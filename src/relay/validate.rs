@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail};
 
 use crate::config::{AccessControl, Config};
 use crate::event::Event;
-use crate::nips::{nip01, nip09, nip13, nip26, nip29, nip40, nip43, nip62, nip70};
+use crate::nips::{nip_ia, nip01, nip09, nip13, nip26, nip29, nip40, nip43, nip62, nip70};
 
 /// Wraps a batch for [`verify_signatures_parallel`] and recovers it
 /// afterwards. The blocking verification tasks need shared ownership
@@ -43,6 +43,33 @@ pub(crate) enum Precheck {
     /// ones created after the request's `until_created` (see the vanish
     /// semantics in the `relay` module docs).
     Vanish,
+}
+
+/// Whether a NIP-92 `imeta` tag describes an image (`m image/…`). The
+/// fields are space-separated `key value` strings, so the MIME is the value
+/// after the `m ` prefix. A malformed tag that still carries an image MIME
+/// is treated as an image: the gate must not be bypassable with extra
+/// whitespace or unknown fields.
+fn has_image_imeta(event: &Event) -> bool {
+    let is_image_mime = |mime: &str| {
+        mime.trim()
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+    };
+    event.tags.iter().any(|tag| {
+        if !tag.first().is_some_and(|name| name == "imeta") {
+            return false;
+        }
+        tag.iter().enumerate().skip(1).any(|(index, field)| {
+            if field == "m" {
+                // Some clients split the key and value into two elements.
+                return tag.get(index + 1).is_some_and(|mime| is_image_mime(mime));
+            }
+            field
+                .split_once(char::is_whitespace)
+                .is_some_and(|(key, mime)| key == "m" && is_image_mime(mime))
+        })
+    })
 }
 
 /// A batch's pre-fetched `previous` tag references. `capped` records that
@@ -238,6 +265,16 @@ impl super::Relay {
         if !access.allows_kind(event.kind) {
             return Precheck::Reject("blocked: kind not allowed".into());
         }
+        // Image attachments are only useful when this relay can host them:
+        // Buzz uploads through the built-in Blossom server and embeds the
+        // returned URL in a NIP-92 `imeta` tag. With no `[blossom] host`
+        // configured there is nowhere to put the bytes, so reject the event
+        // instead of storing a message whose attachment can never load.
+        if cfg.blossom.host.trim().is_empty() && has_image_imeta(event) {
+            return Precheck::Reject(
+                "blocked: image attachments require a configured Blossom server".into(),
+            );
+        }
         // NIP-43: join requests carry an invite code (NIP-43 PR #2408:
         // codes are issued with NIP-86 `createclaim`). A member who
         // already belongs to the relay gets the spec's `duplicate:`
@@ -345,12 +382,34 @@ impl super::Relay {
         // group actions, so the disabled-window gate below does not catch
         // them; a client-signed 39000-39005 would then be served as group
         // metadata until the next enabled restart.
-        if (nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind)
+        if ((nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind)
+            || matches!(
+                event.kind,
+                nip29::SYSTEM_MESSAGE
+                    | nip29::MEMBER_ADDED
+                    | nip29::MEMBER_REMOVED
+                    | nip29::WINDOW_BOUNDS
+                    | nip29::THREAD_WINDOW_BOUNDS
+                    | nip_ia::ARCHIVED_IDENTITIES
+                    | 30622
+            ))
             && Some(event.pubkey.as_str()) != self.relay_pubkey_ref()
         {
             return Precheck::Reject(
-                "blocked: group metadata must be published by the relay".into(),
+                "blocked: relay-signed group metadata/notices and NIP-IA snapshots must be \
+                 published by the relay"
+                    .into(),
             );
+        }
+        // NIP-CL channel identity: validate the create/edit tags before the
+        // group store applies them. A malformed label, channel type or
+        // visibility rejects the whole event, as the NIP requires.
+        if cfg.nip_enabled(29)
+            && cfg.relay.enabled_buzz
+            && matches!(event.kind, nip29::CREATE_GROUP | 9002)
+            && let Err(reason) = nip29::validate_channel_tags(event)
+        {
+            return Precheck::Reject(reason);
         }
         if cfg.nip_enabled(29) && nip29::group_id(event).is_some() {
             // Late publication prevention for group events.
@@ -701,6 +760,16 @@ impl super::Relay {
             .min(crate::config::MAX_CREATED_AT_FUTURE_SECS);
         if event.created_at > now.saturating_add(max_future) {
             bail!("invalid: event creation date is in the future");
+        }
+        // Group state feeds a replay ordered by client timestamps. A
+        // far-future group event can outrank a later removal/settings edit on
+        // every rebuild, so keep only a small clock-skew allowance even when
+        // the generic NIP-01 window is wider.
+        if cfg.nip_enabled(29)
+            && nip29::is_group_action(event)
+            && event.created_at > now.saturating_add(max_future.min(600))
+        {
+            bail!("invalid: group event creation date is in the future");
         }
 
         // NIP-40: the expiration value is required to be a unix timestamp.
@@ -2063,6 +2132,18 @@ mod tests {
             matches!(out, super::Precheck::Reject(message) if message.contains("metadata")),
             "client-signed 39000 must be rejected even while NIP-29 is disabled"
         );
+
+        // NIP-IA's archived-identities snapshot is relay state too: a
+        // client-signed 13535 must not be stored as an authoritative answer
+        // to Buzz's archive-state check.
+        let fake_archive = signed_with_seed(7, crate::nips::nip_ia::ARCHIVED_IDENTITIES, vec![]);
+        let out = relay
+            .precheck(&cfg, &access, &fake_archive, now, &[], None, None)
+            .await;
+        assert!(
+            matches!(out, super::Precheck::Reject(ref message) if message.contains("relay-signed")),
+            "client-signed 13535 must be rejected: {out:?}"
+        );
         drop(cfg);
         relay.db.shutdown();
     }
@@ -3166,6 +3247,44 @@ mod tests {
                 .expect("the author must be able to publish their own protected event");
 
             drop(cfg);
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn image_attachments_require_a_configured_blossom_server() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_validate_relay("nostrfy-image-blossom-gate").await;
+            let mut cfg = relay.config.read().await.clone();
+            cfg.blossom.host.clear();
+            let access = AccessControl::default();
+            let event = signed(
+                1,
+                vec![vec![
+                    "imeta".into(),
+                    "url https://example.com/a.png".into(),
+                    "m image/png".into(),
+                ]],
+            );
+
+            let out = relay
+                .precheck(&cfg, &access, &event, unix_now(), &[], None, None)
+                .await;
+            assert!(
+                matches!(&out, super::Precheck::Reject(message) if message.contains("Blossom")),
+                "an image attachment must be refused without a Blossom server: {out:?}"
+            );
+
+            cfg.blossom.host = "media.example.com".into();
+            let out = relay
+                .precheck(&cfg, &access, &event, unix_now(), &[], None, None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Accept),
+                "a configured Blossom server must admit the image attachment: {out:?}"
+            );
+
             relay.db.shutdown();
         });
     }

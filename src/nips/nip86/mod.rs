@@ -323,6 +323,17 @@ fn warn_auth_failure(client: std::net::IpAddr, now: u64) {
     }
 }
 
+/// The NIP-43 roster can change with an access-list mutation (a ban removes
+/// an allowlist entry; allow/unallow change it directly). Republish 13534 and
+/// persist the role snapshot so the publish does not make the snapshot stale
+/// for the next startup.
+async fn republish_nip43_roster(relay: &crate::relay::Relay) {
+    if relay.config.read().await.nip_enabled(43) {
+        let _ = relay.publish_membership(None).await;
+        relay.persist_roles().await;
+    }
+}
+
 pub async fn rpc_handler(
     State(relay): State<Arc<Relay>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -459,6 +470,9 @@ pub async fn rpc_handler(
             if !persisted {
                 return rpc_err("error: cannot persist the access control state");
             }
+            // A ban removes the pubkey from the allowlist, which is the
+            // NIP-43 roster on a closed relay.
+            republish_nip43_roster(&relay).await;
             rpc_ok(json!(true))
         }
         "unbanpubkey" => {
@@ -557,6 +571,9 @@ pub async fn rpc_handler(
             if !persisted {
                 return rpc_err("error: cannot persist the access control state");
             }
+            // The allowlist is the NIP-43 roster when the relay is closed;
+            // republish 13534 so Buzz-style clients see the new member.
+            republish_nip43_roster(&relay).await;
             rpc_ok(json!(true))
         }
         "unallowpubkey" => {
@@ -586,6 +603,7 @@ pub async fn rpc_handler(
             if !persisted {
                 return rpc_err("error: cannot persist the access control state");
             }
+            republish_nip43_roster(&relay).await;
             rpc_ok(json!(true))
         }
         "listallowedpubkeys" => {

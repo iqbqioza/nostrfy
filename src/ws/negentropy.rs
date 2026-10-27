@@ -383,6 +383,7 @@ impl super::Conn {
         let now = unix_now();
         // The negentropy query only needs (created_at, id) records, so it
         // never materializes every matching full event in memory.
+        let system_filter = filter.clone();
         let Some((items, more)) = self.relay.db.neg_query_result(filter, max_items, now).await
         else {
             // A failed sync must never be answered with an empty item set:
@@ -440,6 +441,18 @@ impl super::Conn {
                     {
                         return false;
                     }
+                    // NIP-DV/NIP-CL per-pubkey state has no group id (and
+                    // 30622 can carry `h` tags), so NEG must apply the p-tag
+                    // recipient gate explicitly; REQ/COUNT already do.
+                    if item.state_recipients.as_ref().is_some_and(|recipients| {
+                        !self.authed_pubkeys.iter().any(|pk| {
+                            recipients
+                                .iter()
+                                .any(|recipient| recipient.eq_ignore_ascii_case(pk))
+                        })
+                    }) {
+                        return false;
+                    }
                     // NIP-78: application-specific events are only synced
                     // to the authenticated owner.
                     if self.nip78_restricted
@@ -471,13 +484,25 @@ impl super::Conn {
                             // shape violates it.
                             return false;
                         };
-                        if self.authed_pubkeys.is_empty() {
+                        let visible = if self.authed_pubkeys.is_empty() {
                             groups.visible_kind(gid, item.kind, None)
                         } else {
                             self.authed_pubkeys
                                 .iter()
                                 .any(|pk| groups.visible_kind(gid, item.kind, Some(pk)))
-                        }
+                        };
+                        visible
+                            && !groups.channel_ttl_expired_gid(
+                                gid,
+                                item.kind,
+                                item.created,
+                                unix_now(),
+                            )
+                            && crate::server::bridge::nip_cl_group_visible(
+                                &system_filter,
+                                groups,
+                                gid,
+                            )
                     } else {
                         true
                     }

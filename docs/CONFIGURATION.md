@@ -89,6 +89,8 @@ Every key is optional; a missing key uses the default shown below.
 | `disabled_nips` | array of integers | `[]` | NIPs to disable (ignored when `enabled_nips` is non-empty) |
 | `reject_ephemeral` | boolean | `false` | When `true`, NIP-01 ephemeral events (kinds 20000-29999) are rejected (`blocked: ephemeral events not allowed`) |
 | `enabled_git` | boolean | `false` | When `true`, NIP-34 git events (kinds 1617-1633, 30617/30618) are accepted and NIP-34 is advertised. Default `false`: the kinds are rejected (`blocked: NIP-34 git events are disabled`) and NIP-34 is not advertised |
+| `enabled_buzz` | boolean | `false` | Enable the Buzz desktop compatibility layer: the HTTP bridge (`/info`, `/query`, `/events`, `/count`), NIP-CL/NIP-CW extensions, Buzz DM commands and the empty NIP-IA snapshot. Default `false`: the bridge routes are not registered and a stock Buzz client cannot use the relay. Read at startup; changing it requires a restart |
+| `advertise_nip43` | boolean | `false` | Advertise NIP-43 even on an open relay. NIP-43 is always advertised when the relay is a `restrict_relay` allowlist, because membership is then enforced; set this for a role-managed closed community that does not use the allowlist |
 | `max_events_per_min_per_pubkey` | integer | `0` | Publish rate limit per pubkey (events per minute; `0` = no limit) |
 | `require_pow` | integer | `0` | Required proof-of-work difficulty in leading zero bits (`0` = off; enforced regardless of NIP-13 advertisement) |
 | `new_pubkey_min_age_secs` | integer | `0` | Reject events from pubkeys first seen less than this many seconds ago (`0` = off) |
@@ -161,7 +163,7 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 - **`public_url`**: NIP-42/62 `relay`-tag matching tolerates different schemes (`wss`/`ws`/`https`/`http`) and paths, and is case-insensitive. NIP-98 `u`-tag matching is stricter: the tag must equal the relay's canonical HTTP URL exactly (the `public_url` authority with `wss` -> `https` / `ws` -> `http`, plus the exact path and query); each auth event is single-use within its 60-second window. When the relay binds `0.0.0.0` or `127.0.0.1` and `public_url` is empty, a loud warning explains that NIP-42/62/98 URL checks will fail.
 - **`livekit_url` + `livekit_api_key` + `livekit_api_secret`**: all three are needed together; a URL without credentials logs a warning (tokens would be signed with an empty secret).
 - **`enabled_nips` / `disabled_nips`**: `enabled_nips` wins over `disabled_nips`. Both affect the NIP-11 `supported_nips` list and the relay's behavior gates (NIP-29 groups, NIP-50 search, NIP-40 expiry, ...).
-- **The NIP-11 `supported_nips` list is dynamic**: besides `enabled_nips`/`disabled_nips`, a NIP is dropped when every kind it defines is blocked — by `blocked_kinds`, by `allowed_kinds` (a NIP's kind is only accepted if it is listed), or by `reject_ephemeral` (a NIP whose kinds are all ephemeral and not in the exempt list is hidden). NIP-29/43/66 are hidden without `relay.private_key` (their relay-signed events cannot be produced), and NIP-86 is hidden without `rpc.management_token` or `rpc.admin_pubkey`. NIP-17, NIP-47 and NIP-59 are advertised only when all their required relay-visible kinds are allowed (NIP-17: 1059; NIP-47: 23194/23195; NIP-59: 1059); blocking only an interior/auxiliary kind (13, 14, 15, 10050, 21059, 13194) keeps them advertised. Kinds without an owning NIP are not affected. Runtime access changes (NIP-86 `allowkind`/`disallowkind`) and `SIGHUP` reloads are reflected in the next NIP-11 fetch; `enabled_nips`/`disabled_nips` still require a restart.
+- **The NIP-11 `supported_nips` list is dynamic**: besides `enabled_nips`/`disabled_nips`, a NIP is dropped when every kind it defines is blocked — by `blocked_kinds`, by `allowed_kinds` (a NIP's kind is only accepted if it is listed), or by `reject_ephemeral` (a NIP whose kinds are all ephemeral and not in the exempt list is hidden). NIP-29/43/66 are hidden without `relay.private_key` (their relay-signed events cannot be produced), NIP-43 is additionally hidden on an open relay unless `relay.advertise_nip43 = true` (an allowlist relay advertises it automatically because membership is enforced), and NIP-86 is hidden without `rpc.management_token` or `rpc.admin_pubkey`. NIP-17, NIP-47 and NIP-59 are advertised only when all their required relay-visible kinds are allowed (NIP-17: 1059; NIP-47: 23194/23195; NIP-59: 1059); blocking only an interior/auxiliary kind (13, 14, 15, 10050, 21059, 13194) keeps them advertised. Kinds without an owning NIP are not affected. Runtime access changes (NIP-86 `allowkind`/`disallowkind`) and `SIGHUP` reloads are reflected in the next NIP-11 fetch; `enabled_nips`/`disabled_nips` still require a restart.
 
 ---
 
@@ -688,6 +690,8 @@ enabled_nips = []
 disabled_nips = []
 reject_ephemeral = false
 enabled_git = false
+enabled_buzz = false
+advertise_nip43 = false
 require_auth = false
 send_auth_challenge = true
 enabled_nip78_auth = true

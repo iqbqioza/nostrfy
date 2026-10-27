@@ -366,6 +366,13 @@ pub async fn api_auth_middleware(relay: Arc<Relay>, request: Request, next: Next
     next.run(request).await
 }
 
+/// `approximate` must reflect truncation of the *visible* result, not the
+/// raw database scan: hidden rows consuming the scan limit would otherwise
+/// become a volume oracle for private groups/per-pubkey state.
+fn visible_approximate(more: bool, visible: usize, limit: usize) -> bool {
+    more && limit > 0 && visible >= limit
+}
+
 /// Answers a rejected API query parameter.
 fn param_rejection(e: anyhow::Error) -> (StatusCode, Json<Value>) {
     error_response(StatusCode::BAD_REQUEST, &e.to_string())
@@ -457,8 +464,18 @@ fn api_visible(
     nip78: bool,
     relay_pubkey: Option<&str>,
 ) -> bool {
+    if let Some(groups) = groups
+        && groups.channel_ttl_expired(event, unix_now())
+    {
+        return false;
+    }
+
     !nip70::hidden_from_anonymous(event, relay_pubkey)
         && event.kind != nip62::GIFT_WRAP_KIND
+        // These are per-pubkey state (Buzz membership notices and the
+        // NIP-DV DM visibility snapshot). The public REST API has no
+        // authenticated viewer, so it must not expose them anonymously.
+        && !matches!(event.kind, 44100 | 44101 | 30622)
         && !(nip78 && nip78::is_app_specific(event))
         && groups.is_none_or(|g| g.visible_to(event, None))
         && !excluded
@@ -922,7 +939,6 @@ pub async fn api_monthly_handler(
         // The per-iteration scan is done: release the permit before the
         // group lock.
         drop(_permit);
-        approximate |= more;
         // The same visibility rules as the unauthenticated API: protected
         // events, gift wraps and private/hidden group content are withheld.
         let has_group_events = events.iter().any(nip29::is_group_event);
@@ -945,10 +961,12 @@ pub async fn api_monthly_handler(
             .count();
         drop(groups);
         total += count as u64;
+        let bucket_approximate = visible_approximate(more, count, count_limit);
+        approximate |= bucket_approximate;
         month_counts.push(json!({
             "month": format!("{y:04}-{m:02}"),
             "count": count,
-            "approximate": more,
+            "approximate": bucket_approximate,
         }));
     }
 
@@ -1048,7 +1066,10 @@ pub async fn api_count_handler(
     drop(groups);
     (
         StatusCode::OK,
-        Json(json!({ "count": count, "approximate": more })),
+        Json(json!({
+            "count": count,
+            "approximate": visible_approximate(more, count, count_limit),
+        })),
     )
 }
 
@@ -1116,6 +1137,7 @@ pub async fn api_kinds_handler(
         *by_kind.entry(e.kind).or_default() += 1;
     }
     drop(groups);
+    let visible_total: usize = by_kind.values().sum();
     let mut kinds: Vec<Value> = by_kind
         .into_iter()
         .map(|(kind, count)| json!({ "kind": kind, "count": count }))
@@ -1128,7 +1150,10 @@ pub async fn api_kinds_handler(
     });
     (
         StatusCode::OK,
-        Json(json!({ "kinds": kinds, "approximate": more })),
+        Json(json!({
+            "kinds": kinds,
+            "approximate": visible_approximate(more, visible_total, count_limit),
+        })),
     )
 }
 
@@ -1216,7 +1241,6 @@ pub async fn api_daily_handler(
         };
         // Release the permit before the group lock (per-iteration permit).
         drop(_permit);
-        approximate |= more;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
             Some(relay.groups.read().await)
@@ -1237,10 +1261,12 @@ pub async fn api_daily_handler(
             .count();
         drop(groups);
         total += count as u64;
+        let bucket_approximate = visible_approximate(more, count, count_limit);
+        approximate |= bucket_approximate;
         day_counts.push(json!({
             "day": format!("{year:04}-{month:02}-{:02}", day + 1),
             "count": count,
-            "approximate": more,
+            "approximate": bucket_approximate,
         }));
     }
     (
@@ -1464,7 +1490,7 @@ pub async fn api_stats_handler(
         StatusCode::OK,
         Json(json!({
             "total": total,
-            "approximate": more,
+            "approximate": visible_approximate(more, total, count_limit),
             "first_seen": first_seen,
             "last_seen": last_seen,
             "first_month": first_month,
@@ -1576,7 +1602,6 @@ pub async fn api_hourly_handler(
         };
         // Release the permit before the group lock (per-iteration permit).
         drop(_permit);
-        approximate |= more;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
             Some(relay.groups.read().await)
@@ -1597,10 +1622,12 @@ pub async fn api_hourly_handler(
             .count();
         drop(groups);
         total += count as u64;
+        let bucket_approximate = visible_approximate(more, count, count_limit);
+        approximate |= bucket_approximate;
         hour_counts.push(json!({
             "hour": format!("{year:04}-{month:02}-{day:02}T{h:02}"),
             "count": count,
-            "approximate": more,
+            "approximate": bucket_approximate,
         }));
     }
     (
@@ -1727,6 +1754,15 @@ pub async fn api_follows_handler(
 /// walking the whole store.
 const AGGREGATE_SAMPLE: usize = 20_000;
 
+/// `approximate` for the relay-wide sampled aggregates must describe the
+/// visible sample, not the raw scan. If hidden rows consume the sample and
+/// fewer than `AGGREGATE_SAMPLE` visible events remain, their presence must
+/// not turn the flag into a volume oracle. The response also carries
+/// `sampled: true`, so clients know the counts are still sample-based.
+fn sampled_approximate(more: bool, visible: usize) -> bool {
+    more && visible >= AGGREGATE_SAMPLE
+}
+
 /// Anonymous visibility of a lightweight aggregate record: the same
 /// NIP-70/NIP-59/NIP-78/NIP-29 rules as [`api_visible`], evaluated without
 /// loading the event content.
@@ -1750,6 +1786,12 @@ fn aggregate_visible(
     // NIP-78: application-specific events are owner-only while the AUTH
     // gate is active.
     if nip78 && item.app_specific {
+        return false;
+    }
+    // Buzz membership notices and NIP-DV visibility snapshots are
+    // per-pubkey state; anonymous aggregate endpoints must not reveal their
+    // kind, author, or existence.
+    if matches!(item.kind, 44100 | 44101 | 30622) {
         return false;
     }
     // NIP-29: private/hidden group content is withheld from non-members.
@@ -1810,6 +1852,7 @@ pub async fn api_relay_kinds_handler(
             }
         }
     }
+    let visible_total: u64 = counts.values().sum();
     let limit = {
         let mut limit = params.limit.unwrap_or(20).min(100);
         // `max_api_limit` is the ceiling for the API `limit` parameter
@@ -1832,7 +1875,12 @@ pub async fn api_relay_kinds_handler(
     kinds.truncate(limit);
     (
         StatusCode::OK,
-        Json(json!({ "kinds": kinds, "approximate": more, "filtered": true })),
+        Json(json!({
+            "kinds": kinds,
+            "approximate": sampled_approximate(more, visible_total as usize),
+            "sampled": true,
+            "filtered": true,
+        })),
     )
 }
 
@@ -1882,6 +1930,7 @@ pub async fn api_top_authors_handler(
             }
         }
     }
+    let visible_total: u64 = counts.values().sum();
     let limit = {
         let mut limit = params.limit.unwrap_or(20).min(100);
         // See the kinds aggregation above: honor a restrictive
@@ -1902,7 +1951,12 @@ pub async fn api_top_authors_handler(
     authors.truncate(limit);
     (
         StatusCode::OK,
-        Json(json!({ "authors": authors, "approximate": more, "filtered": true })),
+        Json(json!({
+            "authors": authors,
+            "approximate": sampled_approximate(more, visible_total as usize),
+            "sampled": true,
+            "filtered": true,
+        })),
     )
 }
 
@@ -2798,6 +2852,30 @@ mod tests {
             "no_p excludes"
         );
         assert!(api_visible(&no_p, None, &["e"], false, None));
+        for kind in [44100u64, 44101, 30622] {
+            let mut per_pubkey = plain.clone();
+            per_pubkey.kind = kind;
+            per_pubkey.tags = vec![vec!["p".into(), "dd".repeat(32)]];
+            assert!(
+                !api_visible(&per_pubkey, None, &[], false, None),
+                "the anonymous REST API must not expose per-pubkey kind {kind}"
+            );
+            let item = crate::db::NegItem {
+                created: 0,
+                id: [0u8; 32],
+                kind,
+                pubkey: "dd".repeat(32),
+                protected: false,
+                app_specific: false,
+                gid: None,
+                wrap_recipients: None,
+                state_recipients: None,
+            };
+            assert!(
+                !aggregate_visible(&item, None, false, None),
+                "the anonymous aggregate API must not count per-pubkey kind {kind}"
+            );
+        }
     }
 
     #[test]
@@ -3039,6 +3117,48 @@ mod tests {
                 5,
                 "0 disables the byte budget"
             );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn sampled_approximate_ignores_hidden_scan_rows() {
+        assert!(!sampled_approximate(true, 0));
+        assert!(!sampled_approximate(true, AGGREGATE_SAMPLE - 1));
+        assert!(sampled_approximate(true, AGGREGATE_SAMPLE));
+        assert!(!sampled_approximate(false, AGGREGATE_SAMPLE));
+    }
+
+    #[test]
+    fn approximate_flags_do_not_count_hidden_scan_rows() {
+        // A raw scan can be capped entirely by events the caller cannot
+        // see. That must not turn `approximate` into a hidden-volume oracle:
+        // the visible result here is complete (1 of 1) even though the
+        // database scan hit its limit and has more rows.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            {
+                let mut cfg = relay.config.write().await;
+                cfg.limits.max_count = 2;
+            }
+            let now = unix_now();
+            let visible = signed_note("visible", now, vec![]);
+            assert_eq!(
+                relay.db.put(visible, now).await,
+                crate::db::PutOutcome::Stored
+            );
+            for i in 0..2 {
+                let mut hidden = signed_note(&format!("hidden{i}"), now - 1 - i, vec![]);
+                hidden.kind = 1059;
+                hidden.tags = vec![vec!["p".into(), "bb".repeat(32)]];
+                hidden.id = crate::nips::nip01::compute_id(&hidden);
+                let _ = relay.db.put(hidden, now).await;
+            }
+            let (_, Json(resp)) =
+                api_count_handler(State(relay.clone()), Query(ApiParams::default())).await;
+            assert_eq!(resp["count"], 1, "{resp}");
+            assert_eq!(resp["approximate"], false, "{resp}");
             relay.db.shutdown();
         });
     }

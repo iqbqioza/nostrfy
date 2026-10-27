@@ -88,6 +88,13 @@ reject_ephemeral = false
 # When true, NIP-34 git events (kinds 1617-1633, 30617/30618) are accepted
 # and NIP-34 is advertised. Default false: the kinds are rejected.
 enabled_git = false
+# Enable the Buzz desktop compatibility bridge (/info, /query, /events,
+# /count), NIP-CL/NIP-CW extensions and Buzz DM commands. Default false:
+# the bridge routes are not served, so a stock Buzz client cannot use the
+# relay. Requires a restart to change.
+enabled_buzz = false
+# Advertise NIP-43 on an open relay (allowlist relays advertise it anyway).
+advertise_nip43 = false
 
 # NIP-13 proof-of-work difficulty required for new events (0 disables).
 require_pow = 0

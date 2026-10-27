@@ -43,6 +43,10 @@ pub(crate) struct BlossomState {
     pub store: BlobStore,
     /// The configured blossom hostname (used for the `server` auth tag).
     pub host: String,
+    /// The relay's own HTTP host. Buzz uploads to the relay origin and
+    /// signs its BUD-11 `server` tag with that host, not the dedicated media
+    /// host, so both are accepted.
+    pub relay_host: String,
     /// Upload limit fixed when the HTTP router and semaphore are created.
     /// Config reloads keep this value unchanged because the router cannot be
     /// rebuilt without restarting the listener.
@@ -214,6 +218,16 @@ pub(crate) async fn routes(relay: &Arc<Relay>, max_upload: usize) -> axum::Route
                 .head(head_media)
                 .layer(DefaultBodyLimit::max(max_upload)),
         )
+        // Buzz's URLs are `/media/{sha256}.{ext}`; keep the standard
+        // `/{sha256}` route for BUD-01 clients and accept both spellings.
+        // Only PUT: a HEAD route here would overlap the dynamic
+        // `/media/{blob}` HEAD route below (Axum rejects the ambiguity).
+        // Buzz uploads with PUT and does not pre-flight this alias.
+        .route(
+            "/media/upload",
+            put(upload).layer(DefaultBodyLimit::max(max_upload)),
+        )
+        .route("/media/{blob}", get(get_blob).head(head_blob))
         .route("/list/{pubkey}", get(list))
         .route("/{blob}", get(get_blob).head(head_blob).delete(delete_blob))
         .with_state(relay.clone())
@@ -231,7 +245,11 @@ pub(crate) fn is_blossom_path(path: &str) -> bool {
     // The root `/` stays with the relay (WS + NIP-11): the WS handler
     // answers it with the Blossom server info when the Host names the
     // Blossom host.
-    if path == "/upload" || path == "/media" {
+    if path == "/upload"
+        || path == "/media"
+        || path == "/media/upload"
+        || path.starts_with("/media/")
+    {
         return true;
     }
     if let Some(rest) = path.strip_prefix("/list/") {
@@ -250,8 +268,33 @@ pub(crate) fn is_blossom_path(path: &str) -> bool {
     }
     !matches!(
         segment,
-        "health" | "metrics" | "inbox" | "outbox" | "ws" | "list"
+        "health"
+            | "metrics"
+            | "inbox"
+            | "outbox"
+            | "ws"
+            | "list"
+            | "info"
+            | "query"
+            | "count"
+            | "events"
     )
+}
+
+/// The two media paths Buzz uses on the relay's own origin. They are also
+/// ordinary Blossom paths on the media host; the host split lets them through
+/// on the relay host so the desktop's `/media/upload` and `/media/{sha}.{ext}`
+/// work without a second media hostname.
+pub(crate) fn is_relay_media_alias(path: &str, method: &axum::http::Method) -> bool {
+    if path == "/media/upload" {
+        return matches!(*method, axum::http::Method::PUT | axum::http::Method::HEAD);
+    }
+    let Some(blob) = path.strip_prefix("/media/") else {
+        return false;
+    };
+    !blob.is_empty()
+        && !blob.contains('/')
+        && matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
 }
 
 fn is_pubkey(value: &str) -> bool {
@@ -404,6 +447,7 @@ fn event_tags<'a>(event: &'a crate::event::Event, name: &'a str) -> impl Iterato
 fn validate_auth_event(
     event: &crate::event::Event,
     host: &str,
+    relay_host: &str,
     verb: &str,
     expected_sha: Option<&str>,
     now: u64,
@@ -457,17 +501,31 @@ fn validate_auth_event(
     // servers" listed), and the relay must accept it when its domain
     // appears in at least one. Each value must be a bare domain name, so
     // only an exact hostname match counts (see `auth_server_host`).
-    let host = host
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let normalize = |value: &str| {
+        value
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            // A fully-qualified spelling (`relay.example.com.`) names the
+            // same host as the canonical form. Keep the dot stripping for
+            // both the public and relay hosts while retaining the Buzz
+            // wildcard/loopback aliases below.
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+    };
+    let mut hosts = vec![normalize(host), normalize(relay_host)];
+    // A wildcard bind address is not a host a client can put in a URL;
+    // local Buzz instances sign with the loopback spelling they connect to.
+    if matches!(hosts[1].as_str(), "0.0.0.0" | "::" | "") {
+        hosts.push("127.0.0.1".into());
+        hosts.push("localhost".into());
+        hosts.push("::1".into());
+    }
     let servers: Vec<&str> = event_tags(event, "server").collect();
     if !servers.is_empty()
-        && !servers
-            .iter()
-            .any(|s| auth_server_host(s).as_deref() == Some(host.as_str()))
+        && !servers.iter().any(|s| {
+            auth_server_host(s).is_some_and(|value| hosts.iter().any(|host| host == &value))
+        })
     {
         return None;
     }
@@ -509,7 +567,14 @@ async fn verify_auth_meta(
     event: &crate::event::Event,
     verb: &str,
 ) -> Option<String> {
-    let pubkey = validate_auth_event(event, &state.host, verb, None, unix_now())?;
+    let pubkey = validate_auth_event(
+        event,
+        &state.host,
+        &state.relay_host,
+        verb,
+        None,
+        unix_now(),
+    )?;
     // The relay's access policy applies to authenticated Blossom actions
     // too, not only to WebSocket publishing: NIP-86 `banpubkey` (always)
     // and the `restrict_relay` allowlist (when enabled) must gate
@@ -1240,7 +1305,19 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Body, verb: &str)
     }
     match result {
         Ok((desc, existed)) => {
-            let url = format!("https://{}/{sha}{}", state.host, ext_of(&desc.mime));
+            // Buzz uploads to the relay origin (its HTTP base URL), so the
+            // descriptor must name the host the client actually used. The
+            // dedicated Blossom host is only correct for uploads that
+            // arrived there; handing it to a relay-origin upload produces a
+            // URL the client cannot resolve.
+            let url_host = response_url_host(
+                &state.host,
+                &state.relay_host,
+                headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|value| value.to_str().ok()),
+            );
+            let url = format!("https://{url_host}/media/{sha}{}", ext_of(&desc.mime));
             let status = if existed {
                 StatusCode::OK
             } else {
@@ -1819,6 +1896,41 @@ async fn delete_blob(
     }
 }
 
+/// The host to put in a BlobDescriptor URL after an upload. Use the host the
+/// request actually arrived on (Buzz's relay origin or the dedicated
+/// Blossom host); fall back to the configured relay/Blossom host when a
+/// proxy omits the Host header.
+fn response_url_host(blossom_host: &str, relay_host: &str, request_host: Option<&str>) -> String {
+    if let Some(request_host) = request_host {
+        let request_host = super::host_header_host(request_host);
+        if !request_host.is_empty() {
+            return request_host.to_string();
+        }
+    }
+    if !relay_host.is_empty() && !matches!(relay_host, "0.0.0.0" | "::" | "[::]") {
+        return relay_host.to_string();
+    }
+    blossom_host.to_string()
+}
+
+/// The relay's externally visible HTTP host, as Buzz signs it in a BUD-11
+/// `server` tag (derived from `relay.public_url`, else `server.host`).
+fn relay_http_host(cfg: &Config) -> String {
+    let public = cfg.relay.public_url.trim();
+    let authority = if public.is_empty() {
+        cfg.server.host.trim()
+    } else {
+        public
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(public)
+            .split('/')
+            .next()
+            .unwrap_or(public)
+    };
+    super::host_header_host(authority).to_ascii_lowercase()
+}
+
 /// Builds the shared Blossom state from the config (or `None` when the
 /// feature is disabled). Must be called before the router is built.
 /// Builds the Blossom media state: `None` when no Blossom host is
@@ -1864,6 +1976,7 @@ pub(crate) async fn build_state(
             let state = Arc::new(BlossomState {
                 store,
                 host: cfg.blossom.host.clone(),
+                relay_host: relay_http_host(cfg),
                 max_upload_bytes: cfg.blossom.max_upload_bytes,
                 upload_budget: Arc::new(tokio::sync::Semaphore::new(
                     cfg.blossom.max_upload_bytes.saturating_mul(4).max(1),
@@ -3089,13 +3202,20 @@ mod tests {
         // A fully-specified upload token validates.
         let ev = auth_event(now, "upload", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             Some(ev.pubkey.clone())
         );
         // A configured FQDN with the absolute-name trailing dot and a
         // token scoped to the bare host are the same server (BLM-03).
         assert_eq!(
-            validate_auth_event(&ev, "media.example.com.", "upload", Some(&sha), now),
+            validate_auth_event(
+                &ev,
+                "media.example.com.",
+                "media.example.com.",
+                "upload",
+                Some(&sha),
+                now,
+            ),
             Some(ev.pubkey.clone())
         );
         let dotted = auth_event(
@@ -3106,31 +3226,31 @@ mod tests {
             Some("media.example.com."),
         );
         assert_eq!(
-            validate_auth_event(&dotted, host, "upload", Some(&sha), now),
+            validate_auth_event(&dotted, host, host, "upload", Some(&sha), now),
             Some(dotted.pubkey.clone())
         );
         // BUD-11: the `expiration` tag is mandatory.
         let ev = auth_event(now, "upload", None, Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None,
             "a token without an expiration tag must be rejected"
         );
         // An expired or unparseable expiration is rejected.
         let ev = auth_event(now, "upload", Some(now - 1), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None
         );
         let ev = auth_event(now, "upload", Some(0), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None
         );
         // The `t` verb must match the endpoint.
         let ev = auth_event(now, "delete", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None
         );
         // A `server` tag naming another host is rejected.
@@ -3142,7 +3262,7 @@ mod tests {
             Some("evil.example.com"),
         );
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None
         );
         // The old normalizer stripped everything before `:`/`/`, so a tag
@@ -3152,7 +3272,7 @@ mod tests {
         let spoofed = format!("{host}:443@evil.example.com");
         let ev = auth_event(now, "upload", Some(now + 300), Some(&sha), Some(&spoofed));
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None,
             "a userinfo-spoofed server tag must not match our host"
         );
@@ -3173,14 +3293,14 @@ mod tests {
         let keypair = Keypair::from_secret_bytes([9u8; 32]).unwrap();
         ev.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &keypair).to_string();
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             Some(ev.pubkey.clone()),
             "a token listing several servers must be accepted when ours is among them"
         );
         // BUD-11: an upload token must carry an `x` tag matching the blob.
         let ev = auth_event(now, "upload", Some(now + 300), None, Some(host));
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None,
             "an upload token without an x tag must be rejected"
         );
@@ -3192,7 +3312,7 @@ mod tests {
             Some(host),
         );
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None,
             "an x tag for a different blob must be rejected"
         );
@@ -3201,34 +3321,34 @@ mod tests {
         // (pre-signed tokens are spec-conformant).
         let ev = auth_event(now - 601, "upload", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             Some(ev.pubkey.clone()),
             "a past-stamped token with a future expiration is valid"
         );
         // A future `created_at` is rejected.
         let ev = auth_event(now + 601, "upload", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None
         );
         // A wrong event kind is rejected.
         let mut ev = auth_event(now, "upload", Some(now + 300), Some(&sha), Some(host));
         ev.kind = 22242;
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None
         );
         // A delete token without an `x` tag is rejected (implied hash).
         let ev = auth_event(now, "delete", Some(now + 300), None, Some(host));
         assert_eq!(
-            validate_auth_event(&ev, host, "delete", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "delete", Some(&sha), now),
             None
         );
         // An unsigned (invalid signature) token is rejected.
         let mut ev = auth_event(now, "upload", Some(now + 300), Some(&sha), Some(host));
         ev.sig = "f".repeat(128);
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None
         );
     }
@@ -3243,13 +3363,13 @@ mod tests {
         let host = "media.example.com";
         let ev = auth_event(now + 30, "upload", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             Some(ev.pubkey.clone()),
             "a token seconds in the future must be accepted within the skew window"
         );
         let ev = auth_event(now + 61, "upload", Some(now + 300), Some(&sha), Some(host));
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None,
             "a token past the skew window must still be rejected"
         );
@@ -3276,21 +3396,21 @@ mod tests {
         // still bounds (accepted while it is in the future).
         let ev = with_extra_expiration(now + 600, &(now + 300).to_string());
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             Some(ev.pubkey.clone())
         );
         // A past tag anywhere rejects, even behind a future first tag
         // (the old first-only check accepted this token).
         let ev = with_extra_expiration(now + 600, &(now - 10).to_string());
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None,
             "a past expiration tag must reject even behind a future first tag"
         );
         // An unparseable tag rejects, even behind a valid first tag.
         let ev = with_extra_expiration(now + 600, "soon");
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None,
             "an unparseable expiration tag must reject"
         );
@@ -3320,7 +3440,7 @@ mod tests {
             "the uppercase token must be cryptographically valid, or the test proves nothing"
         );
         assert_eq!(
-            validate_auth_event(&ev, host, "upload", Some(&sha), now),
+            validate_auth_event(&ev, host, host, "upload", Some(&sha), now),
             None,
             "uppercase-hex pubkey/id/sig must be rejected"
         );
@@ -3965,5 +4085,44 @@ mod tests {
             "an unknown cursor must yield an empty page"
         );
         relay.db.shutdown();
+    }
+
+    #[test]
+    fn upload_descriptor_uses_the_request_host() {
+        // Buzz uploads to the relay origin; returning the Blossom host there
+        // would make the descriptor URL unreachable.
+        assert_eq!(
+            response_url_host(
+                "media.example.com",
+                "relay.example.com",
+                Some("relay.example.com")
+            ),
+            "relay.example.com"
+        );
+        // An upload that really arrived on the media host keeps that host.
+        assert_eq!(
+            response_url_host(
+                "media.example.com",
+                "relay.example.com",
+                Some("media.example.com")
+            ),
+            "media.example.com"
+        );
+        // The host split canonicalizes the authority without its port; the
+        // descriptor echoes the same spelling.
+        assert_eq!(
+            response_url_host(
+                "media.example.com",
+                "relay.example.com",
+                Some("relay.example.com:443")
+            ),
+            "relay.example.com"
+        );
+        // A wildcard bind has no externally reachable name: keep the
+        // configured media host when a proxy omitted the Host header.
+        assert_eq!(
+            response_url_host("media.example.com", "0.0.0.0", None),
+            "media.example.com"
+        );
     }
 }

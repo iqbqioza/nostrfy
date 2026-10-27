@@ -220,6 +220,109 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             }
             false
         }
+        Msg::GroupEpochs { event_ids, reply } => {
+            let out = match store.group_epochs_for(&event_ids) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::RecordGroupEpoch { reply, .. } => {
+            // RecordGroupEpoch is a writer-channel message only.
+            let _ = reply.send(false);
+            false
+        }
+        Msg::EventArrivals { event_ids, reply } => {
+            let out = match store.event_arrivals(&event_ids) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::AssignArrival { reply, .. } => {
+            let _ = reply.send(None);
+            false
+        }
+        Msg::LoadDmCarry { reply } => {
+            let out = match store.load_dm_carry() {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::SaveDmCarry { reply, .. } | Msg::ClearDmCarry { reply } => {
+            let _ = reply.send(false);
+            false
+        }
+        Msg::GroupEpochsBackfilled { reply } => {
+            let out = match store.group_epochs_backfilled() {
+                Ok(done) => Some(done),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::RecordGroupEpochsBatch { reply, .. } | Msg::MarkGroupEpochsBackfilled { reply } => {
+            let _ = reply.send(false);
+            false
+        }
+        Msg::LoadIdentityArchive { reply } => {
+            let out = match store.load_identity_archive() {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::SaveIdentityArchive { reply, .. } => {
+            let _ = reply.send(false);
+            false
+        }
+        Msg::ThreadRootTombstone { event_id, reply } => {
+            let out = match store.thread_root_tombstone(&event_id) {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::LoadRoleRebuildPending { reply } => {
+            let out = match store.load_role_rebuild_pending() {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::SaveRoleRebuildPending { reply, .. } | Msg::ClearRoleRebuildPending { reply } => {
+            // Writer-channel messages only.
+            let _ = reply.send(false);
+            false
+        }
         Msg::Query {
             filters,
             limit,
@@ -366,6 +469,28 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
                 }
             };
             let _ = reply.send(lists);
+            false
+        }
+        Msg::LoadDmBackup { reply } => {
+            let outcome = match store.load_dm_backup() {
+                Ok(snapshot) => Some(snapshot),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(outcome);
+            false
+        }
+        Msg::LoadBuzzBackup { reply } => {
+            let outcome = match store.load_buzz_backup() {
+                Ok(snapshot) => Some(snapshot),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(outcome);
             false
         }
         Msg::LoadGroups { reply } => {
@@ -1255,6 +1380,26 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(outcome);
                                 }
+                                Msg::LoadDmBackup { reply } => {
+                                    let outcome = match store.load_dm_backup() {
+                                        Ok(snapshot) => Some(snapshot),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(outcome);
+                                }
+                                Msg::LoadBuzzBackup { reply } => {
+                                    let outcome = match store.load_buzz_backup() {
+                                        Ok(snapshot) => Some(snapshot),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(outcome);
+                                }
                                 Msg::ForeignRelayEvents {
                                     relay_pubkey,
                                     kinds,
@@ -1357,6 +1502,172 @@ pub(crate) fn spawn(
                                         Err(e) => db_error(&thread_errors, &e),
                                     }
                                 }
+                                Msg::ThreadRootTombstone { event_id, reply } => {
+                                    let out = match store.thread_root_tombstone(&event_id) {
+                                        Ok(meta) => Some(meta),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::AssignArrival { event_id, reply } => {
+                                    let seq = match store.assign_event_arrival(&event_id) {
+                                        Ok(seq) => Some(seq),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(seq);
+                                }
+                                Msg::EventArrivals { event_ids, reply } => {
+                                    let out = match store.event_arrivals(&event_ids) {
+                                        Ok(map) => Some(map),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::SaveDmCarry { data, reply } => {
+                                    let saved = match store.save_dm_carry(&data) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(saved);
+                                }
+                                Msg::LoadDmCarry { reply } => {
+                                    let out = match store.load_dm_carry() {
+                                        Ok(data) => Some(data),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::ClearDmCarry { reply } => {
+                                    let cleared = match store.clear_dm_carry() {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(cleared);
+                                }
+                                Msg::RecordGroupEpochsBatch { entries, reply } => {
+                                    let stored = match store.record_group_epochs_batch(&entries) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(stored);
+                                }
+                                Msg::GroupEpochsBackfilled { reply } => {
+                                    let out = match store.group_epochs_backfilled() {
+                                        Ok(done) => Some(done),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::MarkGroupEpochsBackfilled { reply } => {
+                                    let marked = match store.mark_group_epochs_backfilled() {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(marked);
+                                }
+                                Msg::SaveIdentityArchive { data, reply } => {
+                                    let saved = match store.save_identity_archive(&data) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(saved);
+                                }
+                                Msg::LoadIdentityArchive { reply } => {
+                                    let out = match store.load_identity_archive() {
+                                        Ok(data) => Some(data),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::SaveRoleRebuildPending { data, reply } => {
+                                    let saved = match store.save_role_rebuild_pending(&data) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(saved);
+                                }
+                                Msg::LoadRoleRebuildPending { reply } => {
+                                    let out = match store.load_role_rebuild_pending() {
+                                        Ok(data) => Some(data),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::ClearRoleRebuildPending { reply } => {
+                                    let cleared = match store.clear_role_rebuild_pending() {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(cleared);
+                                }
+                                Msg::RecordGroupEpoch {
+                                    event_id,
+                                    create_id,
+                                    reply,
+                                } => {
+                                    let recorded = match store
+                                        .record_group_epoch(&event_id, &create_id)
+                                    {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(recorded);
+                                }
+                                Msg::GroupEpochs { event_ids, reply } => {
+                                    let out = match store.group_epochs_for(&event_ids) {
+                                        Ok(map) => Some(map),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
                                 Msg::Delete {
                                     targets,
                                     addresses,
@@ -1430,6 +1741,22 @@ pub(crate) fn spawn(
                                         }
                                     };
                                     let _ = reply.send(outcome);
+                                }
+                                Msg::RecordPendingVanish {
+                                    pubkey,
+                                    until_created,
+                                    reply,
+                                } => {
+                                    let recorded = match store
+                                        .record_pending_vanish(&pubkey, until_created)
+                                    {
+                                        Ok(_) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(recorded);
                                 }
                                 Msg::GiftWrapPurge {
                                     pubkey,

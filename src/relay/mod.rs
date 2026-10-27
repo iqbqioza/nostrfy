@@ -18,6 +18,7 @@
 //! a partial, deleted identity remain visible.
 
 mod commands;
+mod dm;
 mod index;
 pub(crate) use index::{FilterComponents, SubscriptionIndex};
 pub(crate) mod roles;
@@ -319,6 +320,8 @@ pub struct Relay {
     startup_group_recovery: std::sync::atomic::AtomicBool,
     /// NIP-43 role definitions and member assignments.
     pub roles: Arc<RwLock<RoleStore>>,
+    /// NIP-IA archived identities (relay-scoped visibility metadata).
+    pub archive: Arc<RwLock<std::collections::BTreeSet<String>>>,
     /// The coalesced NIP-43 role rebuild that follows a NIP-09 deletion,
     /// NIP-62 vanish or NIP-40 expiry of a role-state event: while stale,
     /// the live store is the fail-closed empty store and `persist_roles`
@@ -959,7 +962,7 @@ const ROLES_REBUILD_BUFFER_MAX: usize = 4096;
 /// only when it actually changed the store — except removals the revoked
 /// empty store cannot confirm, which callers force-buffer (see
 /// [`Relay::apply_leave_request`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum BufferedRoleMutation {
     /// `create_role`: install the role definition (and create it).
     Create {
@@ -1184,6 +1187,14 @@ struct RolesRebuild {
     /// lock, so a mutation holding that lock sees a stable value (the mark
     /// cannot revoke underneath it).
     dirty: std::sync::atomic::AtomicBool,
+    /// A role-state removal has committed (or is in flight) and a rebuild
+    /// has not yet produced an authoritative roster. Full 13534 publishes
+    /// must not leave a pre-removal list as the newest event.
+    removal_committed: std::sync::atomic::AtomicBool,
+    /// Monotonic generation of committed role-state removals. The worker
+    /// clears `removal_committed` only when this did not advance during the
+    /// scan.
+    removal_epoch: std::sync::atomic::AtomicU64,
     /// A mark is waiting for the mutation buffer lock (or is about to set
     /// `dirty` under it). Persistence must already stop here: the database
     /// removal advanced the generation before the in-memory mark runs, and
@@ -1195,6 +1206,11 @@ struct RolesRebuild {
     /// A worker task owns (or is about to own) the rebuild loop: triggers
     /// only set the flags.
     running: std::sync::atomic::AtomicBool,
+    /// The startup rebuild found no role events for the current relay key,
+    /// while a previous snapshot/foreign-key events may still be the only
+    /// copy of the assignments. Refuse to persist an empty snapshot until a
+    /// real role mutation supersedes it.
+    preserve_snapshot: std::sync::atomic::AtomicBool,
     /// Unix seconds of the last completed attempt, the minimum-interval
     /// floor (see [`ROLES_REBUILD_MIN_INTERVAL_SECS`]).
     last: std::sync::atomic::AtomicU64,
@@ -1219,14 +1235,55 @@ impl RolesRebuild {
     /// discarded. Buffered leaves that never reached the live store (the
     /// revoked window) are lost here: they are counted and warned about
     /// so the operator knows a re-leave may be needed.
-    async fn leave_buffering(&self) {
+    /// Leaves the buffering window after a failed scan but keeps the
+    /// captured mutations for the next attempt. Called when the live store
+    /// remains fail-closed and the worker will retry on a later mark.
+    async fn retain_buffering(&self) {
         let mut buffer = self.buffer.lock().await;
         buffer.scanning = false;
+        buffer.overflow = false;
+    }
+
+    async fn leave_buffering(&self, db: &DbClient) {
+        let mut buffer = self.buffer.lock().await;
+        buffer.scanning = false;
+        // A shutdown can discard mutations captured while the live store
+        // was revoked. Persist the bounded journal so the next startup can
+        // replay it after the event rebuild; an empty journal is left
+        // untouched (a previous crash may still own it).
+        if !buffer.mutations.is_empty() {
+            match serde_json::to_vec(&buffer.mutations) {
+                Ok(data) => {
+                    // A transient writer backlog must not drop the captured
+                    // leaves on shutdown. Retry a few times before falling
+                    // back to the (already warned) in-memory-only state.
+                    let mut saved = false;
+                    for attempt in 0..3 {
+                        if db.save_role_rebuild_pending(data.clone()).await {
+                            saved = true;
+                            break;
+                        }
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                    if !saved {
+                        log::warn!(
+                            "could not persist the role rebuild mutation journal after retries; \
+                             captured mutations may be lost on shutdown"
+                        );
+                    }
+                }
+                Err(error) => {
+                    log::warn!("could not serialize the role rebuild mutation journal: {error}")
+                }
+            }
+        }
         // A dropped leave (buffered while the live store was revoked, never
         // applied to it) resurrects its member on the next rebuild: the
         // remove-user event published for it keeps clients correct, but the
         // rebuild only honors membership lists. Surface the count so the
-        // operator knows a re-leave may be needed.
+        // operator knows a re-leave may be needed if persistence failed.
         let dropped_leaves = buffer
             .mutations
             .iter()
@@ -1267,8 +1324,11 @@ impl RolesRebuild {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::warn!(
                 "role state rebuild discarded: the mutation buffer overflowed during the \
-                 scan; rebuilding again"
+                 scan; retaining the captured mutations for the next scan"
             );
+            // Do not lose ACKed mutations: the next scan must replay them.
+            buffer.mutations = buffered;
+            buffer.overflow = false;
             return false;
         }
         let mut store = roles.write().await;
@@ -1291,6 +1351,9 @@ impl RolesRebuild {
                  to the surviving history; retry the affected role change"
             );
         }
+        // Claims are snapshot-only: they cannot be reconstructed from
+        // events, so even the fail-closed reset below must carry them.
+        let preserved_claims = fresh.claims.clone();
         *store = fresh;
         if self.dirty.load(Ordering::SeqCst) {
             // A removal landed while the scan ran (or during the swap): the
@@ -1300,7 +1363,10 @@ impl RolesRebuild {
             // were accepted during this pending window and applied to the
             // live store, which is being discarded here; the next scan must
             // replay them or an ACKed claim/leave would vanish.
-            *store = RoleStore::default();
+            *store = RoleStore {
+                claims: preserved_claims,
+                ..RoleStore::default()
+            };
             buffer.mutations = buffered;
             buffer.overflow = false;
             self.failed_rebuilds
@@ -1320,6 +1386,11 @@ struct RoleStatePublisher {
     stamps: Arc<StampClock>,
     live_tx: mpsc::Sender<(Arc<Event>, Arc<String>)>,
     stats: Arc<Stats>,
+    /// Synthetic roster entries are config/access-derived and are not in the
+    /// event-rebuilt assignments; carry them so the post-rebuild 13534 still
+    /// names the current owners and allowlisted members.
+    extra_members: Arc<Vec<String>>,
+    owners: Arc<Vec<String>>,
 }
 
 impl RoleStatePublisher {
@@ -1345,14 +1416,38 @@ impl RoleStatePublisher {
         let Some(key) = self.key else {
             return false;
         };
+        let mut extra_members = Vec::with_capacity(self.extra_members.len());
+        for pubkey in self.extra_members.iter() {
+            match db.is_vanished(pubkey).await {
+                Some(false) => extra_members.push(pubkey.clone()),
+                Some(true) => {}
+                None => return false,
+            }
+        }
+        let mut owners = Vec::with_capacity(self.owners.len());
+        for pubkey in self.owners.iter() {
+            match db.is_vanished(pubkey).await {
+                Some(false) => owners.push(pubkey.clone()),
+                Some(true) => {}
+                None => return false,
+            }
+        }
         let mut event = {
             let roles = roles.read().await;
-            if state.dirty.load(Ordering::SeqCst) {
+            if state.dirty.load(Ordering::SeqCst)
+                || state.removal_committed.load(Ordering::SeqCst)
+                || state.derived.in_flight()
+            {
                 return false;
             }
-            roles.membership_event(relay_pubkey, self.stamps.stamp(unix_now()))
+            roles.membership_event(
+                relay_pubkey,
+                self.stamps.stamp(unix_now()),
+                &extra_members,
+                &owners,
+            )
         };
-        store_relay_event_parts(
+        let stored = store_relay_event_parts(
             db,
             Some(key),
             &self.stamps,
@@ -1362,7 +1457,17 @@ impl RoleStatePublisher {
             true,
         )
         .await
-        .is_ok()
+        .is_ok();
+        if stored && (state.removal_committed.load(Ordering::SeqCst) || state.derived.in_flight()) {
+            // A removal began between the pre-check and the write. Remove
+            // the pre-removal roster so the rebuild cannot read it as the
+            // newest membership list.
+            if let Some(id) = event.id_bytes() {
+                let _ = db.remove_events_by_id(&[id]).await;
+            }
+            return false;
+        }
+        stored
     }
 }
 
@@ -1420,6 +1525,7 @@ async fn roles_rebuild_worker(
     // Set after a clean swap so the trailing code republishes the membership
     // list (N43-L02). A later dirty/failed scan skips the refresh.
     let mut membership_rebuilt = false;
+    let mut last_scan_epoch = None;
     loop {
         // Shutdown: stop before starting another scan. The removal that
         // dirtied the state already cleared the live store, so the next
@@ -1427,7 +1533,7 @@ async fn roles_rebuild_worker(
         // (e.g. a leave accepted while revoked) are reported and dropped:
         // the process is dying, so they can never replay.
         if *drain.borrow() {
-            state.leave_buffering().await;
+            state.leave_buffering(&db).await;
             break;
         }
         if !state.dirty.swap(false, Ordering::SeqCst) {
@@ -1446,7 +1552,7 @@ async fn roles_rebuild_worker(
                 )) => {}
                 _ = drain.changed() => {
                     state.dirty.store(true, Ordering::SeqCst);
-                    state.leave_buffering().await;
+                    state.leave_buffering(&db).await;
                     break;
                 }
             }
@@ -1462,6 +1568,7 @@ async fn roles_rebuild_worker(
             buffer.scanning = true;
             buffer.overflow = false;
         }
+        last_scan_epoch = Some(state.removal_epoch.load(Ordering::SeqCst));
         // Claims are snapshot-only; carry the revoked store's codes into the
         // rebuilt store (removals cannot recreate them from events).
         let preserved_claims = roles.read().await.claims.clone();
@@ -1475,7 +1582,7 @@ async fn roles_rebuild_worker(
             rebuilt = fresh.rebuild(&db, &relay_pubkey) => rebuilt,
             _ = drain.changed() => {
                 state.dirty.store(true, Ordering::SeqCst);
-                state.leave_buffering().await;
+                state.leave_buffering(&db).await;
                 log::warn!(
                     "role state rebuild aborted by shutdown; keeping the live role store \
                      empty (fail-closed) so the next startup rebuilds from the surviving \
@@ -1495,24 +1602,12 @@ async fn roles_rebuild_worker(
             state
                 .failed_rebuilds
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            state.leave_buffering().await;
+            state.retain_buffering().await;
             log::error!(
                 "role state rebuild failed; keeping the live role store empty (fail-closed) \
-                 and retrying on the next role-state removal"
+                 and retaining captured mutations for the next role-state removal"
             );
             state.running.store(false, Ordering::SeqCst);
-            // The worker is done: drop the post-swap captures it may have
-            // accepted while still marked running. They were applied to the live
-            // store (and scheduled for persistence) like normal mutations, so
-            // replaying them in a later rebuild would wrongly re-apply stale
-            // intent. Clearing runs after `running` is already false, so a racing
-            // mutation either lands before the clear (applied live, safe to drop)
-            // or after it (sees a closed window and stays live-only, like normal).
-            {
-                let mut buffer = state.buffer.lock().await;
-                buffer.mutations.clear();
-                buffer.overflow = false;
-            }
             return;
         }
         if state.dirty.load(Ordering::SeqCst) {
@@ -1531,13 +1626,34 @@ async fn roles_rebuild_worker(
         if !state.finish_rebuild(&roles, fresh).await {
             continue;
         }
+        // A fresh non-empty store is authoritative and supersedes the
+        // preserved old snapshot; an empty one must not overwrite it.
+        let (empty, preserved) = {
+            let store = roles.read().await;
+            (
+                !store.has_role_state(),
+                state.preserve_snapshot.load(Ordering::SeqCst),
+            )
+        };
+        if !empty {
+            state.preserve_snapshot.store(false, Ordering::SeqCst);
+        }
+        // A preserved empty rebuild still has an authoritative roster for
+        // the *current* key: the startup preserved path publishes that
+        // synthetic/empty list under the current key. Keeping an older
+        // 13534 as the newest event would leave a vanished identity visible
+        // until the next role/membership change (N43 vanity gap), so refresh
+        // it here as well. The persisted role snapshot remains protected by
+        // `preserve_snapshot`.
         membership_rebuilt = true;
         // Persist the fresh store under the mutation-serializing lock. A
         // mutation that lands in the meantime is refused persistence (the
         // state is not established yet) and a removal clears the store
         // again; the loop then rebuilds with the surviving state.
         let _persist = persist_lock.lock().await;
-        if persist_fresh_roles(&db, &roles, &state).await == PersistOutcome::Failed {
+        if !(empty && preserved)
+            && persist_fresh_roles(&db, &roles, &state).await == PersistOutcome::Failed
+        {
             state
                 .failed_rebuilds
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1561,6 +1677,12 @@ async fn roles_rebuild_worker(
         buffer.mutations.clear();
         buffer.overflow = false;
         buffer.scanning = false;
+        // The rebuild is authoritative now only if no later removal began
+        // while the scan ran. The epoch compare closes the check-then-clear
+        // race with a mark that sets the flag before waiting for this lock.
+        if last_scan_epoch == Some(state.removal_epoch.load(Ordering::SeqCst)) {
+            state.removal_committed.store(false, Ordering::SeqCst);
+        }
         // The runtime rebuild could have dropped assignments to a role whose
         // definition was removed, while the stored kind:13534 still names
         // them. Republish the authoritative list so clients see the rebuilt
@@ -1636,6 +1758,12 @@ async fn persist_fresh_roles(
     if state.marking.load(Ordering::SeqCst) {
         return PersistOutcome::Deferred;
     }
+    if state.preserve_snapshot.load(Ordering::SeqCst)
+        && snapshot.roles.is_empty()
+        && snapshot.assignments.values().all(|roles| roles.is_empty())
+    {
+        return PersistOutcome::Failed;
+    }
     if state.derived.in_flight() {
         return PersistOutcome::Deferred;
     }
@@ -1704,6 +1832,12 @@ async fn persist_roles_now(
     // was being captured must not have its pre-removal grants stamped
     // with the removal's generation.
     if stale() {
+        return PersistOutcome::Failed;
+    }
+    if state.preserve_snapshot.load(Ordering::SeqCst)
+        && snapshot.roles.is_empty()
+        && snapshot.assignments.values().all(|roles| roles.is_empty())
+    {
         return PersistOutcome::Failed;
     }
     if state.derived.in_flight() {
@@ -1861,6 +1995,7 @@ async fn groups_rebuild_worker(
                 )
             };
             let mut fresh = GroupStore::with_cap(cap);
+            fresh.buzz_enabled = groups.read().await.buzz_enabled;
             // The scan must not outlive a shutdown: abort it at its next
             // await (a page query) and keep the state pending. The fresh
             // store is local and was never swapped in, so the live store
@@ -1987,6 +2122,10 @@ async fn groups_rebuild_worker(
                     // mark on the same path cannot interleave between the
                     // scope read and the swap.
                     let mut store = groups.write().await;
+                    // These events passed live validation on this relay, so
+                    // a keyless store must trust a JOIN accepted while the
+                    // scan ran even if a later buffered close outranks it.
+                    fresh.trust_stored_joins = true;
                     for buffered in buffered {
                         // Pass the relay key so relay-signed 9002 edits in
                         // the buffer keep their master-key authority on
@@ -1999,6 +2138,21 @@ async fn groups_rebuild_worker(
                             true,
                         );
                     }
+                    fresh.trust_stored_joins = false;
+                    // DM channels are snapshot-backed: their synthetic
+                    // create/member events are never stored, so the event
+                    // replay cannot reconstruct them. Copy the live store's
+                    // current DM state after any buffered 9000/9001 edits;
+                    // the handler's direct mutations are then preserved
+                    // across the swap instead of being ghosted as missing
+                    // history.
+                    let live_dms: Vec<(String, crate::nips::nip29::Group)> = store
+                        .groups
+                        .iter()
+                        .filter(|(_, group)| group.channel_type == "dm")
+                        .map(|(gid, group)| (gid.clone(), group.clone()))
+                        .collect();
+                    fresh.adopt_live_dm_groups(live_dms);
                     *store = fresh;
                     if relay_pubkey.is_some() {
                         state
@@ -2153,7 +2307,14 @@ async fn snapshot_persist_worker(
             }
         }
         if state.groups_dirty.swap(false, Ordering::SeqCst) {
-            groups_rebuild.persist(&db, &groups).await;
+            let outcome = groups_rebuild.persist(&db, &groups).await;
+            if outcome == PersistOutcome::Deferred {
+                // A derived mutation was in flight when the capture tried
+                // to certify its generation; keep the store dirty so the
+                // worker's next pass saves it instead of dropping the
+                // post-mutation roster.
+                state.groups_dirty.store(true, Ordering::SeqCst);
+            }
         }
         if state.roles_dirty.swap(false, Ordering::SeqCst) {
             let outcome = persist_roles_now(&db, &roles, &roles_rebuild, &persist_roles_lock).await;
@@ -2445,6 +2606,12 @@ impl Relay {
                 std::process::exit(1);
             }
         };
+        let groups = {
+            let cfg = config.read().await;
+            let mut groups = GroupStore::with_cap(cfg.relay.max_groups);
+            groups.buzz_enabled = cfg.relay.enabled_buzz;
+            groups
+        };
         Relay {
             config: Arc::clone(&config),
             access: Arc::new(RwLock::new(access)),
@@ -2459,12 +2626,11 @@ impl Relay {
             live_rx: Some(live_rx),
             live_batch_interval_ms,
             live_batch_size,
-            groups: Arc::new(RwLock::new(GroupStore::with_cap(
-                config.read().await.relay.max_groups,
-            ))),
+            groups: Arc::new(RwLock::new(groups)),
             groups_rebuild: std::sync::Arc::new(GroupsRebuild::default()),
             startup_group_recovery: std::sync::atomic::AtomicBool::new(false),
             roles: Arc::new(RwLock::new(RoleStore::default())),
+            archive: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
             roles_rebuild: std::sync::Arc::new(RolesRebuild::default()),
             api_limit: ApiLimiter::new(api_max_concurrent),
             publish_rate: std::sync::Mutex::new(PublishRate::default()),
@@ -3050,6 +3216,54 @@ impl Relay {
         self.access_tx.subscribe()
     }
 
+    /// Whether `pubkey` may issue Buzz relay-admin commands: a configured
+    /// owner/NIP-86 admin, or a NIP-43 assignment with the `owner`/`admin`
+    /// role.
+    pub(crate) async fn is_relay_owner_or_admin(&self, pubkey: &str) -> bool {
+        if self
+            .relay_owner_members()
+            .await
+            .iter()
+            .any(|owner| owner.eq_ignore_ascii_case(pubkey))
+        {
+            return true;
+        }
+        self.roles
+            .read()
+            .await
+            .assignments
+            .get(pubkey)
+            .is_some_and(|roles| {
+                roles.iter().any(|role| {
+                    role.eq_ignore_ascii_case("owner") || role.eq_ignore_ascii_case("admin")
+                })
+            })
+    }
+
+    /// Applies a Buzz `kind:9033` workspace icon. The value is already
+    /// validated by the accept path; persistence follows the NIP-86
+    /// changerelayicon contract (rollback on a failed file write).
+    pub(crate) async fn apply_workspace_icon(&self, icon: &str) -> bool {
+        let previous = {
+            let mut cfg = self.config.write().await;
+            let previous = cfg.relay.icon.clone();
+            cfg.relay.icon = icon.to_string();
+            previous
+        };
+        self.config_version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.persist_relay_field("icon", icon).await {
+            return true;
+        }
+        let mut cfg = self.config.write().await;
+        if cfg.relay.icon == icon {
+            cfg.relay.icon = previous;
+        }
+        self.config_version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    }
+
     /// Persists a runtime change of one `[relay]` config field (e.g. the
     /// NIP-86 `changerelayname`/`changerelaydescription`/`changerelayicon`
     /// methods) to the config file, preserving comments and unrelated
@@ -3143,7 +3357,10 @@ impl Relay {
         let now = unix_now();
         let cfg = self.config.read().await;
         let access = self.access.read().await;
-
+        let dm_command = matches!(
+            event.kind,
+            crate::nips::nip29::DM_OPEN | crate::nips::nip29::DM_HIDE
+        );
         // NIP-43 invite-code brute-force guard (N43-L05): reserve the attempt
         // before the signature check (`precheck` verifies inline when
         // `verified` is None) and before the vanish lookup / claim
@@ -3160,11 +3377,79 @@ impl Relay {
                 return PutOutcome::Invalid("rate-limited: too many join attempts".into());
             }
         }
-
-        match self
+        let verdict = self
             .precheck(&cfg, &access, &event, now, authed, known_prefixes, verified)
-            .await
+            .await;
+        if dm_command {
+            // Buzz DM commands are relay-handled: they mutate derived group
+            // state and answer with a command response, but must not be
+            // stored as ordinary events. They go through the normal precheck
+            // first: an invalid signature, a blocked kind, PoW, tag limits
+            // or a future timestamp must never create or hide a DM.
+            match verdict {
+                crate::relay::validate::Precheck::Accept => {}
+                crate::relay::validate::Precheck::Reject(reason) => {
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    return PutOutcome::Invalid(reason);
+                }
+                crate::relay::validate::Precheck::Duplicate(msg) => {
+                    self.stats.bump(&self.stats.events_duplicate, 1);
+                    return PutOutcome::Invalid(msg);
+                }
+                crate::relay::validate::Precheck::Admit(msg) => {
+                    return PutOutcome::Invalid(msg);
+                }
+                crate::relay::validate::Precheck::Vanish => {
+                    return PutOutcome::Invalid(
+                        "blocked: a DM command cannot be a vanish request".into(),
+                    );
+                }
+            }
+            // Drop the config/access guards before the handler takes them
+            // again.
+            drop(cfg);
+            drop(access);
+            return if event.kind == crate::nips::nip29::DM_OPEN {
+                self.handle_dm_open(&event, authed).await
+            } else {
+                self.handle_dm_hide(&event, authed).await
+            };
+        }
+
+        // A live 9000 can re-add a vanished pubkey; the rebuild strips such
+        // p tags, but no rebuild is scheduled for a successful live insert.
+        // Apply the same permanent-vanish rule before storing the grant.
+        if matches!(&verdict, crate::relay::validate::Precheck::Accept)
+            && event.kind == crate::nips::nip29::PUT_USER
         {
+            let mut targets = std::collections::HashSet::new();
+            for tag in event
+                .tags
+                .iter()
+                .filter(|tag| tag.len() >= 2 && tag[0] == "p")
+            {
+                if !targets.insert(tag[1].to_ascii_lowercase()) {
+                    continue;
+                }
+                match self.db.is_vanished(&tag[1].to_ascii_lowercase()).await {
+                    Some(false) => {}
+                    Some(true) => {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        return PutOutcome::Invalid(
+                            "blocked: a group member has requested to vanish".into(),
+                        );
+                    }
+                    None => {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        return PutOutcome::Invalid(
+                            "error: cannot verify the vanish status; retry".into(),
+                        );
+                    }
+                }
+            }
+        }
+
+        match verdict {
             crate::relay::validate::Precheck::Reject(reason) => {
                 self.stats.bump(&self.stats.events_rejected, 1);
                 return PutOutcome::Invalid(reason);
@@ -3310,6 +3595,57 @@ impl Relay {
             self.stats.bump(&self.stats.events_rejected, 1);
             return PutOutcome::Invalid("rate-limited: too many events".into());
         }
+        // Bind a state event to the incarnation that validation saw. A
+        // delete/recreate between the read-side check and after_put must not
+        // let the old admin's event mutate the new group.
+        let expected_group_create =
+            if nip29::is_group_action(&event) && event.kind != nip29::CREATE_GROUP {
+                let groups = self.groups.read().await;
+                nip29::group_id(&event)
+                    .and_then(|gid| groups.group(gid))
+                    .and_then(|group| group.create_id.clone())
+            } else {
+                None
+            };
+        // Buzz kind:9033 is an admin command that changes the NIP-11 icon.
+        // Authorize and validate it before the event write; the config write
+        // happens after the read guards are dropped below.
+        let workspace_icon = if event.kind == 9033 {
+            if !self.is_relay_owner_or_admin(&event.pubkey).await {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return PutOutcome::Invalid(
+                    "restricted: only the relay owner or an admin may set the workspace icon"
+                        .into(),
+                );
+            }
+            let mut icons = event
+                .tags
+                .iter()
+                .filter(|tag| tag.len() >= 2 && tag[0] == "icon")
+                .map(|tag| tag[1].as_str());
+            let Some(icon) = icons.next() else {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return PutOutcome::Invalid("invalid: workspace icon tag is missing".into());
+            };
+            if icons.next().is_some() {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return PutOutcome::Invalid("invalid: duplicate workspace icon tag".into());
+            }
+            if icon.len() > 4_000
+                || icon.chars().any(char::is_control)
+                || (!icon.is_empty()
+                    && !icon.starts_with("https://")
+                    && !icon.starts_with("data:image/"))
+            {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return PutOutcome::Invalid(
+                    "invalid: workspace icon must be an https or data:image URL".into(),
+                );
+            }
+            Some(icon.to_string())
+        } else {
+            None
+        };
         // The first-seen record rides along with the put: applied in the
         // same write transaction (one commit/fsync) only when the event
         // actually stores.
@@ -3335,6 +3671,36 @@ impl Relay {
             (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
         drop(cfg);
         drop(access);
+        if nip29::is_group_action(&event)
+            && let Some(event_id) = event.id_bytes()
+        {
+            // Best-effort durable arrival sequence; a missing value falls
+            // back to the legacy rank/id order on replay.
+            let _ = self.db.assign_event_arrival(event_id).await;
+        }
+        if let Some(icon) = workspace_icon.as_deref()
+            && !self.apply_workspace_icon(icon).await
+        {
+            self.publish_rate_rollback(&event.pubkey, now);
+            self.stats.bump(&self.stats.events_rejected, 1);
+            return PutOutcome::Invalid(
+                "error: cannot persist the workspace icon; the command was not accepted".into(),
+            );
+        }
+        if matches!(event.kind, 9030..=9032)
+            && let Err(reason) = self.apply_relay_member_command(&event).await
+        {
+            self.publish_rate_rollback(&event.pubkey, now);
+            self.stats.bump(&self.stats.events_rejected, 1);
+            return PutOutcome::Invalid(reason);
+        }
+        if matches!(event.kind, 9035 | 9036)
+            && let Err(reason) = self.apply_identity_archive(&event).await
+        {
+            self.publish_rate_rollback(&event.pubkey, now);
+            self.stats.bump(&self.stats.events_rejected, 1);
+            return PutOutcome::Invalid(reason);
+        }
         let outcome = self
             .db
             .put_with_first_seen(Arc::clone(&event), now, first_seen)
@@ -3349,7 +3715,17 @@ impl Relay {
         }
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                match self.after_put(event, now, nip9, nip43, nip29_enabled).await {
+                match self
+                    .after_put(
+                        event,
+                        now,
+                        nip9,
+                        nip43,
+                        nip29_enabled,
+                        expected_group_create.as_deref(),
+                    )
+                    .await
+                {
                     RemovalAck::Applied(delivered) => {
                         if !delivered {
                             log::error!("event persisted but live delivery failed");
@@ -3528,6 +3904,16 @@ impl Relay {
             // its guards before admitting, exactly like the vanish branch
             // below.
             || event.kind == nip43::JOIN
+            || event.kind == crate::nips::nip29::DM_OPEN
+            || event.kind == crate::nips::nip29::DM_HIDE
+            // Buzz workspace-profile command: it mutates the NIP-11 icon.
+            || event.kind == 9033
+            // Buzz/NIP-43 relay member admin commands mutate the role store.
+            || matches!(event.kind, 9030..=9032)
+            // NIP-IA archive requests mutate the archive set and publish
+            // relay-signed state.
+            || event.kind == 9035
+            || event.kind == 9036
             || nip62::is_vanish(event)
             || (event.kind == 1 && self.relay_pubkey.as_deref() == Some(event.pubkey.as_str()))
     }
@@ -3962,7 +4348,23 @@ impl Relay {
         nip9: bool,
         nip43: bool,
         nip29_enabled: bool,
+        expected_group_create: Option<&str>,
     ) -> RemovalAck {
+        // Persist the incarnation this state event was validated against.
+        // The additive sidecar lets a replay reject a future-dated event
+        // that crosses a later delete/recreate of the same group id. A
+        // missing entry (old database) falls back to the legacy checks.
+        if let Some(create_id) = expected_group_create
+            && event.kind != nip29::CREATE_GROUP
+            && let Some(event_id) = event.id_bytes()
+            && !self.db.record_group_epoch(event_id, create_id).await
+        {
+            log::warn!(
+                "could not persist the group epoch for event {}; replay will use the \
+                 legacy create-id/timestamp checks",
+                event.id
+            );
+        }
         let mut removal_failed = false;
         // A removal that could not be applied, held for the pending-record
         // flush. See `Self::hold_pending_removal` for why the request cannot
@@ -4070,7 +4472,9 @@ impl Relay {
             self.apply_leave_request(&event).await;
         }
         if nip29_enabled && nip29::is_group_action(&event) {
-            let (applied, group_unapplied) = self.apply_group_event(&event, now).await;
+            let (applied, group_unapplied) = self
+                .apply_group_event(&event, now, expected_group_create)
+                .await;
             if !applied {
                 removal_failed = true;
             }
@@ -4236,6 +4640,24 @@ impl Relay {
         self.persist_groups_outcome().await == PersistOutcome::Committed
     }
 
+    /// Persists group state only when a successful return means the current
+    /// store is actually restorable. `persist_groups` reports a stale-state
+    /// snapshot *clear* as `Committed`; that is correct for the fail-closed
+    /// maintenance paths but not for a DM/command ACK, where it would claim
+    /// durability for a state the next rebuild cannot reconstruct.
+    pub(crate) async fn persist_groups_durable(&self) -> bool {
+        if self.groups_rebuild.pending.load(Ordering::SeqCst)
+            || self.groups.read().await.is_unrestored()
+        {
+            return false;
+        }
+        if !self.persist_groups().await {
+            return false;
+        }
+        !self.groups_rebuild.pending.load(Ordering::SeqCst)
+            && !self.groups.read().await.is_unrestored()
+    }
+
     /// Like [`Self::persist_groups`], reporting a deferred save (a derived
     /// mutation was in flight) separately from a failed one: callers must
     /// only treat `Failed` as fail-closed (the state may still be current).
@@ -4262,6 +4684,9 @@ impl Relay {
     /// a large group once their interval has elapsed. The stats tick calls
     /// this, so a dropped update is delayed, never lost.
     pub(crate) async fn republish_due_group_members(&self) {
+        if !self.config.read().await.nip_enabled(29) {
+            return;
+        }
         let Some(relay_pubkey) = self.relay_pubkey() else {
             return;
         };
@@ -4393,9 +4818,26 @@ impl Relay {
             return false;
         };
         let now = self.stamp_floor(unix_now());
+        let mut extra_members = Vec::new();
+        for pubkey in self.allowlisted_members().await {
+            match self.db.is_vanished(&pubkey).await {
+                Some(false) => extra_members.push(pubkey),
+                Some(true) => {}
+                None => return false,
+            }
+        }
+        let mut owners = Vec::new();
+        for pubkey in self.relay_owner_members().await {
+            match self.db.is_vanished(&pubkey).await {
+                Some(false) => owners.push(pubkey),
+                Some(true) => {}
+                None => return false,
+            }
+        }
         let events = {
             let roles = self.roles.read().await;
-            let mut events = vec![roles.membership_event(&relay_pubkey, now)];
+            let mut events =
+                vec![roles.membership_event(&relay_pubkey, now, &extra_members, &owners)];
             for id in roles.roles.keys() {
                 events.push(roles.role_event(id, &relay_pubkey, now));
             }
@@ -4406,6 +4848,43 @@ impl Relay {
             all_stored &= self.store_relay_event(&mut event).await.is_ok();
         }
         all_stored
+    }
+
+    /// Replays the bounded role-rebuild journal persisted at shutdown.
+    /// Returns whether a journal existed; the caller persists the store and
+    /// clears the journal only after that succeeds.
+    pub(crate) async fn apply_role_rebuild_journal(&self) -> anyhow::Result<bool> {
+        let Some(data) = self.db.load_role_rebuild_pending().await else {
+            return Err(anyhow::anyhow!(
+                "cannot read the role rebuild mutation journal; refusing to start \
+                 with potentially lost role mutations"
+            ));
+        };
+        let Some(data) = data else {
+            return Ok(false);
+        };
+        let mutations: Vec<BufferedRoleMutation> = serde_json::from_slice(&data)
+            .map_err(|error| anyhow::anyhow!("invalid role rebuild mutation journal: {error}"))?;
+        let mut roles = self.roles.write().await;
+        for mutation in &mutations {
+            if !replay_role_mutation(&mut roles, mutation) {
+                log::warn!(
+                    "role rebuild journal mutation could not be applied to the rebuilt \
+                     store: {mutation:?}"
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// Clears the journal after the replayed state has been persisted.
+    pub(crate) async fn clear_role_rebuild_journal(&self) {
+        if !self.db.clear_role_rebuild_pending().await {
+            log::warn!(
+                "could not clear the role rebuild mutation journal; the next startup \
+                 will replay it again"
+            );
+        }
     }
 
     /// Heals the NIP-43 role state left by a previous relay key.
@@ -4537,6 +5016,18 @@ impl Relay {
         if more {
             return false;
         }
+        let owners: std::collections::HashSet<String> = self
+            .relay_owner_members()
+            .await
+            .into_iter()
+            .map(|pubkey| pubkey.to_ascii_lowercase())
+            .collect();
+        let allowlisted: std::collections::HashSet<String> = self
+            .allowlisted_members()
+            .await
+            .into_iter()
+            .map(|pubkey| pubkey.to_ascii_lowercase())
+            .collect();
         let roles = self.roles.read().await;
         for event in events {
             if event.pubkey.eq_ignore_ascii_case(relay_pubkey) {
@@ -4571,11 +5062,44 @@ impl Relay {
                         if tag.len() < 2 || tag[0] != "member" {
                             continue;
                         }
-                        let Some(assigned) = roles.assignments.get(&tag[1]) else {
-                            return false;
-                        };
-                        if !tag[2..].iter().all(|role| assigned.contains(role)) {
-                            return false;
+                        let roles_in_tag: Vec<&str> = tag[2..]
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|role| !role.is_empty())
+                            .collect();
+                        let pubkey = tag[1].to_ascii_lowercase();
+                        let synthetic_owner =
+                            roles_in_tag.as_slice() == ["owner"] && owners.contains(&pubkey);
+                        if synthetic_owner {
+                            // `membership_event` overwrites an owner entry
+                            // to exactly `owner`, even if the same pubkey
+                            // also has a role assignment. Check this before
+                            // the assignment branch so that configuration
+                            // does not keep the former key's events forever.
+                            continue;
+                        }
+                        if let Some(assigned) = roles.assignments.get(&tag[1]) {
+                            if !roles_in_tag
+                                .iter()
+                                .all(|role| assigned.iter().any(|assigned| assigned == role))
+                            {
+                                return false;
+                            }
+                        } else {
+                            let synthetic_allowlist =
+                                roles_in_tag.is_empty() && allowlisted.contains(&pubkey);
+                            // `membership_event` injects these entries from
+                            // the current owner identities/allowlist. They
+                            // have no role assignment, so requiring one made
+                            // every production roster fail this coverage
+                            // check and kept the former key's events forever.
+                            // Only current synthetic entries count: an old
+                            // owner/member removed from config stays
+                            // uncovered, so the cleanup keeps the former
+                            // events rather than guessing.
+                            if !synthetic_allowlist {
+                                return false;
+                            }
                         }
                     }
                 }
@@ -5188,15 +5712,30 @@ impl Relay {
     /// rebuilds from the surviving events; `persist_roles` refuses to
     /// overwrite it until the rebuild completes.
     pub(crate) async fn mark_roles_stale(&self) {
-        // Flag the rebuild first so the snapshot persistence stops saving the
-        // state as soon as the removal is known (the database generation has
-        // already advanced). `marking` is only for the persist paths: the
-        // mutation-visible `dirty` is stored *under the buffer lock* below so
-        // a mutation holding the lock sees a stable value (N43-M01).
+        if !self.config.read().await.nip_enabled(43) {
+            // The role store was never loaded and nothing serves NIP-43.
+            // Leave the persisted snapshot and its claims untouched; the
+            // advanced DB generation makes the next enabled startup reject
+            // it, carry its claims, and rebuild from the surviving events.
+            return;
+        }
+        // Publish the mutation-visible dirty flag immediately, before
+        // waiting for the mutation buffer. The DB removal has already
+        // committed, so a concurrent mutation that reaches the publish path
+        // must not store a pre-removal full 13534 and thereby resurrect the
+        // removed state on the next rebuild.
+        self.roles_rebuild
+            .removal_committed
+            .store(true, Ordering::SeqCst);
+        self.roles_rebuild
+            .removal_epoch
+            .fetch_add(1, Ordering::SeqCst);
+        self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
         self.roles_rebuild.marking.store(true, Ordering::SeqCst);
         let marking = RoleMarkingGuard(&self.roles_rebuild.marking);
         let buffer = self.roles_rebuild.buffer.lock().await;
-        self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
+        // Keep the early store: it covers a mutation that observed the flag
+        // before this mark; the buffer lock now serializes revocation.
         // `dirty` now covers the persist paths; release the early flag.
         drop(marking);
         let claims = {
@@ -5217,19 +5756,21 @@ impl Relay {
             self.relay_pubkey().unwrap_or_default(),
             Arc::clone(&self.persist_roles_lock),
             Arc::clone(&self.roles_rebuild),
-            self.role_state_publisher(),
+            self.role_state_publisher().await,
             self.subscribe_drain(),
         );
     }
 
     /// The handles the role rebuild worker needs to republish the membership
     /// list after a clean rebuild (see [`RoleStatePublisher`]).
-    fn role_state_publisher(&self) -> RoleStatePublisher {
+    async fn role_state_publisher(&self) -> RoleStatePublisher {
         RoleStatePublisher {
             key: self.key,
             stamps: Arc::clone(&self.stamps),
             live_tx: self.live_tx.clone(),
             stats: Arc::clone(&self.stats),
+            extra_members: Arc::new(self.allowlisted_members().await),
+            owners: Arc::new(self.relay_owner_members().await),
         }
     }
 
@@ -5316,10 +5857,17 @@ impl Relay {
         }
         if state_removed.role {
             log::warn!(
-                "startup recovery removed a NIP-43 role-state event; rebuilding the role \
-                 state from the surviving events"
+                "startup recovery removed a NIP-43 role-state event; deferring the role \
+                 rebuild until the startup snapshot restore has loaded the invite claims"
             );
-            self.mark_roles_stale().await;
+            // Do not call `mark_roles_stale` here: that revokes the live
+            // store and schedules a worker while the snapshot (and its
+            // snapshot-only invite claims) is still unloaded. The startup
+            // `restore_role_state` sees the advanced state generation,
+            // rejects the stale snapshot, carries the claims across, and
+            // owns the rebuild. The dirty flag keeps `persist_roles` from
+            // certifying the empty pre-restore store.
+            self.roles_rebuild.dirty.store(true, Ordering::SeqCst);
         }
     }
 
@@ -5333,6 +5881,31 @@ impl Relay {
     /// Role-side counterpart of [`Self::begin_group_derived`].
     pub(crate) fn begin_role_derived(&self) -> impl Drop + '_ {
         self.roles_rebuild.derived.begin()
+    }
+
+    /// Releases the NIP-43 recovery-pending flag after the startup
+    /// `restore_role_state` has rebuilt the authoritative store. The rebuild
+    /// is synchronous and happens before the server accepts traffic, so no
+    /// coalesced worker owns the state here.
+    pub(crate) fn finish_startup_role_recovery(&self) {
+        self.roles_rebuild.dirty.store(false, Ordering::SeqCst);
+    }
+
+    /// Protect the last persisted NIP-43 snapshot after an empty/keyless/
+    /// rotated-key rebuild. A later reload or mutation must not overwrite it
+    /// with an empty roster until a real role change supersedes it.
+    pub(crate) fn preserve_role_snapshot(&self) {
+        self.roles_rebuild
+            .preserve_snapshot
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// A non-empty rebuild or a real role mutation made the current store
+    /// authoritative again; allow persistence.
+    pub(crate) fn release_role_snapshot_preserve(&self) {
+        self.roles_rebuild
+            .preserve_snapshot
+            .store(false, Ordering::SeqCst);
     }
 
     /// Releases the startup recovery gate after `startup_group_state` has
@@ -5395,6 +5968,62 @@ impl Relay {
         }
     }
 
+    /// Recovers a stored `9008` whose purge was never recorded (the process
+    /// crashed between the event/ghost commit and `group_purge`). Such a
+    /// group is absent from the restored store but still has `h`-tagged
+    /// history, so it must be purged or kept ghosted before serving. This is
+    /// the startup counterpart to the live delete path; a re-created group
+    /// is present in the store and is skipped.
+    pub(crate) async fn recover_unrecorded_group_purges(&self) -> bool {
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({ "kinds": [nip29::DELETE_GROUP] }))
+                .expect("static filter");
+        let Some((events, more)) = self
+            .db
+            .query_full_startup(vec![filter], 10_000, unix_now(), true)
+            .await
+        else {
+            log::error!(
+                "cannot read stored 9008 events; refusing to serve without completing \
+                 crash-interrupted group purges"
+            );
+            return false;
+        };
+        if more {
+            log::error!(
+                "stored 9008 scan was truncated; refusing to serve without completing every \
+                 crash-interrupted group purge"
+            );
+            return false;
+        }
+        for event in events {
+            let Some(gid) = nip29::group_id(&event) else {
+                continue;
+            };
+            if self.groups.read().await.group(gid).is_some() {
+                // A re-created id is live; its later events must survive.
+                continue;
+            }
+            let removed = self.db.group_purge(gid.to_string(), unix_now()).await;
+            self.stats
+                .bump(&self.stats.events_deleted, removed.unwrap_or(0) as u64);
+            if self.group_purge_confirmed(gid, u64::MAX).await {
+                self.unghost_confirmed(gid).await;
+                if self.persist_groups_outcome().await == PersistOutcome::Failed {
+                    log::error!("could not persist the recovered purge for {gid}");
+                }
+            } else {
+                // The purge did not complete: keep the id ghosted so a
+                // later create cannot expose the surviving history.
+                self.ghost_deleted_group(gid).await;
+                if self.persist_groups_outcome().await == PersistOutcome::Failed {
+                    log::error!("could not persist the fail-closed ghost for {gid}");
+                }
+            }
+        }
+        true
+    }
+
     /// Resumes one recorded purge (see [`Self::resume_pending_purges`]):
     /// re-runs the purge, confirms it, then downgrades the ghost to the
     /// ordinary delete tombstone and persists. Kept separate from the
@@ -5411,6 +6040,52 @@ impl Relay {
                 "could not persist the pending-purge ghost for {gid}; the persisted state \
                  stays fail-closed"
             );
+        }
+        // The purge also removes every 30622 snapshot carrying this DM in
+        // an `h` tag. Capture the affected viewers before the walk so the
+        // resumed purge can rebuild their remaining hidden-DM list, exactly
+        // like the live 9008 path.
+        let dm_visibility_viewers = if until == u64::MAX {
+            // A failed presentation read must not block the security purge
+            // forever: continue with no captured viewers (the task may leave
+            // an old sidebar snapshot stale, but the deleted group's history
+            // is still purged).
+            self.dm_visibility_viewers(gid).await.unwrap_or_else(|| {
+                log::warn!(
+                    "could not read DM visibility snapshots for the resumed purge of {gid}; \
+                     continuing without rebuilding them"
+                );
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
+        if until == u64::MAX && self.relay_pubkey_ref().is_some() {
+            // Rebuild before the purge for the same crash-safety reason as
+            // the live 9008 path. If a rebuild fails, keep the purge pending
+            // rather than deleting a snapshot that could not be replaced.
+            // A relay without a signing key cannot have produced a 30622;
+            // do not let that block the purge.
+            let mut rebuilt = true;
+            for viewer in &dm_visibility_viewers {
+                if let Err(()) = self
+                    .publish_dm_visibility_excluding(viewer, Some(gid))
+                    .await
+                {
+                    rebuilt = false;
+                    log::warn!(
+                        "could not rebuild the DM visibility snapshot while resuming the \
+                         purge of {gid}"
+                    );
+                }
+            }
+            if !rebuilt {
+                log::error!(
+                    "keeping the resumed group purge of {gid} pending: a DM visibility \
+                     snapshot could not be rebuilt"
+                );
+                return;
+            }
         }
         let removed = self
             .db
@@ -5467,7 +6142,6 @@ impl Relay {
         let pubkey_hex = hex::encode(pubkey);
         let nip29_enabled = self.config.read().await.nip_enabled(29);
         let nip43_enabled = self.config.read().await.nip_enabled(43);
-        let mut affected_gids: Vec<String> = Vec::new();
         let mut role_changed = false;
         // The removal commits in the database before the in-memory derived
         // state is updated: hold the in-flight claims until the per-store
@@ -5492,25 +6166,27 @@ impl Relay {
                 }
             };
         self.stats.bump(&self.stats.events_deleted, removed as u64);
-        if nip29_enabled && !state_removed.group {
-            // A replayed vanish, one that removed nothing, or one that only
-            // deleted ordinary posts: the live state only needs the vanished
-            // pubkey dropped from its memberships, and only a real change is
-            // worth a snapshot write. The removal is not reconstructible
-            // from the database (an admin's surviving 9000 may re-add the
-            // pubkey after the scan's vanished-set snapshot), so an
-            // in-flight rebuild discards its scan.
-            {
-                let mut buffer = self.groups_rebuild.buffer.lock().await;
-                if buffer.scanning {
-                    buffer.retry = true;
-                }
-                let mut groups = self.groups.write().await;
-                affected_gids = groups.remove_member_everywhere(&pubkey_hex);
+        // Drop the vanished pubkey from every live group even while NIP-29
+        // is disabled: the group store still gates private content and is
+        // restored from its snapshot independently of the NIP toggle. A
+        // later re-enable must not restore the pre-vanish member from that
+        // snapshot. The DM state is snapshot-backed: its synthetic
+        // 9007/9000 never exist in the event history, so a rebuild cannot
+        // derive the removal. An in-flight rebuild also discards its scan
+        // when this removal changes live state (the DMs it would adopt are
+        // taken from the live store after the scan).
+        let affected_gids: Vec<String> = {
+            let mut buffer = self.groups_rebuild.buffer.lock().await;
+            if buffer.scanning {
+                buffer.retry = true;
             }
-        }
+            let mut groups = self.groups.write().await;
+            groups.remove_member_everywhere(&pubkey_hex)
+        };
         // NIP-43 role assignments hold pubkeys too: a vanished author must
-        // not keep its roles.
+        // not keep its roles. Force-buffer the removal while a rebuild owns
+        // the revoked empty store, exactly like a leave request; otherwise
+        // the rebuilt member list would resurrect the assignment.
         if nip43_enabled {
             let mut buffer = self.roles_rebuild.buffer.lock().await;
             // `dirty`/`running` are stable under the buffer lock. A vanish
@@ -5574,18 +6250,63 @@ impl Relay {
                 .await;
         }
         drop(groups_in_flight);
-        if nip29_enabled
-            && !state_removed.group
-            && !affected_gids.is_empty()
-            && !self.persist_groups().await
-        {
-            log::error!(
-                "could not persist the group state after a vanish; it will be \
-                 rebuilt on the next restart"
-            );
+        if !state_removed.group && !affected_gids.is_empty() {
+            match self.persist_groups_outcome().await {
+                PersistOutcome::Committed => {}
+                // A derived mutation held the in-flight claim, so nothing
+                // was written. The vanish removal is not a stored group
+                // event; on a keyless relay no 9001 mirror advances the
+                // sequence either. Drop the snapshot and rebuild fail-closed
+                // instead of leaving the pre-vanish roster restorable if the
+                // process exits before the debounced worker runs.
+                PersistOutcome::Deferred => {
+                    log::warn!(
+                        "group snapshot deferred after a vanish; forcing a fail-closed rebuild"
+                    );
+                    self.mark_group_state_stale_for(&affected_gids).await;
+                }
+                PersistOutcome::Failed => {
+                    log::error!(
+                        "could not persist the group state after a vanish; forcing a \
+                         fail-closed rebuild so a stale snapshot cannot resurrect the member"
+                    );
+                    // The removal is reconstructible from the surviving
+                    // history only after filtering the vanished pubkey: a
+                    // keyless relay has no relay-signed 9001 mirror to
+                    // advance the state sequence. Drop the snapshot and let
+                    // the rebuild reapply the vanish filter instead of
+                    // restoring the pre-vanish roster.
+                    self.mark_group_state_stale_for(&affected_gids).await;
+                }
+            }
         }
         drop(roles_in_flight);
-        if nip43_enabled && role_changed {
+        let synthetic_member = nip43_enabled
+            && (self
+                .allowlisted_members()
+                .await
+                .iter()
+                .any(|pk| pk.eq_ignore_ascii_case(&pubkey_hex))
+                || self
+                    .relay_owner_members()
+                    .await
+                    .iter()
+                    .any(|pk| pk.eq_ignore_ascii_case(&pubkey_hex)));
+        if nip43_enabled && (role_changed || synthetic_member) {
+            let pending = self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                || self.roles_rebuild.running.load(Ordering::SeqCst)
+                || self.roles_rebuild.marking.load(Ordering::SeqCst);
+            let published = if pending {
+                // The live store is revoked; publishing its empty full list
+                // would overwrite the last good 13534. A remove-user event
+                // announces the vanish now; the rebuild restores the rest.
+                self.publish_remove_user(&pubkey_hex).await
+            } else {
+                self.publish_membership(None).await
+            };
+            if !published {
+                log::warn!("could not republish the NIP-43 roster after a vanish");
+            }
             self.schedule_roles_persist();
         }
         true
@@ -5606,8 +6327,15 @@ impl Relay {
         };
         let stamp = self.stamp_floor(unix_now());
         for gid in gids {
+            let create_id = self
+                .groups
+                .read()
+                .await
+                .group(gid)
+                .and_then(|group| group.create_id.clone());
             let mut event =
                 crate::nips::nip29::events::build_remove_user(gid, pubkey, &relay_pubkey, stamp);
+            crate::nips::nip29::events::attach_create_id(&mut event, create_id.as_deref());
             if self.store_relay_event(&mut event).await.is_err() {
                 log::error!("could not store the relay-signed 9001 for a vanished member in {gid}");
             }
@@ -5627,7 +6355,12 @@ impl Relay {
     /// not buffered — its ghost/tombstone/purge outcome is not
     /// reconstructible from the database — so it forces the worker to
     /// discard the scan and rebuild instead.
-    async fn apply_group_state(&self, event: &Event, now: u64) -> Vec<Event> {
+    async fn apply_group_state(
+        &self,
+        event: &Event,
+        now: u64,
+        expected_group_create: Option<&str>,
+    ) -> Vec<Event> {
         let relay_pubkey = self.relay_pubkey().unwrap_or_default();
         // Relay-generated events are stamped with the strictly monotonic
         // clock (not plain `now`): two events applied in the same second
@@ -5639,6 +6372,19 @@ impl Relay {
         // wall time catches up after a restart).
         let stamp = self.stamp_floor(now);
         let mut buffer = self.groups_rebuild.buffer.lock().await;
+        // Take the store lock while still holding the buffer lock (the
+        // worker's established order), then re-check the incarnation. A
+        // delete/recreate between validation and this point must not let the
+        // old event mutate or be buffered into the new group's replay.
+        let mut groups = self.groups.write().await;
+        if let Some(expected) = expected_group_create {
+            let current = nip29::group_id(event)
+                .and_then(|gid| groups.group(gid))
+                .and_then(|group| group.create_id.as_deref());
+            if current != Some(expected) {
+                return Vec::new();
+            }
+        }
         if buffer.scanning {
             if event.kind == nip29::DELETE_GROUP {
                 buffer.retry = true;
@@ -5651,10 +6397,7 @@ impl Relay {
                 });
             }
         }
-        self.groups
-            .write()
-            .await
-            .apply(event, &relay_pubkey, stamp, self.has_relay_key(), false)
+        groups.apply(event, &relay_pubkey, stamp, self.has_relay_key(), false)
     }
 
     /// Marks a `9008` id as a ghost on the live store, before the delete is
@@ -5722,6 +6465,7 @@ impl Relay {
         &self,
         event: &Event,
         now: u64,
+        expected_group_create: Option<&str>,
     ) -> (bool, Option<crate::db::store::PendingDeletion>) {
         // Serialize the apply and its generated events with a LiveKit
         // refresh for the same group: a refresh that passed
@@ -5735,6 +6479,18 @@ impl Relay {
         };
         let mut removal_failed = false;
         let mut unapplied = None;
+        // A DM's 30622 snapshots carry this group in an `h` tag and are
+        // removed by the purge. Capture the live `hidden_for` set before the
+        // delete removes the group, so a failed/interrupted purge can still
+        // rebuild the viewers' snapshots from the other hidden DMs.
+        let dm_hidden_viewers = if event.kind == nip29::DELETE_GROUP {
+            match nip29::group_id(event) {
+                Some(gid) => self.dm_hidden_viewers(gid).await,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         // A `kind:9008` purge may fail (or the process may crash before it
         // commits). The delete tombstone alone would let a later create
         // clear it and expose the un-purged history, so the id is ghosted
@@ -5753,7 +6509,9 @@ impl Relay {
                 );
             }
         }
-        let generated = self.apply_group_state(event, now).await;
+        let generated = self
+            .apply_group_state(event, now, expected_group_create)
+            .await;
         // Debounced persistence: restarts restore from the snapshot instead
         // of replaying history, and a skipped save is detected at startup
         // through the group-state sequence (`DbClient::state_seq_group`).
@@ -5845,6 +6603,38 @@ impl Relay {
             // stats), so success is confirmed by the state below: only then
             // does the id return to the ordinary delete tombstone (which a
             // create may clear).
+            //
+            // A NIP-DV 30622 snapshot lists every hidden DM in one event
+            // with one `h` tag per channel. The purge removes it with the
+            // deleted DM, so combine the live hidden set captured before the
+            // state deletion with the stored snapshots and rebuild the
+            // viewers' remaining snapshots. The rebuilt snapshot no longer
+            // carries an `h` tag for this id, so a later purge retry cannot
+            // remove it again.
+            let mut dm_visibility_viewers = dm_hidden_viewers;
+            match self.dm_visibility_viewers(gid).await {
+                Some(viewers) => dm_visibility_viewers.extend(viewers),
+                None => log::warn!(
+                    "could not read stored DM visibility snapshots before purging {gid}; \
+                     using the live hidden set"
+                ),
+            }
+            dm_visibility_viewers.sort();
+            dm_visibility_viewers.dedup();
+            // Rebuild before the irreversible purge. The fresh snapshot
+            // omits this id, so the purge cannot delete it; a crash after
+            // the purge therefore cannot lose the viewer's other hidden
+            // DMs.
+            for viewer in &dm_visibility_viewers {
+                if let Err(()) = self
+                    .publish_dm_visibility_excluding(viewer, Some(gid))
+                    .await
+                {
+                    log::warn!(
+                        "could not rebuild the DM visibility snapshot before deleting {gid}"
+                    );
+                }
+            }
             let removed = self.db.group_purge(gid.to_string(), unix_now()).await;
             self.stats
                 .bump(&self.stats.events_deleted, removed.unwrap_or(0) as u64);
@@ -5862,29 +6652,7 @@ impl Relay {
             }
         }
 
-        // One moderation event can generate several versions of the same
-        // replaceable metadata slot (e.g. a parent loses two adopted
-        // children in one 9002, rebuilding its 39000 after each removal).
-        // They all share the single per-apply stamp, so the NIP-01 id
-        // tie-break would keep one arbitrarily — retaining the stale
-        // version when its id happens to be lower and dropping the
-        // corrected one as a duplicate. Keep only the last build per `d`
-        // slot: the emit order lists the group's final state last.
-        let mut seen = std::collections::HashSet::new();
-        let mut generated: Vec<Event> = generated
-            .into_iter()
-            .rev()
-            .filter(|ev| {
-                let d = ev
-                    .tags
-                    .iter()
-                    .find(|t| t.len() >= 2 && t[0] == "d")
-                    .map(|t| t[1].clone())
-                    .unwrap_or_default();
-                seen.insert((ev.kind, d))
-            })
-            .collect();
-        generated.reverse();
+        let generated = dedup_generated_events(generated);
 
         for mut ev in generated {
             let participants_gid = if ev.kind == crate::nips::nip29::GROUP_PARTICIPANTS {
@@ -6019,7 +6787,7 @@ impl PendingBatch {
             let mut ack_override = None;
             match outcome {
                 PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                    let ack = relay.after_put(event, now, nip9, nip43, nip29).await;
+                    let ack = relay.after_put(event, now, nip9, nip43, nip29, None).await;
                     match ack {
                         RemovalAck::Applied(delivered) => {
                             if !delivered {
@@ -6076,6 +6844,36 @@ impl PendingBatch {
 
         results
     }
+}
+
+/// One moderation event can generate several versions of the same
+/// replaceable metadata slot (e.g. a parent loses two adopted children in one
+/// 9002, rebuilding its 39000 after each removal). They all share the single
+/// per-apply stamp, so the NIP-01 id tie-break would keep one arbitrarily —
+/// retaining the stale version when its id happens to be lower and dropping
+/// the corrected one as a duplicate. Keep only the last build per `d` slot:
+/// the emit order lists the group's final state last. Events without a `d`
+/// tag (per-member 40099/44100/44101 notices and relay-signed 9000/9001
+/// mirrors) are not replaceable slots and must all be kept.
+fn dedup_generated_events(generated: Vec<Event>) -> Vec<Event> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<Event> = generated
+        .into_iter()
+        .rev()
+        .filter(|event| {
+            let Some(d) = event
+                .tags
+                .iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == "d")
+                .map(|tag| tag[1].clone())
+            else {
+                return true;
+            };
+            seen.insert((event.kind, d))
+        })
+        .collect();
+    out.reverse();
+    out
 }
 
 #[cfg(test)]
@@ -6149,6 +6947,206 @@ mod tests {
         )
         .await;
         std::sync::Arc::new(relay)
+    }
+
+    #[test]
+    fn generated_event_dedup_keeps_per_member_notices_and_last_metadata() {
+        let notice = |target: &str| crate::event::Event {
+            id: String::new(),
+            pubkey: "relay".into(),
+            created_at: 1,
+            kind: 44100,
+            tags: vec![
+                vec!["p".into(), target.into()],
+                vec!["h".into(), "g1".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let meta = |name: &str| crate::event::Event {
+            id: String::new(),
+            pubkey: "relay".into(),
+            created_at: 1,
+            kind: 39000,
+            tags: vec![
+                vec!["d".into(), "g1".into()],
+                vec!["name".into(), name.into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let events = super::dedup_generated_events(vec![
+            notice("aa"),
+            notice("bb"),
+            meta("old"),
+            meta("new"),
+        ]);
+        assert_eq!(
+            events.iter().filter(|event| event.kind == 44100).count(),
+            2,
+            "every per-member notice must survive deduplication"
+        );
+        let metadata: Vec<&crate::event::Event> =
+            events.iter().filter(|event| event.kind == 39000).collect();
+        assert_eq!(metadata.len(), 1);
+        assert!(
+            metadata[0]
+                .tags
+                .contains(&vec!["name".into(), "new".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_open_reuses_an_existing_channel_after_key_rotation() {
+        let relay = build_relay_with_key(false, &"21".repeat(32)).await;
+        relay.groups.write().await.buzz_enabled = true;
+        relay.config.write().await.relay.enabled_buzz = true;
+        let a = secp256k1::Keypair::from_secret_bytes([5u8; 32]).unwrap();
+        let b = secp256k1::Keypair::from_secret_bytes([6u8; 32]).unwrap();
+        let a_pk = secp256k1::XOnlyPublicKey::from_keypair(&a).0.to_string();
+        let b_pk = secp256k1::XOnlyPublicKey::from_keypair(&b).0.to_string();
+        let now = crate::util::unix_now();
+        {
+            let mut groups = relay.groups.write().await;
+            let mut group = crate::nips::nip29::Group {
+                channel_type: "dm".into(),
+                created_at: Some(now - 100),
+                ..crate::nips::nip29::Group::default()
+            };
+            group
+                .members
+                .insert(a_pk.clone(), ["admin".to_string()].into());
+            group
+                .members
+                .insert(b_pk.clone(), std::collections::HashSet::new());
+            group.settings.private = true;
+            group.settings.restricted = true;
+            group.settings.closed = true;
+            group.settings.hidden = true;
+            groups.groups.insert("old-dm".into(), group);
+        }
+        let open = crate::event::Event {
+            id: String::new(),
+            pubkey: a_pk,
+            created_at: now,
+            kind: crate::nips::nip29::DM_OPEN,
+            tags: vec![vec!["p".into(), b_pk]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let outcome = relay.handle_dm_open(&open, &[]).await;
+        let channel = match outcome {
+            crate::db::PutOutcome::Duplicate(message) => {
+                let json = message.strip_prefix("response:").expect("DM response");
+                serde_json::from_str::<serde_json::Value>(json).unwrap()["channel_id"]
+                    .as_str()
+                    .expect("channel id")
+                    .to_string()
+            }
+            other => panic!("DM open failed: {other:?}"),
+        };
+        assert_eq!(
+            channel, "old-dm",
+            "the existing participant channel must survive key rotation"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dm_open_does_not_delete_an_existing_channel_when_a_participant_was_removed() {
+        let relay = build_relay_with_key(false, &"11".repeat(32)).await;
+        relay.groups.write().await.buzz_enabled = true;
+        relay.config.write().await.relay.enabled_buzz = true;
+
+        let a = secp256k1::Keypair::from_secret_bytes([1u8; 32]).unwrap();
+        let b = secp256k1::Keypair::from_secret_bytes([2u8; 32]).unwrap();
+        let a_pk = secp256k1::XOnlyPublicKey::from_keypair(&a).0.to_string();
+        let b_pk = secp256k1::XOnlyPublicKey::from_keypair(&b).0.to_string();
+        let now = crate::util::unix_now();
+        let open = |from: &str, to: &str| crate::event::Event {
+            id: String::new(),
+            pubkey: from.to_string(),
+            created_at: now,
+            kind: crate::nips::nip29::DM_OPEN,
+            tags: vec![vec!["p".into(), to.to_string()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+
+        let outcome = relay.handle_dm_open(&open(&a_pk, &b_pk), &[]).await;
+        let channel = match &outcome {
+            crate::db::PutOutcome::Duplicate(message) => {
+                let json = message.strip_prefix("response:").expect("DM response");
+                serde_json::from_str::<serde_json::Value>(json).unwrap()["channel_id"]
+                    .as_str()
+                    .expect("channel id")
+                    .to_string()
+            }
+            other => panic!("DM open failed: {other:?}"),
+        };
+        // The ACK is only safe after the DM group state is durable: a
+        // pre-DM snapshot would make the unknown channel id public on the
+        // next restart.
+        let snapshot = relay.db.load_groups().await.expect_loaded("snapshot");
+        assert!(
+            snapshot.groups.contains_key(&channel),
+            "the DM must be persisted before handle_dm_open acknowledges it"
+        );
+
+        // Re-opening immediately must refresh the 39000 without colliding
+        // with the create-time replaceable event.
+        let reopened = relay.handle_dm_open(&open(&a_pk, &b_pk), &[]).await;
+        assert!(
+            matches!(reopened, crate::db::PutOutcome::Duplicate(_)),
+            "an existing DM re-open must succeed: {reopened:?}"
+        );
+
+        // Simulate an admin removing one participant after the DM existed.
+        let relay_pubkey = relay.relay_pubkey().expect("relay key");
+        let remove = crate::event::Event {
+            id: String::new(),
+            pubkey: a_pk.clone(),
+            created_at: now.saturating_add(1),
+            kind: crate::nips::nip29::REMOVE_USER,
+            tags: vec![
+                vec!["h".into(), channel.clone()],
+                vec!["p".into(), b_pk.clone()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay.groups.write().await.apply(
+            &remove,
+            &relay_pubkey,
+            now.saturating_add(1),
+            false,
+            false,
+        );
+        assert!(
+            !relay
+                .groups
+                .read()
+                .await
+                .group(&channel)
+                .unwrap()
+                .is_member(&b_pk)
+        );
+
+        // Re-opening from the removed participant (or from the remaining
+        // one) cannot make the channel complete again. It must be rejected
+        // without destroying the existing DM for its remaining members.
+        for (from, to) in [(&b_pk, &a_pk), (&a_pk, &b_pk)] {
+            let outcome = relay.handle_dm_open(&open(from, to), &[]).await;
+            assert!(
+                matches!(outcome, crate::db::PutOutcome::Invalid(_)),
+                "an incomplete existing DM must be rejected: {outcome:?}"
+            );
+            assert!(
+                relay.groups.read().await.group(&channel).is_some(),
+                "the existing DM must survive a rejected re-open"
+            );
+        }
+        relay.db.shutdown();
     }
 
     #[tokio::test]
@@ -6590,6 +7588,328 @@ mod tests {
                 .iter()
                 .any(|t| t == &vec!["p".into(), member.clone()])),
             "the mid-flight leave must still announce its departure"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn role_rebuild_journal_replays_captured_removal() {
+        let relay = build_relay().await;
+        let member = "aa".repeat(32);
+        assert!(relay.roles.write().await.admit(&member));
+        let journal = vec![BufferedRoleMutation::RemovePubkey {
+            pubkey: member.clone(),
+        }];
+        assert!(
+            relay
+                .db
+                .save_role_rebuild_pending(serde_json::to_vec(&journal).unwrap())
+                .await
+        );
+        assert!(relay.apply_role_rebuild_journal().await.unwrap());
+        assert!(
+            !relay.roles.read().await.is_member_of(&member),
+            "the persisted removal must be applied to the rebuilt store"
+        );
+        relay.clear_role_rebuild_journal().await;
+        assert_eq!(relay.db.load_role_rebuild_pending().await, Some(None));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn relay_member_commands_update_the_roster() {
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let owner = "aa".repeat(32);
+        let target = "bb".repeat(32);
+        relay.config.write().await.relay.pubkey = owner.clone();
+        let command = |kind: u64, tags: Vec<Vec<String>>| crate::event::Event {
+            id: String::new(),
+            pubkey: owner.clone(),
+            created_at: crate::util::unix_now(),
+            kind,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        };
+        let add = command(
+            9030,
+            vec![
+                vec!["p".into(), target.clone()],
+                vec!["role".into(), "admin".into()],
+            ],
+        );
+        relay
+            .apply_relay_member_command(&add)
+            .await
+            .expect("owner may add an admin member");
+        assert!(
+            relay
+                .roles
+                .read()
+                .await
+                .assignments
+                .get(&target)
+                .is_some_and(|roles| roles.iter().any(|role| role == "admin")),
+            "the member must hold the admin role"
+        );
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13534]})).unwrap();
+        let (lists, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(lists.len(), 1);
+        assert!(lists[0].tags.iter().any(|tag| {
+            tag.len() >= 3 && tag[0] == "member" && tag[1] == target && tag[2] == "admin"
+        }));
+
+        let change = command(
+            9032,
+            vec![
+                vec!["p".into(), target.clone()],
+                vec!["role".into(), "member".into()],
+            ],
+        );
+        relay
+            .apply_relay_member_command(&change)
+            .await
+            .expect("owner may change the member role");
+        assert!(
+            relay
+                .roles
+                .read()
+                .await
+                .assignments
+                .get(&target)
+                .is_some_and(Vec::is_empty),
+            "a member-role assignment has no privileged role"
+        );
+
+        let remove = command(9031, vec![vec!["p".into(), target.clone()]]);
+        relay
+            .apply_relay_member_command(&remove)
+            .await
+            .expect("owner may remove a member");
+        assert!(!relay.roles.read().await.is_member_of(&target));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn identity_archive_requests_update_the_snapshot() {
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let target = "aa".repeat(32);
+        let request = |kind: u64| crate::event::Event {
+            id: "ab".repeat(32),
+            pubkey: target.clone(),
+            created_at: crate::util::unix_now(),
+            kind,
+            tags: vec![
+                vec!["-".into()],
+                vec!["p".into(), target.clone()],
+                vec!["reason".into(), "rotated".into()],
+            ],
+            content: "archive test".into(),
+            sig: String::new(),
+        };
+        relay
+            .apply_identity_archive(&request(9035))
+            .await
+            .expect("self archive request must be accepted");
+        assert!(relay.archive.read().await.contains(&target));
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13535]})).unwrap();
+        let (snapshots, _) = relay
+            .db
+            .query(vec![filter.clone()], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(snapshots.len(), 1);
+        assert!(
+            snapshots[0]
+                .tags
+                .iter()
+                .any(|tag| tag.len() == 2 && tag[0] == "p" && tag[1] == target)
+        );
+        let deltas = relay
+            .db
+            .query(
+                vec![serde_json::from_value(serde_json::json!({"kinds": [8002]})).unwrap()],
+                10,
+                crate::util::unix_now(),
+            )
+            .await
+            .0;
+        assert_eq!(deltas.len(), 1);
+
+        relay
+            .apply_identity_archive(&request(9036))
+            .await
+            .expect("self unarchive request must be accepted");
+        assert!(!relay.archive.read().await.contains(&target));
+        let (snapshots, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(snapshots.len(), 1, "13535 is replaceable");
+        assert!(
+            !snapshots[0]
+                .tags
+                .iter()
+                .any(|tag| { tag.len() == 2 && tag[0] == "p" && tag[1] == target })
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn published_profile_attestation_can_archive_an_agent() {
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let owner = secp256k1::Keypair::from_secret_bytes([3u8; 32]).unwrap();
+        let agent = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let owner_pk = secp256k1::XOnlyPublicKey::from_keypair(&owner)
+            .0
+            .to_string();
+        let agent_pk = secp256k1::XOnlyPublicKey::from_keypair(&agent)
+            .0
+            .to_string();
+        let conditions = "";
+        let preimage = format!("nostr:agent-auth:{agent_pk}:{conditions}");
+        use sha2::Digest as _;
+        let message: [u8; 32] = sha2::Sha256::digest(preimage.as_bytes()).into();
+        let auth_sig = secp256k1::schnorr::sign_no_aux_rand(&message, &owner).to_string();
+        let mut profile = crate::event::Event {
+            id: String::new(),
+            pubkey: agent_pk.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 0,
+            tags: vec![vec![
+                "auth".into(),
+                owner_pk.clone(),
+                conditions.into(),
+                auth_sig,
+            ]],
+            content: "{}".into(),
+            sig: String::new(),
+        };
+        crate::nips::nip01::sign(&mut profile, &agent).unwrap();
+        relay.db.put(profile.clone(), crate::util::unix_now()).await;
+
+        let request = crate::event::Event {
+            id: "ef".repeat(32),
+            pubkey: owner_pk,
+            created_at: crate::util::unix_now(),
+            kind: 9035,
+            tags: vec![vec!["-".into()], vec!["p".into(), agent_pk.clone()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .apply_identity_archive(&request)
+            .await
+            .expect("profile attestation must authorize the archive");
+        assert!(relay.archive.read().await.contains(&agent_pk));
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [8002]})).unwrap();
+        let (deltas, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(deltas.len(), 1);
+        assert!(deltas[0].tags.iter().any(|tag| {
+            tag.len() == 5 && tag[0] == "e" && tag[1] == profile.id && tag[3] == "proof"
+        }));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn owner_can_archive_an_agent_with_nip_oa() {
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let owner = secp256k1::Keypair::from_secret_bytes([1u8; 32]).unwrap();
+        let agent = secp256k1::Keypair::from_secret_bytes([2u8; 32]).unwrap();
+        let owner_pk = secp256k1::XOnlyPublicKey::from_keypair(&owner)
+            .0
+            .to_string();
+        let agent_pk = secp256k1::XOnlyPublicKey::from_keypair(&agent)
+            .0
+            .to_string();
+        use sha2::Digest as _;
+        let conditions = "";
+        let preimage = format!("nostr:agent-auth:{agent_pk}:{conditions}");
+        let message: [u8; 32] = sha2::Sha256::digest(preimage.as_bytes()).into();
+        let signature = secp256k1::schnorr::sign_no_aux_rand(&message, &owner).to_string();
+        let event = crate::event::Event {
+            id: "cd".repeat(32),
+            pubkey: owner_pk.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 9035,
+            tags: vec![
+                vec!["-".into()],
+                vec!["p".into(), agent_pk.clone()],
+                vec!["auth".into(), owner_pk, conditions.into(), signature],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .apply_identity_archive(&event)
+            .await
+            .expect("a valid owner-of-agent request must be accepted");
+        assert!(relay.archive.read().await.contains(&agent_pk));
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [8002]})).unwrap();
+        let (deltas, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert_eq!(deltas.len(), 1);
+        assert!(
+            deltas[0]
+                .tags
+                .iter()
+                .any(|tag| { tag.len() >= 3 && tag[0] == "consent" && tag[1] == "owner" })
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn workspace_icon_requires_admin_and_persists() {
+        let relay = build_relay().await;
+        let owner = "aa".repeat(32);
+        let other = "bb".repeat(32);
+        relay.config.write().await.relay.pubkey = owner.clone();
+        assert!(relay.is_relay_owner_or_admin(&owner).await);
+        assert!(!relay.is_relay_owner_or_admin(&other).await);
+        relay
+            .roles
+            .write()
+            .await
+            .create("admin", "Admin", "", "", None);
+        relay.roles.write().await.assign(&other, "admin");
+        assert!(
+            relay.is_relay_owner_or_admin(&other).await,
+            "a NIP-43 admin assignment must authorize the command"
+        );
+
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join("nostrfy-workspace-icon-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{id}.toml"));
+        std::fs::write(&path, "[relay]\nname = \"test\"\nicon = \"\"\n").unwrap();
+        *relay.config_path.write().await = Some(path.clone());
+        assert!(
+            relay
+                .apply_workspace_icon("https://example.com/icon.png")
+                .await
+        );
+        assert_eq!(
+            relay.config.read().await.relay.icon,
+            "https://example.com/icon.png"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("https://example.com/icon.png")
         );
         relay.db.shutdown();
     }
@@ -7188,6 +8508,28 @@ mod tests {
             "the full membership list must carry the marking-window grant: {:?}",
             lists[0].tags
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_committed_removal_blocks_a_full_membership_publish() {
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        relay
+            .roles_rebuild
+            .removal_committed
+            .store(true, Ordering::SeqCst);
+        assert!(
+            !relay.publish_membership(None).await,
+            "a pre-removal full 13534 must not be published while the removal rebuild is pending"
+        );
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13534]})).unwrap();
+        let (lists, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert!(lists.is_empty());
         relay.db.shutdown();
     }
 
@@ -10685,6 +12027,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vanish_removes_group_members_while_nip29_is_disabled() {
+        let relay = build_relay().await;
+        let now = crate::util::unix_now();
+        let admin = "aa".repeat(32);
+        let member = "bb".repeat(32);
+        let create = crate::event::Event {
+            id: "31".repeat(32),
+            pubkey: admin.clone(),
+            created_at: now,
+            kind: crate::nips::nip29::CREATE_GROUP,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, "", now, false, false);
+        let grant = crate::event::Event {
+            id: "32".repeat(32),
+            pubkey: admin,
+            created_at: now + 1,
+            kind: crate::nips::nip29::PUT_USER,
+            tags: vec![
+                vec!["h".into(), "g1".into()],
+                vec!["p".into(), member.clone()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&grant, "", now + 1, false, false);
+        assert!(
+            relay
+                .groups
+                .read()
+                .await
+                .group("g1")
+                .unwrap()
+                .members
+                .contains_key(&member)
+        );
+        relay.config.write().await.relay.enabled_nips = vec![9];
+        let bytes: [u8; 32] = hex::decode(&member).unwrap().try_into().unwrap();
+        assert!(relay.vanish_pubkey(bytes, now + 2).await);
+        assert!(
+            !relay
+                .groups
+                .read()
+                .await
+                .group("g1")
+                .unwrap()
+                .members
+                .contains_key(&member),
+            "the snapshot-backed group member must be removed even while NIP-29 is disabled"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn vanish_republishes_the_roster_without_the_vanished_member() {
         // M07: a vanish that only drops an admin-added member must also fix
         // the stored history. The JOIN mirror is a relay-signed 9000, which
@@ -12001,7 +13407,7 @@ mod tests {
         // the generated empty 39004 cannot be committed.
         let leave = signed_group_event(&admin, 9002, gid, vec![], now + 2);
         relay.db.shutdown();
-        let _ = relay.apply_group_event(&leave, now + 2).await;
+        let _ = relay.apply_group_event(&leave, now + 2, None).await;
         assert_eq!(
             relay.livekit_participants.lock().await.get(gid),
             Some(&old),
@@ -12502,7 +13908,7 @@ mod tests {
         // confirmed-purged id (the 9008's purge removed the events, so the
         // scan cannot reconstruct the tombstone) — blocking re-creation
         // forever. The worker re-seeds the captured tombstones.
-        let relay = build_relay().await;
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
         let now = crate::util::unix_now();
         let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
         let create = signed_group_event(
@@ -13291,7 +14697,7 @@ mod tests {
                 vec![vec!["p".into(), member.clone(), "mod".into()]],
                 now,
             );
-            relay.apply_group_event(&grant, now).await;
+            relay.apply_group_event(&grant, now, None).await;
             let buffered = {
                 let mut buffer = relay.groups_rebuild.buffer.lock().await;
                 assert_eq!(
@@ -13369,7 +14775,7 @@ mod tests {
                 vec![vec!["p".into(), member.clone(), "mod".into()]],
                 now,
             );
-            relay.apply_group_event(&grant, now).await;
+            relay.apply_group_event(&grant, now, None).await;
             {
                 let buffer = relay.groups_rebuild.buffer.lock().await;
                 assert!(
@@ -13589,6 +14995,123 @@ mod tests {
                 stored.len()
             );
         }
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_empty_preserved_rebuild_still_refreshes_the_current_roster() {
+        // A keyless/rotated-key rebuild preserves the old persisted role
+        // snapshot, but the *published* current-key roster must still be
+        // refreshed: otherwise a vanish during the rebuild leaves the old
+        // 13534 (possibly naming the vanished identity) as the newest list.
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        relay.preserve_role_snapshot();
+        *relay.roles.write().await = RoleStore::default();
+        relay.mark_roles_stale().await;
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13534]})).unwrap();
+        let mut found = false;
+        for _ in 0..100 {
+            let (lists, _) = relay
+                .db
+                .query(vec![filter.clone()], 10, crate::util::unix_now())
+                .await;
+            if !lists.is_empty() {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            found,
+            "a clean empty preserved rebuild must publish a current-key 13534"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_preserved_role_snapshot_survives_an_empty_persist() {
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        relay
+            .roles
+            .write()
+            .await
+            .create("king", "King", "", "", None);
+        relay.roles.write().await.add_claim("welcome");
+        assert!(
+            relay.persist_roles().await,
+            "the baseline snapshot must save"
+        );
+
+        *relay.roles.write().await = RoleStore::default();
+        relay.preserve_role_snapshot();
+        relay.finish_startup_role_recovery();
+        assert!(
+            !relay.persist_roles().await,
+            "an empty persist must not overwrite the preserved snapshot"
+        );
+        let saved = relay.db.load_roles().await.expect_loaded("snapshot");
+        assert!(saved.roles.contains_key("king"));
+        assert!(saved.claims.contains("welcome"));
+
+        relay.release_role_snapshot_preserve();
+        assert!(relay.persist_roles().await);
+        relay.db.shutdown();
+    }
+    #[tokio::test]
+    async fn a_stale_create_id_cannot_mutate_the_new_incarnation() {
+        let relay = build_relay().await;
+        let now = crate::util::unix_now();
+        let create = crate::event::Event {
+            id: String::new(),
+            pubkey: "aa".repeat(32),
+            created_at: now,
+            kind: crate::nips::nip29::CREATE_GROUP,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, "", now, false, false);
+        let edit = crate::event::Event {
+            id: String::new(),
+            pubkey: "aa".repeat(32),
+            created_at: now + 1,
+            kind: 9002,
+            tags: vec![
+                vec!["h".into(), "g1".into()],
+                vec!["name".into(), "new".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let stale = relay
+            .apply_group_state(&edit, now + 1, Some("old-create-id"))
+            .await;
+        assert!(stale.is_empty());
+        assert_eq!(
+            relay.groups.read().await.group("g1").unwrap().settings.name,
+            ""
+        );
+        let create_id = relay
+            .groups
+            .read()
+            .await
+            .group("g1")
+            .unwrap()
+            .create_id
+            .clone()
+            .expect("create id");
+        let _ = relay
+            .apply_group_state(&edit, now + 1, Some(create_id.as_str()))
+            .await;
+        assert_eq!(
+            relay.groups.read().await.group("g1").unwrap().settings.name,
+            "new"
+        );
         relay.db.shutdown();
     }
 }

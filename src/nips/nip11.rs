@@ -108,6 +108,13 @@ pub fn relay_info(
     if advertise_nip29 {
         info["nip29"] = json!({ "subgroups": true });
     }
+    // NIP-CL (channel identity/discovery) and NIP-CW (channel/thread
+    // windows) are draft extensions carried through the Buzz HTTP bridge.
+    // They are only meaningful when the Buzz layer is enabled; an
+    // extension-unaware client can still use plain NIP-29.
+    if advertise_nip29 && config.relay.enabled_buzz {
+        info["supported_extensions"] = json!(["nip-cl", "nip-cw"]);
+    }
     info
 }
 
@@ -469,14 +476,16 @@ mod tests {
             .expect("supported_nips is an array");
         let nips: Vec<u16> = nips.iter().map(|n| n.as_u64().unwrap() as u16).collect();
         for expected in [
-            1u16, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65,
-            66, 67, 70, 77, 78, 84, 85, 86, 87, 88, 94, 98,
+            1u16, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 45, 46, 47, 50, 57, 59, 62, 65, 66,
+            67, 70, 77, 78, 84, 85, 86, 87, 88, 94, 98,
         ] {
             assert!(
                 nips.contains(&expected),
                 "NIP-{expected} must be advertised"
             );
         }
+        // NIP-43 is advertised only when membership is enforced.
+        assert!(!nips.contains(&43), "open relay must not advertise NIP-43");
         // NIP-34 (git) is gated behind `relay.enabled_git` (default false).
         assert!(
             !nips.contains(&34),
@@ -496,5 +505,30 @@ mod tests {
                 "NIP-{missing} must not be advertised without its prerequisites"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod buzz_extension_tests {
+    use super::*;
+
+    #[test]
+    fn buzz_extensions_require_enabled_buzz() {
+        let mut cfg = Config::default();
+        cfg.relay.private_key = "11".repeat(32);
+        let stats = Stats::new();
+        let access = AccessControl::default();
+        let info = relay_info(&cfg, &access, &stats, None);
+        assert!(
+            info.get("supported_extensions").is_none(),
+            "NIP-CL/NIP-CW must not be advertised while Buzz is disabled"
+        );
+        cfg.relay.enabled_buzz = true;
+        let info = relay_info(&cfg, &access, &stats, None);
+        assert_eq!(
+            info["supported_extensions"],
+            json!(["nip-cl", "nip-cw"]),
+            "enabled Buzz must advertise its channel extensions"
+        );
     }
 }

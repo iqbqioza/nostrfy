@@ -4,6 +4,8 @@
 
 mod api;
 pub(crate) mod blossom;
+pub(crate) mod bridge;
+mod bridge_window;
 mod landing;
 pub(crate) mod livekit;
 
@@ -20,7 +22,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use log::{error, info, warn};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -333,10 +335,34 @@ async fn build_router(
                 .then(|| Duration::from_secs(cfg.limits.http_read_timeout_secs)),
         )
     };
+    let (bridge_body_limit, buzz_enabled) = {
+        let cfg = relay.config.read().await;
+        (cfg.limits.max_ws_message_bytes, cfg.relay.enabled_buzz)
+    };
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/live", get(live_handler))
-        .route("/relay/stats", get(stats_handler))
+        .route("/relay/stats", get(stats_handler));
+    if buzz_enabled {
+        // Buzz's HTTP bridge: NIP-11 at /info, one-shot reads at /query and
+        // writes at /events (NIP-98 authenticated). These live on the relay
+        // origin because the desktop derives its HTTP base URL from the
+        // WebSocket URL. Without `relay.enabled_buzz` the routes are not
+        // registered at all, so a Buzz client sees a plain 404.
+        app = app
+            .route("/info", get(bridge::info))
+            .route("/query", post(bridge::query))
+            .route("/count", post(bridge::count))
+            .route("/events", post(bridge::events));
+    }
+    app = app
+        .layer(axum::extract::DefaultBodyLimit::max(bridge_body_limit))
+        // The bridge reads request bodies (filters and signed events): a
+        // trickling POST must not pin a connection past the configured HTTP
+        // deadline.
+        .layer(axum::middleware::from_fn(move |request, next| async move {
+            body_read_timeout_middleware(request, next, body_read_timeout, bridge_body_limit).await
+        }))
         .nest("/api/v1", api_routes);
     // In `inbox-outbox` mode the root is not a WebSocket endpoint: it only
     // answers the Blossom server-info document on the Blossom host (every
@@ -579,7 +605,13 @@ fn host_route_allowed(
     // reach the management API).
     let root_read = matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD);
     let blossom_path = blossom::is_blossom_path(path) || (is_blossom && path == "/" && root_read);
-    (is_api && api_path) || (is_blossom && blossom_path) || (is_relay && !api_path && !blossom_path)
+    // Buzz uploads and renders media on the relay origin. Those two paths
+    // are served by the same Blossom router, so let them through the relay
+    // branch of the split while the dedicated media host keeps its full set.
+    let relay_media = is_relay && blossom::is_relay_media_alias(path, method);
+    (is_api && api_path)
+        || (is_blossom && blossom_path)
+        || (is_relay && !api_path && (!blossom_path || relay_media))
 }
 
 /// Restores the persisted NIP-29 group state at startup, comparing the
@@ -597,8 +629,466 @@ fn host_route_allowed(
 /// a database whose private groups are missing from the empty store cannot
 /// leak their content. The next start with the NIP re-enabled rebuilds the
 /// store from the surviving events.
+/// Derives the incarnation id for snapshots written before `create_id`
+/// existed. A DM has no stored synthetic create and gets the deterministic
+/// synthetic marker; other groups use the stored 9007 whose timestamp/creator
+/// matches the snapshot. If the history is unavailable the startup fails
+/// closed rather than serving an unbound group.
+async fn populate_group_create_ids(
+    relay: &Relay,
+    snapshot: &mut crate::nips::nip29::GroupsSnapshot,
+) -> Result<()> {
+    if snapshot
+        .groups
+        .values()
+        .all(|group| group.create_id.is_some())
+    {
+        return Ok(());
+    }
+    let filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+        "kinds": [crate::nips::nip29::CREATE_GROUP],
+    }))
+    .expect("static filter");
+    let Some((events, more)) = relay
+        .db
+        .query_full_startup(vec![filter], 100_000, unix_now(), true)
+        .await
+    else {
+        return Err(anyhow::anyhow!(
+            "cannot read stored group creates to bind the NIP-29 snapshot; refusing to serve"
+        ));
+    };
+    if more {
+        return Err(anyhow::anyhow!(
+            "stored group-create scan was truncated; refusing to serve an unbound snapshot"
+        ));
+    }
+    let mut creates: std::collections::HashMap<String, Vec<(u64, String, String)>> =
+        std::collections::HashMap::new();
+    for event in events {
+        if let Some(gid) = crate::nips::nip29::group_id(&event) {
+            creates.entry(gid.to_string()).or_default().push((
+                event.created_at,
+                event.pubkey.clone(),
+                event.id.clone(),
+            ));
+        }
+    }
+    for (gid, group) in snapshot.groups.iter_mut() {
+        if group.create_id.is_some() {
+            continue;
+        }
+        if group.channel_type == "dm" {
+            group.create_id = Some(format!("synthetic:{gid}"));
+            continue;
+        }
+        let Some(candidates) = creates.get(gid) else {
+            continue;
+        };
+        let matched = candidates
+            .iter()
+            .find(|(created_at, pubkey, _)| {
+                group
+                    .created_at
+                    .is_some_and(|created| *created_at == created)
+                    && group
+                        .creator
+                        .as_deref()
+                        .is_some_and(|creator| creator.eq_ignore_ascii_case(pubkey))
+            })
+            .or_else(|| {
+                if candidates.len() == 1 {
+                    candidates.first()
+                } else {
+                    None
+                }
+            });
+        if let Some((_, _, id)) = matched {
+            group.create_id = Some(id.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Removes vanished pubkeys from a persisted group snapshot before it is
+/// restored. The snapshot may predate a NIP-62 vanish (including a vanish
+/// accepted while NIP-29 was disabled), and unlike the NIP-43 restore the
+/// group store has no event-derived fallback for DM membership.
+async fn filter_vanished_group_snapshot(
+    relay: &Relay,
+    snapshot: &mut crate::nips::nip29::GroupsSnapshot,
+) -> Result<()> {
+    let mut present = std::collections::HashSet::new();
+    for group in snapshot.groups.values() {
+        present.extend(group.members.keys().map(|pk| pk.to_ascii_lowercase()));
+        present.extend(group.guests.iter().map(|pk| pk.to_ascii_lowercase()));
+        present.extend(group.bots.iter().map(|pk| pk.to_ascii_lowercase()));
+        present.extend(group.hidden_for.iter().map(|pk| pk.to_ascii_lowercase()));
+    }
+    if present.is_empty() {
+        return Ok(());
+    }
+    let mut vanished = std::collections::HashSet::new();
+    if relay
+        .db
+        .vanish_pubkeys_each(|key| {
+            let lower = hex::encode(key);
+            if present.contains(&lower) {
+                vanished.insert(lower);
+            }
+        })
+        .await
+        .is_none()
+    {
+        return Err(anyhow::anyhow!(
+            "cannot read the vanished-pubkey list; refusing to restore the NIP-29 \
+             group snapshot"
+        ));
+    }
+    if vanished.is_empty() {
+        return Ok(());
+    }
+    for group in snapshot.groups.values_mut() {
+        group
+            .members
+            .retain(|pk, _| !vanished.contains(&pk.to_ascii_lowercase()));
+        group
+            .guests
+            .retain(|pk| !vanished.contains(&pk.to_ascii_lowercase()));
+        group
+            .bots
+            .retain(|pk| !vanished.contains(&pk.to_ascii_lowercase()));
+        group
+            .hidden_for
+            .retain(|pk| !vanished.contains(&pk.to_ascii_lowercase()));
+    }
+    Ok(())
+}
+
+/// Reconstructs DM groups from the relay-signed metadata a DM leaves behind
+/// (`39000` settings, `39001` roles, `39002` members and `30622` hidden-DM
+/// snapshots). The synthetic `9007`/`9000` are not stored, so this is the
+/// only event-derived fallback when both the main snapshot and the additive
+/// DM backup are missing. It only fills ids the rebuilt store does not know,
+/// never overwrites a live group, and skips deleted/ghosted ids.
+async fn restore_dm_metadata(relay: &Relay) -> Result<usize> {
+    let Some(relay_pubkey) = relay.relay_pubkey() else {
+        return Ok(0);
+    };
+    if relay.groups.read().await.is_unrestored() {
+        return Ok(0);
+    }
+    let now = unix_now();
+    let Some(meta_events) =
+        query_dm_metadata(relay, crate::nips::nip29::GROUP_META, &relay_pubkey, now).await
+    else {
+        log::warn!("could not read DM group metadata; leaving DM recovery to the snapshot");
+        return Ok(0);
+    };
+    let Some(admin_events) =
+        query_dm_metadata(relay, crate::nips::nip29::GROUP_ADMINS, &relay_pubkey, now).await
+    else {
+        log::warn!("could not read DM admin metadata; leaving DM recovery to the snapshot");
+        return Ok(0);
+    };
+    let Some(member_events) =
+        query_dm_metadata(relay, crate::nips::nip29::GROUP_MEMBERS, &relay_pubkey, now).await
+    else {
+        log::warn!("could not read DM member metadata; leaving DM recovery to the snapshot");
+        return Ok(0);
+    };
+    let meta = latest_dm_events(meta_events);
+    let admins = latest_dm_events(admin_events);
+    let members = latest_dm_events(member_events);
+    let hidden = match query_dm_visibility(relay, &relay_pubkey, now).await {
+        Some(events) => hidden_dm_viewers(events),
+        None => {
+            log::warn!("could not read hidden-DM snapshots; recovering DMs without them");
+            std::collections::HashMap::new()
+        }
+    };
+    let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
+    {
+        let groups = relay.groups.read().await;
+        for (gid, meta) in meta {
+            if groups.group(&gid).is_some() || groups.is_deleted(&gid) || groups.is_ghosted(&gid) {
+                continue;
+            }
+            let Some(group) = dm_group_from_metadata(
+                &meta,
+                admins.get(&gid),
+                members.get(&gid),
+                hidden.get(&gid),
+            ) else {
+                continue;
+            };
+            snapshot.groups.insert(gid, group);
+        }
+    }
+    if snapshot.groups.is_empty() {
+        return Ok(0);
+    }
+    // A vanished participant must not be re-added by relay metadata created
+    // before the vanish. This is the same filter used for snapshot restores.
+    filter_vanished_group_snapshot(relay, &mut snapshot).await?;
+    snapshot.groups.retain(|_, group| !group.members.is_empty());
+    if snapshot.groups.is_empty() {
+        return Ok(0);
+    }
+    let changed = relay.groups.write().await.merge_dm_snapshot(snapshot);
+    if changed {
+        info!("recovered DM group state from stored relay metadata");
+    }
+    Ok(if changed { 1 } else { 0 })
+}
+
+async fn query_dm_metadata(
+    relay: &Relay,
+    kind: u64,
+    relay_pubkey: &str,
+    now: u64,
+) -> Option<Vec<crate::event::Event>> {
+    let mut filter = crate::filter::Filter {
+        kinds: Some(vec![kind]),
+        authors: Some(vec![relay_pubkey.to_string()]),
+        ..crate::filter::Filter::default()
+    };
+    filter.tags.insert("#t".to_string(), json!(["dm"]));
+    let (events, more) = relay
+        .db
+        .query_full_startup(vec![filter], 100_000, now, false)
+        .await?;
+    if more {
+        log::warn!("DM metadata scan was truncated; recovering the events that fit");
+    }
+    Some(events)
+}
+
+async fn query_dm_visibility(
+    relay: &Relay,
+    relay_pubkey: &str,
+    now: u64,
+) -> Option<Vec<crate::event::Event>> {
+    let filter = crate::filter::Filter {
+        kinds: Some(vec![30622]),
+        authors: Some(vec![relay_pubkey.to_string()]),
+        ..crate::filter::Filter::default()
+    };
+    let (events, more) = relay
+        .db
+        .query_full_startup(vec![filter], 100_000, now, false)
+        .await?;
+    if more {
+        log::warn!("hidden-DM snapshot scan was truncated; recovering the events that fit");
+    }
+    Some(events)
+}
+
+fn latest_dm_events(
+    events: Vec<crate::event::Event>,
+) -> std::collections::HashMap<String, crate::event::Event> {
+    let mut latest = std::collections::HashMap::new();
+    for event in events {
+        let Some(gid) = crate::nips::nip29::group_id_d(&event) else {
+            continue;
+        };
+        let replace = latest
+            .get(gid)
+            .is_none_or(|current: &crate::event::Event| current.created_at <= event.created_at);
+        if replace {
+            latest.insert(gid.to_string(), event);
+        }
+    }
+    latest
+}
+
+fn hidden_dm_viewers(
+    events: Vec<crate::event::Event>,
+) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    let mut hidden: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for event in events {
+        let Some(viewer) = dm_tag(&event, "d") else {
+            continue;
+        };
+        if !crate::nips::nip29::is_pubkey_hex(viewer) {
+            continue;
+        }
+        for gid in dm_tag_values(&event, "h") {
+            hidden
+                .entry(gid.to_string())
+                .or_default()
+                .insert(viewer.to_ascii_lowercase());
+        }
+    }
+    hidden
+}
+
+fn dm_group_from_metadata(
+    meta: &crate::event::Event,
+    admins: Option<&crate::event::Event>,
+    members: Option<&crate::event::Event>,
+    hidden: Option<&std::collections::HashSet<String>>,
+) -> Option<crate::nips::nip29::Group> {
+    use crate::nips::nip29::{Group, GroupSettings};
+    let mut group = Group {
+        channel_type: "dm".into(),
+        buzz_metadata: true,
+        settings: GroupSettings {
+            private: true,
+            restricted: true,
+            closed: true,
+            hidden: true,
+            name: "Direct message".into(),
+            ..GroupSettings::default()
+        },
+        ..Group::default()
+    };
+    for tag in &meta.tags {
+        if tag.len() < 2 {
+            continue;
+        }
+        let value = tag[1].as_str();
+        match tag[0].as_str() {
+            "name" => group.settings.name = value.to_string(),
+            "picture" => group.settings.picture = value.to_string(),
+            "banner" => group.settings.banner = value.to_string(),
+            "about" => group.settings.about = value.to_string(),
+            "topic" => group.settings.topic = Some(value.to_string()),
+            "purpose" => group.settings.purpose = Some(value.to_string()),
+            "ttl" => group.settings.ttl = value.parse().ok(),
+            "archived" => group.settings.archived = true,
+            "join_role" => group.settings.join_role = Some(value.to_string()),
+            "livekit" => group.settings.livekit = true,
+            "supported_kinds" => {
+                group.settings.supported_kinds = Some(
+                    tag.iter()
+                        .skip(1)
+                        .filter_map(|kind| kind.parse().ok())
+                        .collect(),
+                );
+            }
+            "t" if value != "dm" => group.labels.push(value.to_string()),
+            "P" if crate::nips::nip29::is_pubkey_hex(value) => {
+                group.creator = Some(value.to_ascii_lowercase());
+            }
+            "created_at" => group.created_at = value.parse().ok(),
+            "parent" => group.parent = Some(value.to_string()),
+            "child" => group.children.push(value.to_string()),
+            _ => {}
+        }
+    }
+    for tag in &meta.tags {
+        if tag.len() == 1 {
+            match tag[0].as_str() {
+                "archived" => group.settings.archived = true,
+                "livekit" => group.settings.livekit = true,
+                _ => {}
+            }
+        }
+    }
+    let mut guest_set = std::collections::HashSet::new();
+    let mut bot_set = std::collections::HashSet::new();
+    let add_tag =
+        |tag: &[String],
+         members: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+         guests: &mut std::collections::HashSet<String>,
+         bots: &mut std::collections::HashSet<String>| {
+            if tag.len() < 2 || tag[0] != "p" || !crate::nips::nip29::is_pubkey_hex(&tag[1]) {
+                return;
+            }
+            let pubkey = tag[1].to_ascii_lowercase();
+            members.entry(pubkey.clone()).or_default();
+            for role in tag.iter().skip(2).filter(|role| !role.is_empty()) {
+                match role.as_str() {
+                    "member" => {}
+                    "guest" => {
+                        guests.insert(pubkey.clone());
+                    }
+                    "bot" => {
+                        bots.insert(pubkey.clone());
+                    }
+                    other => {
+                        members
+                            .get_mut(&pubkey)
+                            .expect("member inserted above")
+                            .insert(other.to_string());
+                    }
+                }
+            }
+        };
+    if let Some(members) = members {
+        for tag in &members.tags {
+            add_tag(tag, &mut group.members, &mut guest_set, &mut bot_set);
+        }
+    }
+    if let Some(admins) = admins {
+        for tag in &admins.tags {
+            add_tag(tag, &mut group.members, &mut guest_set, &mut bot_set);
+        }
+    }
+    // The 39000 participant list is a fallback for an old database that
+    // lacks a 39002 roster. Once a roster exists, do not union the older
+    // 39000 p tags back in: a member removed by a later roster event must
+    // stay removed.
+    if group.members.is_empty() {
+        for pubkey in dm_tag_values(meta, "p") {
+            if crate::nips::nip29::is_pubkey_hex(pubkey) {
+                group
+                    .members
+                    .entry(pubkey.to_ascii_lowercase())
+                    .or_default();
+            }
+        }
+        if let Some(creator) = group.creator.clone() {
+            group.members.entry(creator).or_default();
+        }
+    }
+    if group.members.is_empty() {
+        return None;
+    }
+    group.guests.extend(
+        guest_set
+            .into_iter()
+            .filter(|pk| group.members.contains_key(pk)),
+    );
+    group.bots.extend(
+        bot_set
+            .into_iter()
+            .filter(|pk| group.members.contains_key(pk)),
+    );
+    if let Some(hidden) = hidden {
+        group.hidden_for.extend(
+            hidden
+                .iter()
+                .filter(|pk| group.members.contains_key(*pk))
+                .cloned(),
+        );
+    }
+    Some(group)
+}
+
+fn dm_tag<'a>(event: &'a crate::event::Event, name: &str) -> Option<&'a str> {
+    event
+        .tags
+        .iter()
+        .find(|tag| tag.len() >= 2 && tag[0] == name)
+        .map(|tag| tag[1].as_str())
+}
+
+fn dm_tag_values<'a>(
+    event: &'a crate::event::Event,
+    name: &'a str,
+) -> impl Iterator<Item = &'a str> {
+    event
+        .tags
+        .iter()
+        .filter(move |tag| tag.len() >= 2 && tag[0] == name)
+        .map(|tag| tag[1].as_str())
+}
+
 async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
-    let snapshot = match relay.db.load_groups().await {
+    let mut snapshot = match relay.db.load_groups().await {
         crate::db::LoadGroupsOutcome::Loaded(snapshot) => snapshot,
         crate::db::LoadGroupsOutcome::Missing => {
             return rebuild_group_state(relay, groups_enabled).await;
@@ -613,10 +1103,16 @@ async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
             ));
         }
     };
+    populate_group_create_ids(relay, &mut snapshot).await?;
+    filter_vanished_group_snapshot(relay, &mut snapshot).await?;
     let stamp = relay.db.state_stamp().await;
     let seq = relay.db.state_seq_group().await;
     match (stamp, seq) {
         (Some(stamp), Some(seq)) => {
+            let mode_changed = {
+                let groups = relay.groups.read().await;
+                snapshot.buzz_enabled != Some(groups.buzz_enabled)
+            };
             if relay
                 .groups
                 .write()
@@ -624,6 +1120,27 @@ async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
                 .restore_checked(snapshot, stamp, seq)
             {
                 info!("NIP-29 group state restored from the database snapshot");
+                if mode_changed {
+                    // The stored 39000/39001/39002 were generated under the
+                    // previous Buzz mode. Refresh them now rather than
+                    // waiting for the next metadata/membership mutation.
+                    if !relay.publish_group_metadata().await {
+                        log::warn!(
+                            "could not refresh NIP-29 metadata after a Buzz-mode change; \
+                             the next membership/metadata change retries it"
+                        );
+                    }
+                }
+                // Persist the restored (and possibly auto-migrated/filtered)
+                // snapshot: this writes derived create ids and removes
+                // vanished members from old snapshots without a destructive
+                // schema migration.
+                if !relay.persist_groups().await {
+                    log::warn!(
+                        "could not persist the restored/filtered NIP-29 snapshot; \
+                         the next restart will repeat the safe restore"
+                    );
+                }
                 return Ok(());
             }
             error!(
@@ -678,7 +1195,9 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
         // `unrestored`, and group writes are rejected; the operator can
         // repair the history and restart.
         let mut groups = relay.groups.write().await;
+        let buzz_enabled = groups.buzz_enabled;
         *groups = crate::nips::nip29::GroupStore::default();
+        groups.buzz_enabled = buzz_enabled;
         groups.mark_unrestored();
         drop(groups);
         log::error!(
@@ -689,6 +1208,16 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
         relay.persist_groups().await;
         return Ok(());
     }
+    // The main snapshot is absent/stale, but the same-transaction DM and
+    // Buzz backups may still be current. Merge them before this rebuild's
+    // snapshot write replaces the backups with event-derived state.
+    merge_dm_backup(relay).await?;
+    // The snapshot and its additive backup may both be absent, but a DM
+    // still leaves relay-signed 39000/39001/39002/30622 metadata in the
+    // database. Recover what the available metadata proves before the
+    // rebuild snapshot is written.
+    restore_dm_metadata(relay).await?;
+    merge_buzz_backup(relay).await?;
     // The rebuilt state has no (or stale) relay-signed metadata: publish the
     // current 39000/39001/39002/39005 for every group so clients can see
     // them (a migrated database never had them).
@@ -709,6 +1238,11 @@ async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
     // finished (the process crashed mid-walk) is re-run here, before the
     // relay serves. Idempotent and a no-op when nothing is pending.
     relay.resume_pending_purges().await;
+    if !relay.recover_unrecorded_group_purges().await {
+        return Err(anyhow::anyhow!(
+            "could not recover crash-interrupted group purges; refusing to serve"
+        ));
+    }
     // A relay key rotation leaves the previous key's relay-signed metadata
     // (39000-39005) stored: addressable replacement is per author, so the
     // current key can never replace it, and clients that verify the relay
@@ -744,12 +1278,422 @@ async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
 /// snapshot (the per-family sequence), and an unreadable generation fails
 /// closed the same way. Both cases fall through to the replay migration,
 /// which rebuilds from the surviving events. A failed rebuild is fatal.
-async fn restore_role_state(relay: &Relay) -> Result<()> {
-    if !relay.config.read().await.nip_enabled(43) {
+/// Merges DM groups saved by the migration before it invalidated the main
+/// snapshot. Ordinary groups are rebuilt from imported events; DM groups
+/// have no stored create and must be carried separately.
+async fn restore_dm_carry(relay: &Relay) -> Result<()> {
+    let Some(data) = relay.db.load_dm_carry().await else {
+        return Err(anyhow::anyhow!(
+            "cannot read the migration DM carry snapshot; refusing to start"
+        ));
+    };
+    let Some(data) = data else {
+        return Ok(());
+    };
+    let carry: crate::nips::nip29::GroupsSnapshot = serde_json::from_slice(&data)
+        .map_err(|error| anyhow::anyhow!("invalid migration DM carry snapshot: {error}"))?;
+    let changed = relay.groups.write().await.merge_dm_snapshot(carry);
+    if !changed {
+        if !relay.db.clear_dm_carry().await {
+            log::warn!("could not clear an empty migration DM carry snapshot");
+        }
         return Ok(());
     }
+    if !relay.persist_groups().await {
+        log::warn!(
+            "could not persist the merged DM carry snapshot; keeping the carry for the \
+             next startup"
+        );
+        return Ok(());
+    }
+    if !relay.db.clear_dm_carry().await {
+        log::warn!("could not clear the migration DM carry snapshot after persisting it");
+    }
+    Ok(())
+}
+
+/// Restores DM groups from the additive backup written atomically with the
+/// last main group snapshot. This covers a main snapshot that was lost or
+/// found corrupt while the database generation still matches the backup;
+/// DMs have no stored create/join events, so the ordinary rebuild cannot
+/// recreate them. A stale backup (a state removal/event advanced the
+/// generation) is discarded rather than resurrecting a removed member.
+async fn merge_dm_backup(relay: &Relay) -> Result<bool> {
+    if relay.groups.read().await.is_unrestored() {
+        return Ok(false);
+    }
+    let Some(backup) = relay.db.load_dm_backup().await else {
+        log::warn!("could not read the DM backup; continuing with the event-derived group state");
+        return Ok(false);
+    };
+    let Some(backup) = backup else {
+        return Ok(false);
+    };
+    let Some(stamp) = relay.db.state_stamp().await else {
+        log::warn!("could not verify the DM backup generation; skipping it");
+        return Ok(false);
+    };
+    let Some(seq) = relay.db.state_seq_group().await else {
+        log::warn!("could not verify the DM backup sequence; skipping it");
+        return Ok(false);
+    };
+    if !crate::nips::nip29::GroupStore::snapshot_is_current(backup.stamp, stamp)
+        || !crate::nips::nip29::GroupStore::snapshot_is_current(backup.seq, seq)
+    {
+        log::warn!("discarding a stale DM backup: it predates the current group-state generation");
+        return Ok(false);
+    }
+    Ok(relay.groups.write().await.merge_dm_snapshot(backup))
+}
+
+async fn restore_dm_backup(relay: &Relay) -> Result<()> {
+    if merge_dm_backup(relay).await? && !relay.persist_groups().await {
+        log::warn!(
+            "could not persist the restored DM backup; the backup remains for the next startup"
+        );
+    }
+    Ok(())
+}
+
+/// Restores the Buzz-specific group fields (provenance, guest/bot tiers and
+/// separate role grants) that a plain-mode event replay cannot reconstruct.
+/// The backup is generation-stamped with the snapshot, so a rebuild after a
+/// later state removal/event rejects it.
+async fn merge_buzz_backup(relay: &Relay) -> Result<bool> {
+    if relay.groups.read().await.is_unrestored() {
+        return Ok(false);
+    }
+    let Some(backup) = relay.db.load_buzz_backup().await else {
+        log::warn!("could not read the Buzz backup; continuing with the replayed group state");
+        return Ok(false);
+    };
+    let Some(backup) = backup else {
+        return Ok(false);
+    };
+    let Some(stamp) = relay.db.state_stamp().await else {
+        log::warn!("could not verify the Buzz backup generation; skipping it");
+        return Ok(false);
+    };
+    let Some(seq) = relay.db.state_seq_group().await else {
+        log::warn!("could not verify the Buzz backup sequence; skipping it");
+        return Ok(false);
+    };
+    if !crate::nips::nip29::GroupStore::snapshot_is_current(backup.stamp, stamp)
+        || !crate::nips::nip29::GroupStore::snapshot_is_current(backup.seq, seq)
+    {
+        log::warn!(
+            "discarding a stale Buzz backup: it predates the current group-state generation"
+        );
+        return Ok(false);
+    }
+    Ok(relay.groups.write().await.merge_buzz_backup(backup))
+}
+
+async fn restore_buzz_backup(relay: &Relay) -> Result<()> {
+    if merge_buzz_backup(relay).await? && !relay.persist_groups().await {
+        log::warn!(
+            "could not persist the restored Buzz backup; the backup remains for the next startup"
+        );
+    }
+    Ok(())
+}
+
+/// Startup reclamation for channel TTL. Runtime reads hide expired content
+/// immediately; this pass also removes old rows so a long-running relay does
+/// not retain them forever. It is bounded per query and best-effort after a
+/// database error (read-time enforcement remains authoritative).
+async fn purge_expired_group_messages(relay: &Relay) -> Result<()> {
+    purge_expired_group_messages_paged(relay, 50_000).await
+}
+
+/// The page size is a parameter so the regression test can force a
+/// state-only page without creating 50,000 rows.
+async fn purge_expired_group_messages_paged(relay: &Relay, page: usize) -> Result<()> {
+    if page == 0 {
+        return Ok(());
+    }
+    let now = unix_now();
+    let groups: Vec<(String, u64)> = relay
+        .groups
+        .read()
+        .await
+        .groups
+        .iter()
+        .filter_map(|(gid, group)| {
+            group
+                .settings
+                .ttl
+                .filter(|ttl| *ttl > 0)
+                .map(|ttl| (gid.clone(), ttl))
+        })
+        .collect();
+    for (gid, ttl) in groups {
+        let cutoff = now.saturating_sub(ttl);
+        if cutoff == 0 {
+            continue;
+        }
+        // Ascending pages start at the oldest surviving event. Once a full
+        // page contains nothing removable (only group state/metadata, or ids
+        // that are already gone), advance `since` past its complete boundary
+        // second; otherwise the same state pages would hide newer expired
+        // content forever.
+        let mut since: Option<u64> = None;
+        loop {
+            let mut filter = crate::filter::Filter::default();
+            filter.tags.insert("#h".into(), serde_json::json!([gid]));
+            filter.since = since;
+            filter.until = Some(cutoff);
+            filter.limit = Some(page);
+            let Some((events, _)) = relay
+                .db
+                .query_full_startup(vec![filter], page, now, true)
+                .await
+            else {
+                log::warn!("could not scan expired TTL messages for {gid}; deferring cleanup");
+                break;
+            };
+            if events.is_empty() {
+                break;
+            }
+            let ids: Vec<[u8; 32]> = events
+                .iter()
+                .filter(|event| {
+                    !crate::nips::nip29::is_group_action_kind(event.kind)
+                        && !(crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
+                            .contains(&event.kind)
+                })
+                .filter_map(|event| event.id_bytes())
+                .collect();
+            if ids.is_empty() {
+                // The page is all state/metadata. Advance past it when it is
+                // full; a short page is the end of the scan.
+                if events.len() < page {
+                    break;
+                }
+                let Some(newest) = events.last().map(|event| event.created_at) else {
+                    break;
+                };
+                if newest >= cutoff {
+                    break;
+                }
+                since = Some(newest.saturating_add(1));
+                continue;
+            }
+            let Some(removed) = relay.db.remove_events_by_id(&ids).await else {
+                log::warn!("could not remove expired TTL messages for {gid}; deferring cleanup");
+                break;
+            };
+            relay
+                .stats
+                .bump(&relay.stats.events_deleted, removed as u64);
+            if removed == 0 {
+                // All ids on this full page were already gone. Move past
+                // the boundary instead of re-reading the same page.
+                if events.len() < page {
+                    break;
+                }
+                let Some(newest) = events.last().map(|event| event.created_at) else {
+                    break;
+                };
+                if newest >= cutoff {
+                    break;
+                }
+                since = Some(newest.saturating_add(1));
+                continue;
+            }
+            if events.len() < page {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One-time migration for databases written before durable group epochs:
+/// bind every currently stored group-state event to its group's current
+/// create id. It cannot reconstruct a past incarnation that was already
+/// deleted, but it prevents those pre-existing rows from crossing the next
+/// delete/recreate. The marker makes this a single full scan.
+async fn backfill_group_epochs(relay: &Relay) -> Result<()> {
+    match relay.db.group_epochs_backfilled().await {
+        Some(true) => return Ok(()),
+        Some(false) => {}
+        None => {
+            return Err(anyhow::anyhow!(
+                "cannot read the group-epoch backfill marker; refusing to serve with an \
+                 unverified epoch index"
+            ));
+        }
+    }
+    let create_ids: std::collections::HashMap<String, String> = relay
+        .groups
+        .read()
+        .await
+        .groups
+        .iter()
+        .filter_map(|(gid, group)| group.create_id.clone().map(|id| (gid.clone(), id)))
+        .collect();
+    if create_ids.is_empty() {
+        if !relay.db.mark_group_epochs_backfilled().await {
+            return Err(anyhow::anyhow!(
+                "cannot mark the group-epoch backfill complete"
+            ));
+        }
+        return Ok(());
+    }
+    const PAGE: usize = 50_000;
+    let kinds: Vec<u64> = (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
+        .chain([crate::nips::nip29::JOIN, crate::nips::nip29::LEAVE])
+        .collect();
+    let mut since = None;
+    loop {
+        let mut filter: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": kinds,
+        }))
+        .expect("static filter");
+        filter.since = since;
+        let boundary_filter = filter.clone();
+        let Some((page, more)) = relay
+            .db
+            .query_full_startup(vec![filter], PAGE, unix_now(), true)
+            .await
+        else {
+            return Err(anyhow::anyhow!(
+                "cannot read stored group state for the epoch backfill; refusing to serve"
+            ));
+        };
+        if page.is_empty() {
+            break;
+        }
+        let max_created = page.last().map(|event| event.created_at);
+        let boundary_count = page
+            .iter()
+            .filter(|event| Some(event.created_at) == max_created)
+            .count();
+        let ids: Vec<Vec<u8>> = page
+            .iter()
+            .filter_map(|event| event.id_bytes().map(|id| id.to_vec()))
+            .collect();
+        let Some(existing) = relay.db.group_epochs_startup(ids).await else {
+            return Err(anyhow::anyhow!(
+                "cannot read the existing group epochs during backfill; refusing to serve"
+            ));
+        };
+        let mut entries = Vec::new();
+        for event in &page {
+            if matches!(
+                event.kind,
+                crate::nips::nip29::CREATE_GROUP | crate::nips::nip29::DELETE_GROUP
+            ) {
+                continue;
+            }
+            let Some(gid) = crate::nips::nip29::group_id(event) else {
+                continue;
+            };
+            let Some(create_id) = create_ids.get(gid) else {
+                continue;
+            };
+            let Some(id) = event.id_bytes() else {
+                continue;
+            };
+            if existing.contains_key(&hex::encode(id)) {
+                continue;
+            }
+            entries.push((id.to_vec(), create_id.clone()));
+        }
+        if !entries.is_empty() && !relay.db.record_group_epochs_batch(entries).await {
+            return Err(anyhow::anyhow!(
+                "cannot persist the group-epoch backfill; refusing to serve"
+            ));
+        }
+        if !more {
+            break;
+        }
+        let Some(boundary) = max_created else {
+            break;
+        };
+        if !crate::nips::nip29::boundary_second_complete(
+            &relay.db,
+            boundary_filter,
+            boundary,
+            boundary_count,
+        )
+        .await
+        {
+            return Err(anyhow::anyhow!(
+                "the group-epoch backfill boundary second {boundary} is incomplete; \
+                 refusing to serve"
+            ));
+        }
+        if boundary == u64::MAX {
+            break;
+        }
+        since = Some(boundary.saturating_add(1));
+    }
+    if !relay.db.mark_group_epochs_backfilled().await {
+        return Err(anyhow::anyhow!(
+            "cannot mark the group-epoch backfill complete; refusing to serve"
+        ));
+    }
+    info!("group-state epoch backfill completed");
+    Ok(())
+}
+
+async fn restore_archive_state(relay: &Relay) -> Result<()> {
+    let Some(data) = relay.db.load_identity_archive().await else {
+        return Err(anyhow::anyhow!(
+            "cannot read the NIP-IA archive state; refusing to start with an unknown archive"
+        ));
+    };
+    let archived: std::collections::BTreeSet<String> = match data {
+        Some(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow::anyhow!("invalid NIP-IA archive state: {error}"))?,
+        None => std::collections::BTreeSet::new(),
+    };
+    *relay.archive.write().await = archived;
+    Ok(())
+}
+
+async fn restore_role_state(relay: &Relay) -> Result<()> {
+    if !relay.config.read().await.nip_enabled(43) {
+        // No role operations can run while NIP-43 is disabled. Clear a
+        // recovery mark so it cannot leave a stale flag in this process.
+        relay.finish_startup_role_recovery();
+        return Ok(());
+    }
+    let mut preserve_existing = false;
     let (needs_rebuild, carried_claims) = match relay.db.load_roles().await {
         crate::db::LoadRolesOutcome::Loaded(snap) => {
+            let mut snap = snap;
+            preserve_existing =
+                !snap.roles.is_empty() || snap.assignments.values().any(|roles| !roles.is_empty());
+            // Vanish is permanent and may have happened while NIP-43 was
+            // disabled (no live role store) or during a role rebuild (the
+            // revoked store could not record the assignment removal). The
+            // snapshot itself predates that vanish, so filter it before
+            // restore; the event rebuild already applies the same filter.
+            if !snap.assignments.is_empty() {
+                // Do not materialize the (unbounded) vanish table: stream
+                // its pages and remove only the bounded snapshot keys.
+                if relay
+                    .db
+                    .vanish_pubkeys_each(|key| {
+                        let lower = hex::encode(key);
+                        snap.assignments.remove(&lower);
+                        let upper = hex::encode_upper(key);
+                        if upper != lower {
+                            snap.assignments.remove(&upper);
+                        }
+                    })
+                    .await
+                    .is_none()
+                {
+                    return Err(anyhow::anyhow!(
+                        "cannot read the vanished-pubkey list; refusing to restore the \
+                         NIP-43 role snapshot"
+                    ));
+                }
+            }
             let claims = snap.claims.clone();
             match (
                 relay.db.state_stamp().await,
@@ -758,6 +1702,11 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
                 (Some(stamp), Some(seq)) => {
                     if relay.roles.write().await.restore_checked(snap, stamp, seq) {
                         info!("NIP-43 role state restored from the database snapshot");
+                        // The snapshot is authoritative and already reflects
+                        // any recovered removal; release a recovery mark that
+                        // would otherwise block role persistence forever.
+                        relay.release_role_snapshot_preserve();
+                        relay.finish_startup_role_recovery();
                         (false, None)
                     } else {
                         error!(
@@ -809,6 +1758,71 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
                  incomplete role store"
             ));
         }
+        // A keyless relay, or a relay whose signing key changed, finds no
+        // role-state events it can verify. Do not persist an empty snapshot
+        // over the previous one: that would permanently erase the
+        // assignments/claims the old key authored. The current key may still
+        // publish its synthetic roster below; leaving the snapshot in place
+        // is safe because its older generation makes the next startup reject
+        // it and retry the rebuild once the key is restored.
+        let rebuilt_empty = {
+            let store = relay.roles.read().await;
+            !store.has_role_state()
+        };
+        if rebuilt_empty && !preserve_existing {
+            // A missing/empty snapshot on a genuinely fresh relay has
+            // nothing to preserve. A keyless/rotated start may instead be
+            // hiding former-key events: only those require the preserve
+            // flag. A failed lookup fails closed.
+            let kinds = [
+                crate::nips::nip43::ROLE_DEFINITION,
+                crate::nips::nip43::MEMBERSHIP_LIST,
+                crate::nips::nip43::ADD_USER,
+                crate::nips::nip43::REMOVE_USER,
+                crate::nips::nip43::INVITE,
+            ];
+            match relay
+                .db
+                .foreign_relay_event_ids(&relay.relay_pubkey().unwrap_or_default(), &kinds)
+                .await
+            {
+                Some(ids) if !ids.is_empty() => preserve_existing = true,
+                None => preserve_existing = true,
+                Some(_) => {}
+            }
+        }
+        if rebuilt_empty && preserve_existing {
+            warn!(
+                "NIP-43 role state rebuild found no role events for the current relay key; \
+                 preserving the previous snapshot (if any) instead of persisting an empty \
+                 roster"
+            );
+            // Still publish the current key's (possibly synthetic-owner)
+            // roster so NIP-11/NIP-43 clients have a `self`-signed list; do
+            // not persist it, so the last snapshot (and any foreign events)
+            // remains available if the former key is restored. The preserve
+            // flag also blocks a later SIGHUP/NIP-86 persist from
+            // overwriting it before a real role mutation.
+            relay.preserve_role_snapshot();
+            relay.finish_startup_role_recovery();
+            // Apply a shutdown journal before publishing the live roster,
+            // but keep it: this branch deliberately does not persist over
+            // the preserved old snapshot, so a later start must be able to
+            // replay the journal again after the relay key is restored.
+            relay.apply_role_rebuild_journal().await?;
+            if relay.relay_pubkey().is_some()
+                && relay.config.read().await.nip_enabled(43)
+                && !relay.publish_membership(None).await
+            {
+                log::warn!("could not republish the empty NIP-43 roster under the current key");
+            }
+            return Ok(());
+        }
+        // The startup rebuild is authoritative; release the recovery-pending
+        // and preserve flags so the publish/persist below can certify the
+        // fresh store.
+        relay.release_role_snapshot_preserve();
+        relay.finish_startup_role_recovery();
         // The rebuilt store has no (or stale) published membership list:
         // republish it so NIP-43 clients see the current members (a
         // migrated database never had it). Publish before the snapshot
@@ -820,6 +1834,20 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
         }
         relay.persist_roles().await;
     }
+    // Replay the bounded mutations captured while a rebuild was in flight
+    // at the previous shutdown. The event rebuild above is authoritative,
+    // but leaves/admissions made against the revoked store have no event
+    // to rebuild from; the journal is the only durable copy.
+    if relay.apply_role_rebuild_journal().await? {
+        if relay.persist_roles().await {
+            relay.clear_role_rebuild_journal().await;
+        } else {
+            warn!(
+                "could not persist the role store after replaying the shutdown journal; \
+                 keeping the journal for the next startup"
+            );
+        }
+    }
     // A relay key rotation leaves the previous key's relay-signed role
     // state (33534/13534/8000/8001) stored: the current key can neither
     // replace nor delete it, and clients that verify the relay signature
@@ -827,6 +1855,20 @@ async fn restore_role_state(relay: &Relay) -> Result<()> {
     // holds the restored/rebuilt state, so the republished events reflect
     // the state the relay is about to serve.
     relay.heal_rotated_role_state().await;
+    // Republish the NIP-43 roster on every start: it carries the relay's own
+    // owner identities (NIP-11 pubkey and the NIP-86 admin) and, on a
+    // closed relay, the allowlist. Without this an open relay has no 13534 at
+    // all, and a list edited while the daemon was down is stale.
+    if relay.relay_pubkey().is_some() && relay.config.read().await.nip_enabled(43) {
+        if !relay.publish_membership(None).await {
+            warn!("could not republish the NIP-43 membership list");
+        }
+        // Storing the 13534 event advances the role-state sequence. Persist
+        // the role snapshot afterwards so the next startup can restore it
+        // instead of rebuilding every time (the snapshot would otherwise
+        // always predate this publish).
+        relay.persist_roles().await;
+    }
     Ok(())
 }
 
@@ -879,16 +1921,6 @@ pub async fn run_server(
     // Make the config file path known to the relay so NIP-86 runtime
     // changes (relay name/description/icon) can be persisted to disk.
     *relay.config_path.write().await = Some(config_path.clone());
-    // The SIGHUP handler is registered early too (see above); the task can
-    // run as soon as the relay exists, before the long state restore.
-    let reload_task = tokio::spawn(reload_handler(
-        config_path,
-        relay.clone(),
-        relay.db.clone(),
-        relay.api_limit.clone(),
-        shutdown_rx.clone(),
-        hangup,
-    ));
     // Startup barrier: the database's synchronous recovery may have removed
     // a NIP-29/NIP-43 state event while resuming interrupted deletions. The
     // relay marks its derived stores stale here, before any snapshot is
@@ -911,6 +1943,11 @@ pub async fn run_server(
     startup_group_state(&relay, groups_enabled).await?;
     if groups_enabled {
         relay.finish_startup_group_recovery().await;
+        restore_dm_carry(&relay).await?;
+        restore_dm_backup(&relay).await?;
+        restore_buzz_backup(&relay).await?;
+        backfill_group_epochs(&relay).await?;
+        purge_expired_group_messages(&relay).await?;
     }
     if groups_enabled && relay.has_relay_key() {
         info!(
@@ -923,6 +1960,33 @@ pub async fn run_server(
     // migration only when nothing usable was ever persisted (see
     // [`restore_role_state`]).
     restore_role_state(&relay).await?;
+
+    // Start the SIGHUP task only after the restored role/group state is
+    // authoritative. If it ran during the restore window, a reload could
+    // republish an empty 13534 from the not-yet-restored store and persist
+    // an empty role snapshot, permanently discarding NIP-43 assignments.
+    // The tokio signal driver buffers a SIGHUP delivered before this point.
+    let reload_task = tokio::spawn(reload_handler(
+        config_path,
+        relay.clone(),
+        relay.db.clone(),
+        relay.api_limit.clone(),
+        shutdown_rx.clone(),
+        hangup,
+    ));
+
+    restore_archive_state(&relay).await?;
+
+    // NIP-IA: NIP-IA-aware clients (Buzz) treat a missing archived-identities
+    // snapshot as an uncheckable archive state. Publish the current
+    // relay-signed snapshot so clients can verify the archive state against
+    // NIP-11 `self`.
+    if relay.config.read().await.relay.enabled_buzz
+        && relay.relay_pubkey().is_some()
+        && !relay.publish_archive_snapshot().await
+    {
+        warn!("could not publish the NIP-IA archived-identities snapshot");
+    }
 
     let blossom_state = blossom::build_state(&relay.config.read().await.clone(), &relay).await?;
     *relay.blossom.write().await = blossom_state.clone();
@@ -1013,9 +2077,8 @@ pub async fn run_server(
         });
         supervised.push(SupervisedTask { outer, inner });
     }
-    // Spawned before the startup work (see the top of `run_server`) and
-    // kept out of the abortable set so its second-signal escalation
-    // stays armed.
+    // Spawned after the state restore (see above) and kept out of the
+    // abortable set so its second-signal escalation stays armed.
     let mut tasks = Vec::new();
     {
         let shutdown = shutdown_rx.clone();
@@ -2040,6 +3103,21 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                             // completes.
                             relay.mark_roles_stale().await;
                         }
+                        // Channel TTL is separate from NIP-40's storage
+                        // expiry index; reclaim its expired content on the
+                        // same periodic maintenance tick. Read-time TTL
+                        // enforcement remains authoritative if this scan is
+                        // interrupted or fails.
+                        let cleanup = tokio::select! {
+                            result = purge_expired_group_messages(&relay) => result,
+                            _ = shutdown.changed() => break,
+                        };
+                        if let Err(error) = cleanup {
+                            log::warn!(
+                                "periodic channel-TTL cleanup failed; read-time TTL enforcement \
+                                 remains active: {error}"
+                            );
+                        }
                     }
                     _ = shutdown.changed() => break,
                 }
@@ -2830,6 +3908,17 @@ async fn handle_reload(
     // live in the database: re-read them on every reload (a failed load
     // keeps the previous lists — see `Relay::reload_db_state`).
     relay.reload_db_state().await;
+    // Republish 13534 after a CLI allow/deny or a config reload so
+    // Buzz-style clients see the new allowlist and owner identities without
+    // a restart.
+    if relay.relay_pubkey().is_some() && relay.config.read().await.nip_enabled(43) {
+        if !relay.publish_membership(None).await {
+            warn!("could not republish the NIP-43 membership list after reload");
+        }
+        // The publish advanced the role-state sequence; persist the snapshot
+        // so the next startup does not discard it as stale.
+        relay.persist_roles().await;
+    }
     relocated_pid
 }
 
@@ -2900,6 +3989,10 @@ async fn apply_reloaded_config(
             "relay.livekit_participants_interval_secs",
             old.relay.livekit_participants_interval_secs
                 != new_config.relay.livekit_participants_interval_secs,
+        ),
+        (
+            "relay.enabled_buzz",
+            old.relay.enabled_buzz != new_config.relay.enabled_buzz,
         ),
         (
             "relay.enabled_nips",
@@ -3112,6 +4205,10 @@ async fn apply_reloaded_config(
     new_config.server.metrics_enabled = old.server.metrics_enabled;
     new_config.rpc.max_admin_body_bytes = old.rpc.max_admin_body_bytes;
     new_config.relay.private_key = old.relay.private_key.clone();
+    // `enabled_buzz` shapes the router (bridge routes) and the NIP-11
+    // extension list, so it is startup-only; a reload must not half-apply it
+    // while the old routes stay mounted.
+    new_config.relay.enabled_buzz = old.relay.enabled_buzz;
     new_config.relay.livekit_url = old.relay.livekit_url.clone();
     new_config.relay.livekit_api_key = old.relay.livekit_api_key.clone();
     new_config.relay.livekit_api_secret = old.relay.livekit_api_secret.clone();
@@ -3750,6 +4847,294 @@ mod tests {
             err.to_string().contains("refusing to start"),
             "an unreadable snapshot must stop startup, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_dm_carry_is_merged_after_rebuild() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let mut group = crate::nips::nip29::Group {
+            channel_type: "dm".into(),
+            created_at: Some(unix_now()),
+            ..crate::nips::nip29::Group::default()
+        };
+        group
+            .members
+            .insert("aa".repeat(32), std::collections::HashSet::new());
+        let mut carry = crate::nips::nip29::GroupsSnapshot::default();
+        carry.groups.insert("dm-carry".into(), group);
+        assert!(
+            relay
+                .db
+                .save_dm_carry(serde_json::to_vec(&carry).unwrap())
+                .await
+        );
+        restore_dm_carry(&relay)
+            .await
+            .expect("carry merge must succeed");
+        assert!(relay.groups.read().await.group("dm-carry").is_some());
+        assert_eq!(relay.db.load_dm_carry().await, Some(None));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dm_metadata_reconstructs_after_snapshot_loss() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        relay.config.write().await.relay.enabled_buzz = true;
+        relay.groups.write().await.buzz_enabled = true;
+        let a = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
+        let b = secp256k1::Keypair::from_secret_bytes([8u8; 32]).unwrap();
+        let a_pk = secp256k1::XOnlyPublicKey::from_keypair(&a).0.to_string();
+        let b_pk = secp256k1::XOnlyPublicKey::from_keypair(&b).0.to_string();
+        let open = Event {
+            id: String::new(),
+            pubkey: a_pk.clone(),
+            created_at: unix_now(),
+            kind: crate::nips::nip29::DM_OPEN,
+            tags: vec![vec!["p".into(), b_pk.clone()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let channel = match relay.handle_dm_open(&open, &[]).await {
+            crate::db::PutOutcome::Duplicate(message) => {
+                let json = message.strip_prefix("response:").expect("DM response");
+                serde_json::from_str::<serde_json::Value>(json).unwrap()["channel_id"]
+                    .as_str()
+                    .expect("channel id")
+                    .to_string()
+            }
+            other => panic!("DM open failed: {other:?}"),
+        };
+        // Simulate a database whose main snapshot and additive DM backup are
+        // both gone, while the relay-signed metadata remains.
+        relay
+            .groups
+            .write()
+            .await
+            .restore(crate::nips::nip29::GroupsSnapshot::default());
+        let recovered = restore_dm_metadata(&relay)
+            .await
+            .expect("DM metadata recovery must succeed");
+        assert!(recovered > 0);
+        let groups = relay.groups.read().await;
+        let group = groups.group(&channel).expect("recovered DM group");
+        assert_eq!(group.channel_type, "dm");
+        assert!(group.is_member(&a_pk));
+        assert!(group.is_member(&b_pk));
+        assert!(group.settings.private && group.settings.hidden);
+        drop(groups);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn restore_dm_backup_merges_after_a_lost_main_snapshot() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        relay
+            .groups
+            .write()
+            .await
+            .restore(crate::nips::nip29::GroupsSnapshot::default());
+        let mut group = crate::nips::nip29::Group {
+            channel_type: "dm".into(),
+            created_at: Some(unix_now()),
+            ..crate::nips::nip29::Group::default()
+        };
+        group
+            .members
+            .insert("aa".repeat(32), std::collections::HashSet::new());
+        let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
+        snapshot.groups.insert("dm-backup".into(), group);
+        snapshot.stamp = relay.db.state_stamp().await.expect("stamp");
+        snapshot.seq = relay.db.state_seq_group().await.expect("seq");
+        assert!(relay.db.save_groups(snapshot).await);
+        restore_dm_backup(&relay)
+            .await
+            .expect("DM backup restore must succeed");
+        assert!(
+            relay.groups.read().await.group("dm-backup").is_some(),
+            "a DM must be restored when the event rebuild cannot recreate it"
+        );
+        assert!(
+            relay
+                .db
+                .load_groups()
+                .await
+                .expect_loaded("snapshot")
+                .groups
+                .contains_key("dm-backup"),
+            "the merged DM must be persisted back into the main snapshot"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn startup_ttl_purge_removes_expired_channel_messages() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let now = unix_now();
+        let relay_pk = relay.relay_pubkey().unwrap_or_default();
+        {
+            let mut groups = relay.groups.write().await;
+            groups.buzz_enabled = true;
+            let create = Event {
+                id: "41".repeat(32),
+                pubkey: relay_pk.clone(),
+                created_at: now - 100,
+                kind: crate::nips::nip29::CREATE_GROUP,
+                tags: vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["ttl".into(), "10".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            groups.apply(&create, &relay_pk, now - 100, false, false);
+        }
+        let message = Event {
+            id: "42".repeat(32),
+            pubkey: relay_pk,
+            created_at: now - 100,
+            kind: 9,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: "expired".into(),
+            sig: String::new(),
+        };
+        assert_eq!(
+            relay.db.put(message.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        );
+        purge_expired_group_messages(&relay)
+            .await
+            .expect("TTL purge must succeed");
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": [message.id]})).unwrap();
+        let (stored, _) = relay.db.query(vec![filter], 10, unix_now()).await;
+        assert!(stored.is_empty(), "expired group content must be removed");
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ttl_purge_advances_past_state_only_pages() {
+        // A page full of group state must not end the ascending scan: the
+        // expired content behind it would otherwise stay stored forever.
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let now = unix_now();
+        let relay_pk = relay.relay_pubkey().unwrap_or_default();
+        {
+            let mut groups = relay.groups.write().await;
+            groups.buzz_enabled = true;
+            let create = Event {
+                id: "51".repeat(32),
+                pubkey: relay_pk.clone(),
+                created_at: now - 100,
+                kind: crate::nips::nip29::CREATE_GROUP,
+                tags: vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["ttl".into(), "10".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            groups.apply(&create, &relay_pk, now - 100, false, false);
+        }
+        let state = |id: &str, created_at: u64| Event {
+            id: id.repeat(32),
+            pubkey: relay_pk.clone(),
+            created_at,
+            kind: crate::nips::nip29::PUT_USER,
+            tags: vec![
+                vec!["h".into(), "g1".into()],
+                vec!["p".into(), "aa".repeat(32)],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let content = |id: &str, created_at: u64| Event {
+            id: id.repeat(32),
+            pubkey: relay_pk.clone(),
+            created_at,
+            kind: 9,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: "expired".into(),
+            sig: String::new(),
+        };
+        let state_one = state("52", now - 100);
+        let state_two = state("53", now - 99);
+        let content_one = content("54", now - 98);
+        let content_two = content("55", now - 97);
+        for event in [&state_one, &state_two, &content_one, &content_two] {
+            assert_eq!(
+                relay.db.put(event.clone(), now).await,
+                crate::db::PutOutcome::Stored
+            );
+        }
+        purge_expired_group_messages_paged(&relay, 2)
+            .await
+            .expect("TTL purge must succeed");
+        let query = |ids: Vec<String>| {
+            let filter: crate::filter::Filter =
+                serde_json::from_value(serde_json::json!({"ids": ids})).unwrap();
+            relay.db.query(vec![filter], 10, unix_now())
+        };
+        let (state_rows, _) = query(vec![state_one.id.clone(), state_two.id.clone()]).await;
+        assert_eq!(state_rows.len(), 2, "group state must survive the purge");
+        let (content_rows, _) = query(vec![content_one.id.clone(), content_two.id.clone()]).await;
+        assert!(
+            content_rows.is_empty(),
+            "expired content behind a full state page must be removed"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn group_epoch_backfill_binds_pre_existing_state() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let now = unix_now();
+        let relay_pk = relay.relay_pubkey().unwrap_or_default();
+        let channel = "g1";
+        let create = Event {
+            id: "11".repeat(32),
+            pubkey: relay_pk.clone(),
+            created_at: now - 2,
+            kind: crate::nips::nip29::CREATE_GROUP,
+            tags: vec![vec!["h".into(), channel.into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, &relay_pk, now - 2, false, false);
+        let state = Event {
+            id: "22".repeat(32),
+            pubkey: relay_pk.clone(),
+            created_at: now - 1,
+            kind: crate::nips::nip29::PUT_USER,
+            tags: vec![
+                vec!["h".into(), channel.into()],
+                vec!["p".into(), "aa".repeat(32)],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        assert_eq!(
+            relay.db.put(state.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        );
+        backfill_group_epochs(&relay)
+            .await
+            .expect("backfill must succeed");
+        let mappings = relay
+            .db
+            .group_epochs_startup(vec![state.id_bytes().unwrap().to_vec()])
+            .await
+            .expect("mapping read must answer");
+        assert_eq!(
+            mappings.get(&state.id),
+            Some(&create.id),
+            "the pre-existing state must be bound to the current group epoch"
+        );
+        assert_eq!(relay.db.group_epochs_backfilled().await, Some(true));
+        relay.db.shutdown();
     }
 
     #[tokio::test]
@@ -6588,6 +7973,33 @@ mod tests {
             "/ws",
             &axum::http::Method::GET
         ));
+        // Buzz's bridge endpoints are relay paths, not Blossom blobs, and
+        // must stay reachable when a media host is configured.
+        for path in ["/info", "/query", "/events", "/count"] {
+            let method = if path == "/info" {
+                axum::http::Method::GET
+            } else {
+                axum::http::Method::POST
+            };
+            assert!(
+                host_route_allowed("", "media.test", "relay.example.com", path, &method),
+                "{path} must stay on the relay host"
+            );
+        }
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "relay.example.com",
+            "/media/upload",
+            &axum::http::Method::PUT
+        ));
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "relay.example.com",
+            &format!("/media/{sha}.png"),
+            &axum::http::Method::GET
+        ));
         // api + blossom: each host serves only its own paths.
         assert!(host_route_allowed(
             "api.example.com",
@@ -6727,5 +8139,44 @@ mod tests {
             .await
             .expect("the body fits");
         assert_eq!(bytes.len(), 128);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_empty_role_store_does_not_block_claim_persistence() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        restore_role_state(&relay)
+            .await
+            .expect("a fresh role start must succeed");
+        assert!(
+            relay.create_claim("fresh-code").await.is_ok(),
+            "a fresh empty role store has nothing to preserve; claims must persist"
+        );
+        let saved = relay.db.load_roles().await.expect_loaded("snapshot");
+        assert!(saved.claims.contains("fresh-code"));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn restore_filters_vanished_group_members() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let vanished = "aa".repeat(32);
+        let mut group = crate::nips::nip29::Group::default();
+        group.members.insert(vanished.clone(), Default::default());
+        group.guests.insert(vanished.clone());
+        group.bots.insert(vanished.clone());
+        group.hidden_for.insert(vanished.clone());
+        let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
+        snapshot.groups.insert("g1".into(), group);
+        let key: [u8; 32] = hex::decode(&vanished).unwrap().try_into().unwrap();
+        relay.db.apply_vanish(key, crate::util::unix_now()).await;
+        filter_vanished_group_snapshot(&relay, &mut snapshot)
+            .await
+            .expect("vanish list must be readable");
+        let group = snapshot.groups.get("g1").unwrap();
+        assert!(!group.members.contains_key(&vanished));
+        assert!(!group.guests.contains(&vanished));
+        assert!(!group.bots.contains(&vanished));
+        assert!(!group.hidden_for.contains(&vanished));
+        relay.db.shutdown();
     }
 }

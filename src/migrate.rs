@@ -10,12 +10,14 @@
 //! ([`DbClient::put_batch_checked`]), so NIP-01 replaceable/addressable
 //! semantics, the NIP-40 expiry index, the NIP-50 word index, the gift-wrap
 //! recipient index and every other index are maintained. The per-event side
-//! effects the relay applies *after* a store are reproduced in input order:
+//! effects the relay applies *after* a store are reproduced without changing
+//! the group-action fixpoint:
 //!
-//! - NIP-09 (`kind:5`): the deletion is applied and the deleter's gift wraps
-//!   are purged, writing the tombstones that keep the deleted events from
-//!   being re-published (strfry physically removes deleted events, so the
-//!   export has no trace of them except the deletion requests themselves).
+//! - NIP-09 (`kind:5`): the deletion is recorded during import and applied
+//!   after the NIP-29 fixpoint; its gift-wrap purges run in the same pass.
+//!   It writes the tombstones that keep the deleted events from being
+//!   re-published (strfry physically removes deleted events, so the export
+//!   has no trace of them except the deletion requests themselves).
 //! - NIP-29 (`kind:9005`): the referenced events are deleted with the group
 //!   scoping check.
 //! - NIP-29 (`kind:9008`): the group's stored events are purged and the
@@ -23,9 +25,11 @@
 //!   (fail-closed: leftover history would become world-readable if the id
 //!   were re-created).
 //! - NIP-62 (`kind:62`): only with [`Options::apply_vanish`], and only when
-//!   the request targets this relay. Opt-in because strfry does not
-//!   implement NIP-62: the events the request names were served by strfry
-//!   and are part of the data being migrated.
+//!   the request targets this relay. The pending marker is written during
+//!   import (so later rows of the same author are blocked), while the
+//!   removal walk waits for the group fixpoint. Opt-in because strfry does
+//!   not implement NIP-62: the events the request names were served by
+//!   strfry and are part of the data being migrated.
 //!
 //! Derived state (NIP-29 groups, NIP-43 roles) is not rebuilt here: the
 //! first relay start after the migration replays the stored events, exactly
@@ -67,6 +71,11 @@ pub struct Options {
     /// Whether NIP-40 is enabled in the nostrfy config: a dry run uses it
     /// to classify already-expired events like the put path would.
     pub nip40_enabled: bool,
+    /// Whether the Buzz compatibility layer is enabled. The authorization
+    /// replay must use the same NIP-CL settings semantics as the relay's
+    /// startup rebuild, or a Buzz reopen (`visibility=open`) can make the
+    /// migration drop a JOIN the relay would admit.
+    pub enabled_buzz: bool,
     /// Record the first-seen timestamp of each imported author (only
     /// meaningful, and only set, when the new-pubkey gate is configured).
     pub first_seen: bool,
@@ -408,8 +417,65 @@ pub async fn run(
         // order-independent), then the NIP-29 actions.
         apply_gift_wrap_purges(db, &mut stats).await?;
         apply_group_side_effects(db, opts, &mut stats).await?;
+        // Apply NIP-09/NIP-62 only after the 9005/9008 fixpoint has
+        // consumed every action. A later deletion may still remove an
+        // action event, but its already-applied effect is fail-closed
+        // (revoking membership/purging history) rather than being skipped.
+        apply_stored_removals(db, opts, &identity, &mut stats).await?;
+        invalidate_group_snapshot_after_import(db, &stats).await?;
     }
     Ok(stats)
+}
+
+/// An imported database must not trust a pre-import group snapshot: the
+/// snapshot knows neither the imported group ids nor the imported `h`/`d`
+/// history, so unknown private groups could read as public and the ghost pass
+/// would never run. Drop the snapshot so the next start rebuilds from events.
+/// DM groups are snapshot-only, so keep the snapshot when one exists and
+/// leave that (documented) migration limitation rather than destroying its
+/// membership; the next start still serves the restored DM safely.
+async fn invalidate_group_snapshot_after_import(db: &DbClient, stats: &Stats) -> Result<()> {
+    if stats.stored == 0 && stats.replaced == 0 {
+        return Ok(());
+    }
+    match db.load_groups().await {
+        crate::db::LoadGroupsOutcome::Missing => Ok(()),
+        crate::db::LoadGroupsOutcome::Failed => bail!(
+            "cannot inspect the destination group snapshot after the migration; \
+             refusing to leave it as authoritative (re-run the migration)"
+        ),
+        crate::db::LoadGroupsOutcome::Loaded(snapshot) => {
+            let mut carry = crate::nips::nip29::GroupsSnapshot::default();
+            for (gid, group) in &snapshot.groups {
+                if group.channel_type == "dm" {
+                    carry.groups.insert(gid.clone(), group.clone());
+                }
+            }
+            if !carry.groups.is_empty() {
+                let data = serde_json::to_vec(&carry)?;
+                if !db.save_dm_carry(data).await {
+                    bail!(
+                        "could not preserve the destination DM groups before the \
+                         migration rebuild; the migration did not complete (re-run it)"
+                    );
+                }
+                log::info!(
+                    "migration saved {} DM group(s) for merge after the event rebuild",
+                    carry.groups.len()
+                );
+            }
+            if !db.clear_groups_snapshot().await {
+                if !carry.groups.is_empty() {
+                    let _ = db.clear_dm_carry().await;
+                }
+                bail!(
+                    "could not invalidate the destination group snapshot after the \
+                     migration; refusing to leave imported private history unverified"
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Reads one line (up to and including `\n`) into `out`, keeping at most
@@ -528,21 +594,100 @@ async fn flush(
         {
             first_seen.push((pubkey, event.created_at));
         }
-        match event.kind {
-            nip09::DELETION_KIND => apply_nip09(db, event, stats).await?,
-            nip62::VANISH_KIND
-                if opts.apply_vanish
-                    && opts.nip62_enabled
-                    && nip62::is_vanish(event)
-                    && nip62::targets_us(event, identity) =>
-            {
-                apply_vanish(db, event, stats).await?
+        if crate::nips::nip29::is_group_action(event.as_ref())
+            && let Some(event_id) = event.id_bytes()
+            && db.assign_event_arrival(event_id).await.is_none()
+        {
+            bail!(
+                "could not record the imported group-state arrival order; the migration \
+                 did not complete (re-run it)"
+            );
+        }
+        // NIP-62's marker must be written before later events of the same
+        // author are imported (the permanent-upload ban is order-sensitive).
+        // The removal walk is deferred with NIP-09, so an admin's earlier
+        // 9005/9008 retains its effect; the marker alone blocks later rows.
+        if event.kind == nip62::VANISH_KIND
+            && opts.apply_vanish
+            && opts.nip62_enabled
+            && nip62::is_vanish(event)
+            && nip62::targets_us(event, identity)
+        {
+            let Some(pubkey) = event.pubkey_bytes() else {
+                bail!(
+                    "the stored NIP-62 request has no valid pubkey; the migration did not \
+                     complete (re-run it)"
+                );
+            };
+            if !db.record_pending_vanish(pubkey, event.created_at).await {
+                bail!(
+                    "could not record the NIP-62 pending marker; the migration did not \
+                     complete (re-run it)"
+                );
             }
-            _ => {}
         }
     }
     if opts.first_seen && !first_seen.is_empty() {
         db.touch_first_seen_batch(std::mem::take(first_seen)).await;
+    }
+    Ok(())
+}
+
+/// Applies stored NIP-09/NIP-62 requests after group actions. Both are
+/// author-scoped removal effects; running them after the 9005/9008 fixpoint
+/// prevents a later deletion from erasing an action before its effect is
+/// applied (the effect may over-remove, never under-remove).
+async fn apply_stored_removals(
+    db: &DbClient,
+    opts: &Options,
+    identity: &nip62::RelayIdentity<'_>,
+    stats: &mut Stats,
+) -> Result<()> {
+    const PAGE: usize = 50_000;
+    let mut since: Option<u64> = None;
+    let mut last_key: Option<(u64, u64, String)> = None;
+    loop {
+        let mut filter: Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [nip09::DELETION_KIND, nip62::VANISH_KIND],
+        }))
+        .expect("static filter");
+        filter.since = since;
+        let Some((mut page, more)) = db
+            .query_full_startup(vec![filter], PAGE, unix_now(), true)
+            .await
+        else {
+            bail!(
+                "could not read stored deletion/vanish requests; the migration did not \
+                 complete (re-run it)"
+            );
+        };
+        if page.is_empty() {
+            break;
+        }
+        page.sort_by(|a, b| (a.created_at, a.kind, &a.id).cmp(&(b.created_at, b.kind, &b.id)));
+        for event in page {
+            let key = (event.created_at, event.kind, event.id.clone());
+            if last_key.as_ref().is_some_and(|last| &key <= last) {
+                continue;
+            }
+            last_key = Some(key);
+            if event.kind == nip09::DELETION_KIND {
+                apply_nip09(db, &event, stats).await?;
+            } else if opts.apply_vanish
+                && opts.nip62_enabled
+                && nip62::is_vanish(&event)
+                && nip62::targets_us(&event, identity)
+            {
+                apply_vanish(db, &event, stats).await?;
+            }
+        }
+        if !more {
+            break;
+        }
+        since = last_key.as_ref().map(|(created, _, _)| *created);
+        if since.is_none() {
+            break;
+        }
     }
     Ok(())
 }
@@ -556,6 +701,12 @@ fn replay_moderation(
     event: &Event,
     relay_pubkey: Option<&str>,
 ) -> bool {
+    // The live write path rejects group state more than 600 seconds in the
+    // future. Keep the replay from letting a pre-limit legacy row outrank a
+    // later removal and resurrect it.
+    if event.created_at > unix_now().saturating_add(600) {
+        return false;
+    }
     // The authorization gate only: the relay's own key is the master key,
     // an existing group requires an admin, and an unknown group only
     // accepts a create (a group action without an `h` tag is refused, like
@@ -567,6 +718,31 @@ fn replay_moderation(
     // state and the first restart's rebuild agree.
     if crate::nips::nip29::is_group_action(event) && crate::nips::nip29::group_id(event).is_none() {
         return false;
+    }
+    // The startup rebuild of this relay's own keyless history trusts stored
+    // JOINs, because they were admitted live. An imported export has no such
+    // guarantee: refuse a code-less JOIN to a group that is closed at this
+    // point in the chronological replay, so it is dropped instead of
+    // becoming trusted on the first restart. A code-bearing JOIN is kept
+    // because its 9009 invite may have been removed later (see below).
+    if event.kind == crate::nips::nip29::JOIN {
+        let admitted = crate::nips::nip29::group_id(event)
+            .and_then(|gid| groups.group(gid))
+            .is_some_and(|group| {
+                !group.settings.closed
+                    // The code may have been added by a 9009 that a later
+                    // 9005 removed. The export keeps the JOIN but not the
+                    // deleted invite, so a code-bearing JOIN is treated as
+                    // pre-authorized; a code-less JOIN to a group that is
+                    // already closed is refused. Rejecting every code-bearing
+                    // JOIN after an invite revocation would delete legitimate
+                    // members from the migrated relay.
+                    || crate::nips::nip29::event_code(event)
+                        .is_some_and(|code| !code.is_empty())
+            });
+        if !admitted {
+            return false;
+        }
     }
     if (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX).contains(&event.kind)
         && !relay_pubkey.is_some_and(|pk| pk.eq_ignore_ascii_case(&event.pubkey))
@@ -687,6 +863,7 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
     // scan, and only a state-changing action restarts it. Neither the
     // action list nor the refused list is materialized as a whole.
     let mut applied: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut admitted_joins: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dropped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut deleted_creates: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
@@ -698,6 +875,14 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
         // materialized: memory stays bounded by the page and `applied` ids.
         loop {
             let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
+            groups.buzz_enabled = opts.enabled_buzz;
+            // The JOIN gate in `replay_moderation` has already refused
+            // invalid closed-group joins; for the accepted ones, reproduce
+            // the keyless startup rebuild's trust so the migration's
+            // authorization state matches the first restart. A keyed
+            // destination still re-adjudicates (its relay_pubkey is
+            // non-empty).
+            groups.trust_stored_joins = true;
             let mut sink = ModerationActionSink {
                 db,
                 deleted_creates: &mut deleted_creates,
@@ -709,6 +894,7 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
                 &mut groups,
                 opts.relay_pubkey.as_deref(),
                 ReplayAction::Apply(&mut sink),
+                Some(&mut admitted_joins),
                 None,
             )
             .await?;
@@ -805,10 +991,13 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
     // state once and drop the refused events page by page, so the refused
     // list is never held in memory as a whole.
     let mut groups = crate::nips::nip29::GroupStore::with_cap(opts.max_groups);
+    groups.buzz_enabled = opts.enabled_buzz;
+    groups.trust_stored_joins = true;
     {
         let mut dropper = RefusedDropper {
             db,
             applied: &applied,
+            admitted_joins: &admitted_joins,
             dropped: &mut dropped,
             stats,
         };
@@ -817,6 +1006,7 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
             &mut groups,
             opts.relay_pubkey.as_deref(),
             ReplayAction::Final(&applied),
+            None,
             Some(&mut dropper),
         )
         .await?;
@@ -924,6 +1114,11 @@ async fn drop_fake_group_metadata(
 struct RefusedDropper<'a> {
     db: &'a DbClient,
     applied: &'a std::collections::HashSet<String>,
+    /// JOINs admitted by any fixpoint pass. A later pass may see the group's
+    /// create deleted and refuse the same JOIN; deleting it would break the
+    /// migration's contract because the event was accepted when it was
+    /// first replayed.
+    admitted_joins: &'a std::collections::HashSet<String>,
     dropped: &'a mut std::collections::HashSet<String>,
     stats: &'a mut Stats,
 }
@@ -938,6 +1133,7 @@ impl RefusedDropper<'_> {
             // run had accepted.
             if event.kind == 9005
                 || self.applied.contains(&event.id)
+                || self.admitted_joins.contains(&event.id)
                 || !self.dropped.insert(event.id.clone())
             {
                 continue;
@@ -1024,6 +1220,7 @@ async fn replay_stored_moderation(
     groups: &mut crate::nips::nip29::GroupStore,
     relay_pubkey: Option<&str>,
     mut action: ReplayAction<'_>,
+    mut admitted_joins: Option<&mut std::collections::HashSet<String>>,
     mut refused: Option<&mut RefusedDropper<'_>>,
 ) -> Result<ReplayOutcome> {
     let kinds: Vec<u64> = (crate::nips::nip29::MOD_MIN..=crate::nips::nip29::MOD_MAX)
@@ -1047,6 +1244,17 @@ async fn replay_stored_moderation(
         );
     }
     const PAGE: usize = 50_000;
+    // Mirror the startup rebuild: a stored state event whose create is
+    // later in the chronological/rank order is held until that create is
+    // replayed, then re-adjudicated against the real group. Without this,
+    // migration deletes a legitimate pre-create setting/admin grant that
+    // the first restart would have buffered and applied.
+    const PENDING_STATE_MAX: usize = 50_000;
+    let mut pending_state: std::collections::HashMap<String, Vec<Event>> =
+        std::collections::HashMap::new();
+    let mut pending_arrivals: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    let mut pending_state_count = 0usize;
     let mut since: Option<u64> = None;
     let mut page_refused = Vec::new();
     loop {
@@ -1066,40 +1274,43 @@ async fn replay_stored_moderation(
         if page.is_empty() {
             break;
         }
-        page.sort_by(|a, b| {
-            (
-                a.created_at,
-                crate::nips::nip29::group_rank(a.kind),
-                a.kind,
-                &a.id,
-            )
-                .cmp(&(
-                    b.created_at,
-                    crate::nips::nip29::group_rank(b.kind),
-                    b.kind,
-                    &b.id,
-                ))
-        });
+        let page_ids: Vec<Vec<u8>> = page
+            .iter()
+            .filter_map(|event| event.id_bytes().map(|id| id.to_vec()))
+            .collect();
+        let Some(page_arrivals) = db.event_arrivals(page_ids).await else {
+            bail!(
+                "could not read imported group-state arrival order; the migration did not \
+                 complete (re-run it)"
+            );
+        };
+        page.sort_by(|a, b| crate::nips::nip29::replay_order(a, b, &page_arrivals));
         let max_created = page.last().map(|event| event.created_at);
         let boundary_count = page
             .iter()
             .filter(|event| Some(event.created_at) == max_created)
             .count();
         // Consistency with the startup rebuild, not an authorization change:
-        // this replay's only gate is `is_admin` (`replay_moderation`), and a
-        // join grants no roles, so skipping a join that shares its second
-        // with the removal of the same member cannot flip a 9005/9008 verdict.
+        // this replay's moderation gate is `is_admin` (`replay_moderation`)
+        // plus the JOIN admission check, and a join grants no roles, so
+        // skipping a join that shares its second with the removal of the
+        // same member cannot flip a 9005/9008 verdict.
         // It is kept so the two replays derive the same group state from the
         // same stored events — they share `group_rank` for exactly that
         // reason — and so the `total_members` budget is not inflated by a
         // member the restart will not have.
-        let same_second_removals = crate::nips::nip29::SameSecondRemovals::collect(&page);
+        let same_second_removals =
+            crate::nips::nip29::SameSecondRemovals::collect_with_arrivals(&page, &page_arrivals);
         for mut event in page {
             if event.kind == crate::nips::nip29::JOIN && vanished.contains(&event.pubkey) {
                 continue;
             }
             if event.kind == crate::nips::nip29::JOIN
-                && same_second_removals.removes(&event.pubkey, event.created_at)
+                && same_second_removals.removes(
+                    &event.pubkey,
+                    event.created_at,
+                    crate::nips::nip29::group_id(&event).unwrap_or_default(),
+                )
             {
                 continue;
             }
@@ -1111,7 +1322,43 @@ async fn replay_stored_moderation(
                     continue;
                 }
             }
-            if replay_moderation(groups, &event, relay_pubkey) {
+            let event_gid = crate::nips::nip29::group_id(&event)
+                .filter(|gid| !gid.is_empty())
+                .map(str::to_string);
+            let is_create = event.kind == crate::nips::nip29::CREATE_GROUP;
+            if event.kind != crate::nips::nip29::CREATE_GROUP
+                && let Some(gid) = &event_gid
+                && groups.group(gid).is_none()
+                && !groups.is_ghosted(gid)
+                && !groups.is_deleted(gid)
+            {
+                // A delete for an id that has no group yet is not a
+                // state-bearing event to resurrect; the startup rebuild
+                // skips it, so keep it stored but do not create a pending
+                // group from it.
+                if event.kind == crate::nips::nip29::DELETE_GROUP {
+                    continue;
+                }
+                if pending_state_count < PENDING_STATE_MAX {
+                    if let Some(seq) = page_arrivals.get(&event.id) {
+                        pending_arrivals.insert(event.id.clone(), *seq);
+                    }
+                    pending_state.entry(gid.clone()).or_default().push(event);
+                    pending_state_count += 1;
+                    continue;
+                }
+                // Bounded history exceeded: fall back to the pre-buffer
+                // behavior (the event will be refused below) rather than
+                // aborting a healthy migration.
+            }
+            let authorized = replay_moderation(groups, &event, relay_pubkey);
+            if authorized
+                && event.kind == crate::nips::nip29::JOIN
+                && let Some(admitted) = admitted_joins.as_deref_mut()
+            {
+                admitted.insert(event.id.clone());
+            }
+            if authorized {
                 if matches!(event.kind, 9005 | 9008) {
                     match &mut action {
                         ReplayAction::Apply(sink) => {
@@ -1131,11 +1378,74 @@ async fn replay_stored_moderation(
                     }
                 }
             } else if refused.is_some() {
-                page_refused.push(event);
+                // A JOIN whose group is missing may be a legitimate join
+                // whose create a 9005 removed in an earlier fixpoint pass.
+                // It has no effect on the replayed state (the group no
+                // longer exists) and dropping it would violate the
+                // migration contract; keep it. A JOIN to an existing
+                // closed group without a code is still dropped.
+                let keep_orphan_join = event.kind == crate::nips::nip29::JOIN
+                    && crate::nips::nip29::group_id(&event)
+                        .is_some_and(|gid| groups.group(gid).is_none());
+                if !keep_orphan_join {
+                    page_refused.push(event);
+                }
+            }
+            // The create has established the group: replay the state that
+            // preceded it, now with the real group state for authorization
+            // and apply. State-changing 9005/9008 actions run through the
+            // same sink as in-order actions.
+            if authorized
+                && is_create
+                && let Some(gid) = event_gid.as_deref()
+                && let Some(mut buffered) = pending_state.remove(gid)
+            {
+                pending_state_count = pending_state_count.saturating_sub(buffered.len());
+                buffered.sort_by(|a, b| crate::nips::nip29::replay_order(a, b, &pending_arrivals));
+                for buffered_event in buffered {
+                    let authorized = replay_moderation(groups, &buffered_event, relay_pubkey);
+                    if authorized
+                        && buffered_event.kind == crate::nips::nip29::JOIN
+                        && let Some(admitted) = admitted_joins.as_deref_mut()
+                    {
+                        admitted.insert(buffered_event.id.clone());
+                    }
+                    if authorized {
+                        if matches!(buffered_event.kind, 9005 | 9008) {
+                            match &mut action {
+                                ReplayAction::Apply(sink) => {
+                                    if !sink.applied.contains(&buffered_event.id)
+                                        && sink.apply(&buffered_event).await?
+                                    {
+                                        return Ok(ReplayOutcome::StateChanged);
+                                    }
+                                }
+                                ReplayAction::Final(applied) => {
+                                    if !applied.contains(&buffered_event.id) {
+                                        bail!(
+                                            "the NIP-29 moderation fixpoint was not stable: an \
+                                             authorized buffered action remained in the final \
+                                             replay; the migration did not complete (re-run it)"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } else if refused.is_some() {
+                        page_refused.push(buffered_event);
+                    }
+                }
             }
         }
         if !more {
             if let Some(dropper) = refused.as_deref_mut() {
+                // A buffered state event whose create never appeared is
+                // unauthorized in this replay. Drop it in the final pass,
+                // like the pre-buffer code did, so a future re-create
+                // cannot inherit it.
+                for events in pending_state.drain().map(|(_, events)| events) {
+                    page_refused.extend(events);
+                }
                 dropper.drop_page(std::mem::take(&mut page_refused)).await?;
             }
             break;
@@ -1146,6 +1456,9 @@ async fn replay_stored_moderation(
         // incomplete state); fail the migration instead.
         let Some(boundary) = max_created else {
             if let Some(dropper) = refused.as_deref_mut() {
+                for events in pending_state.drain().map(|(_, events)| events) {
+                    page_refused.extend(events);
+                }
                 dropper.drop_page(std::mem::take(&mut page_refused)).await?;
             }
             break;
@@ -1397,6 +1710,7 @@ mod tests {
             apply_vanish: false,
             nip62_enabled: true,
             nip40_enabled: true,
+            enabled_buzz: false,
             first_seen: false,
             batch: 3,
             max_line_bytes: 1024 * 1024,
@@ -1933,6 +2247,45 @@ mod tests {
     }
 
     #[test]
+    fn vanish_does_not_erase_the_admins_deferred_group_action() {
+        // The vanish marker now blocks later rows immediately, but the
+        // removal walk runs after the 9005/9008 fixpoint. An admin's own
+        // vanish must not erase the 9005 before its effect is applied.
+        let db = test_db("vanish-admin-action");
+        let now = unix_now();
+        let create = signed(1, 9007, now - 50, vec![vec!["h".into(), "g".into()]], "");
+        let post = signed(2, 9, now - 40, vec![vec!["h".into(), "g".into()]], "post");
+        let delete = signed(
+            1,
+            9005,
+            now - 30,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["e".into(), post.id.clone()],
+            ],
+            "",
+        );
+        let vanish = signed(
+            1,
+            nip62::VANISH_KIND,
+            now - 20,
+            vec![vec!["relay".into(), "ALL_RELAYS".into()]],
+            "",
+        );
+        let mut opts = options();
+        opts.apply_vanish = true;
+        let stats = run_str(&db, &jsonl(&[create, post.clone(), delete, vanish]), &opts);
+        assert_eq!(stats.group_deletions, 1, "the 9005 must run before vanish");
+        assert_eq!(stats.vanishes, 1);
+        assert!(
+            visible(&db, serde_json::json!({"ids": [post.id]})).is_empty(),
+            "the deferred 9005 must delete the other author's post even though \
+             its admin author vanished"
+        );
+        db.shutdown();
+    }
+
+    #[test]
     fn first_seen_records_the_earliest_event() {
         let db = test_db("first-seen");
         let now = unix_now();
@@ -2124,6 +2477,67 @@ mod tests {
         let stats = run_str(&db, &jsonl(&[delete]), &options());
         assert_eq!(stats.group_deletions, 1, "the seeded admin is authorized");
         assert!(visible(&db, serde_json::json!({"ids": [post.id]})).is_empty());
+        db.shutdown();
+    }
+
+    #[test]
+    fn state_before_its_create_is_buffered_and_replayed() {
+        // strfry can export a grant before the group create (for example a
+        // backdated event whose id sorts first). The migration must keep the
+        // state, apply it once the create establishes the group, and then
+        // authorize a later action by that grant just like the startup
+        // rebuild does.
+        let db = test_db("pre-create-state");
+        let now = unix_now();
+        let admin_pk = keypair(2).x_only_public_key().0.to_string();
+        let grant = signed(
+            1,
+            9000,
+            now - 50,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["p".into(), admin_pk, "admin".into()],
+            ],
+            "",
+        );
+        let create = signed(1, 9007, now - 40, vec![vec!["h".into(), "g".into()]], "");
+        let post = signed(1, 9, now - 30, vec![vec!["h".into(), "g".into()]], "post");
+        let delete = signed(
+            2,
+            9005,
+            now - 20,
+            vec![
+                vec!["h".into(), "g".into()],
+                vec!["e".into(), post.id.clone()],
+            ],
+            "",
+        );
+        let stats = run_str(
+            &db,
+            &jsonl(&[grant.clone(), create.clone(), post.clone(), delete]),
+            &options(),
+        );
+        assert_eq!(
+            stats.unauthorized_moderation, 0,
+            "the buffered grant must not be counted as refused"
+        );
+        assert_eq!(
+            stats.group_deletions, 1,
+            "the buffered grant authorizes the 9005"
+        );
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [grant.id]})).len(),
+            1,
+            "the pre-create grant must survive the refused-event cleanup"
+        );
+        assert_eq!(
+            visible(&db, serde_json::json!({"ids": [create.id]})).len(),
+            1
+        );
+        assert!(
+            visible(&db, serde_json::json!({"ids": [post.id]})).is_empty(),
+            "the granted admin's 9005 must be applied"
+        );
         db.shutdown();
     }
 
@@ -2964,5 +3378,60 @@ mod tests {
         });
         assert_eq!(stats.valid, 1);
         assert_eq!(stats.imported(), 0);
+    }
+
+    #[test]
+    fn migration_refuses_an_uninvited_closed_group_join() {
+        let admin = "aa".repeat(32);
+        let user = "bb".repeat(32);
+        let mut groups = nip29::GroupStore::default();
+        let create = Event {
+            id: String::new(),
+            pubkey: admin.clone(),
+            created_at: 1,
+            kind: nip29::CREATE_GROUP,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let close = Event {
+            id: String::new(),
+            pubkey: admin,
+            created_at: 2,
+            kind: 9002,
+            tags: vec![vec!["h".into(), "g1".into()], vec!["closed".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let join = Event {
+            id: String::new(),
+            pubkey: user.clone(),
+            created_at: 3,
+            kind: nip29::JOIN,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        // Match the migration's trusted mode: its explicit JOIN gate above
+        // is what refuses the invalid event.
+        groups.trust_stored_joins = true;
+        assert!(replay_moderation(&mut groups, &create, None));
+        assert!(replay_moderation(&mut groups, &close, None));
+        assert!(
+            !replay_moderation(&mut groups, &join, None),
+            "an imported closed-group JOIN without an invite must be refused"
+        );
+        assert!(!groups.group("g1").unwrap().is_member(&user));
+
+        // A code-bearing JOIN may reference a 9009 that a later 9005
+        // removed; the code is no longer in the replayed state, but the
+        // source relay accepted the membership and deleting it would lose
+        // the member.
+        let mut invited = join.clone();
+        invited
+            .tags
+            .push(vec!["code".into(), "removed-invite".into()]);
+        assert!(replay_moderation(&mut groups, &invited, None));
+        assert!(groups.group("g1").unwrap().is_member(&user));
     }
 }

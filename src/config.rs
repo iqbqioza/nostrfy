@@ -140,6 +140,18 @@ pub struct RelayConfig {
     /// accepted and NIP-34 is advertised in the NIP-11 document. Default
     /// false: the kinds are rejected and NIP-34 is not advertised.
     pub enabled_git: bool,
+    /// Enable the Buzz desktop compatibility layer: the HTTP bridge
+    /// (`/info`, `/query`, `/events`, `/count`), the NIP-CL/NIP-CW
+    /// extensions and the Buzz DM commands. Default false: the bridge
+    /// routes are not served, so a stock Buzz client cannot use the relay.
+    pub enabled_buzz: bool,
+    /// Advertise NIP-43 (relay membership) in NIP-11 even when the relay is
+    /// open. NIP-43 is automatically advertised on a `restrict_relay`
+    /// allowlist relay, because that is when membership is actually
+    /// enforced. Set this true for a role-managed relay that wants
+    /// NIP-43-aware clients to treat it as a closed community without
+    /// turning on the allowlist. Default false.
+    pub advertise_nip43: bool,
     /// Events must carry at least this many leading zero bits in their id
     /// to be accepted (0 disables the check).
     pub require_pow: u8,
@@ -460,6 +472,8 @@ impl Default for RelayConfig {
             disabled_nips: Vec::new(),
             reject_ephemeral: false,
             enabled_git: false,
+            enabled_buzz: false,
+            advertise_nip43: false,
             require_pow: 0,
             new_pubkey_min_age_secs: 0,
             max_events_per_min_per_pubkey: 0,
@@ -1124,6 +1138,16 @@ impl Config {
         base.into_iter()
             .filter(|nip| {
                 if !relay_has_key && matches!(nip, 29 | 43 | 66) {
+                    return false;
+                }
+                // NIP-43 is about *enforced* relay membership. An open
+                // relay that merely stores role metadata must not advertise
+                // it: Buzz and other NIP-43-aware clients would then gate
+                // onboarding on kind:13534 and reject every pubkey that is
+                // not an assigned role member. The allowlist (`restrict_relay`)
+                // is an enforced membership set, and `advertise_nip43` is the
+                // explicit opt-in for role-managed relays.
+                if *nip == 43 && !(access.restrict_relay || self.relay.advertise_nip43) {
                     return false;
                 }
                 if !rpc_usable && *nip == 86 {
@@ -3066,6 +3090,8 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "disabled_nips",
                 "reject_ephemeral",
                 "enabled_git",
+                "enabled_buzz",
+                "advertise_nip43",
                 "require_pow",
                 "new_pubkey_min_age_secs",
                 "max_events_per_min_per_pubkey",
@@ -4239,11 +4265,23 @@ max_log_files = 2
         let nips = cfg.effective_supported_nips(&access);
         // Relay-side NIPs are advertised.
         for n in [
-            1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66,
-            67, 70, 77, 78, 84, 85, 86, 87, 88, 91, 94, 98,
+            1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67,
+            70, 77, 78, 84, 85, 86, 87, 88, 91, 94, 98,
         ] {
             assert!(nips.contains(&n), "NIP-{n} must be advertised");
         }
+        // NIP-43 is membership-enforcement metadata, not a generic role
+        // store: an open relay must not advertise it or Buzz-style clients
+        // gate onboarding on a membership list that is not enforced.
+        assert!(
+            !nips.contains(&43),
+            "an open relay must not advertise NIP-43"
+        );
+        cfg.relay.advertise_nip43 = true;
+        assert!(
+            cfg.effective_supported_nips(&access).contains(&43),
+            "advertise_nip43 must opt a role-managed relay in"
+        );
         // NIP-34 (git) is gated behind `enable_git` (default false).
         assert!(
             !nips.contains(&34),
@@ -4606,6 +4644,10 @@ max_log_files = 2
     #[test]
     fn validation_accepts_defaults() {
         assert!(Config::default().validate().is_ok());
+        assert!(
+            !Config::default().relay.enabled_buzz,
+            "the Buzz compatibility layer must be opt-in"
+        );
     }
 
     #[test]

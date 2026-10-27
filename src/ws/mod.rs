@@ -2302,6 +2302,22 @@ mod tests {
         ev
     }
 
+    fn signed_kind(seed: u8, kind: u64, tags: Vec<Vec<String>>, created: u64) -> Event {
+        let keypair = Keypair::from_secret_bytes([seed; 32]).unwrap();
+        let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+        let mut ev = Event {
+            id: String::new(),
+            pubkey,
+            created_at: created,
+            kind,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        };
+        sign(&mut ev, &keypair).unwrap();
+        ev
+    }
+
     fn signed_auth(challenge: &str, created: u64) -> Event {
         let keypair = Keypair::from_secret_bytes([2u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
@@ -2813,6 +2829,86 @@ mod tests {
     }
 
     #[test]
+    fn req_hides_system_channel_events_from_global_filters() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn_with(&"03".repeat(32)).await;
+            let now = unix_now();
+            let channel = "sys-channel";
+            let relay_pk = conn.relay.relay_pubkey.clone().expect("keyed relay");
+            let create = crate::event::Event {
+                id: "31".repeat(32),
+                pubkey: relay_pk.clone(),
+                created_at: now,
+                kind: crate::nips::nip29::CREATE_GROUP,
+                tags: vec![
+                    vec!["h".into(), channel.into()],
+                    vec!["visibility".into(), "open".into()],
+                    vec!["channel_type".into(), "system".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            {
+                let mut groups = conn.relay.groups.write().await;
+                groups.apply(&create, &relay_pk, now, false, false);
+                // Plain NIP-29 replay ignores Buzz's `channel_type` tag;
+                // this test directly builds the system-channel state.
+                if let Some(group) = groups.groups.get_mut(channel) {
+                    group.channel_type = "system".into();
+                }
+            }
+            let mut event = signed_note(
+                "system state",
+                now + 1,
+                vec![vec!["h".into(), channel.into()]],
+            );
+            event.kind = 9;
+            event.id = crate::nips::nip01::compute_id(&event);
+            conn.relay.db.put(event.clone(), now).await;
+            assert!(
+                conn.relay.groups.read().await.group(channel).is_some(),
+                "system test group must exist"
+            );
+            let groups = conn.relay.groups.read().await;
+            let named_filter: crate::filter::Filter =
+                serde_json::from_value(json!({"kinds":[9], "#h":[channel]})).unwrap();
+            assert!(
+                conn.visible_to_filters(Some(&groups), &event, &[named_filter]),
+                "named filter must see the system event"
+            );
+            drop(groups);
+
+            conn.handle_req(&[json!("global"), json!({"kinds": [9]})])
+                .await;
+            conn.pump_pending_reqs();
+            let global_ids: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["id"].as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                !global_ids.contains(&event.id),
+                "a system-channel event must not reach a global filter"
+            );
+
+            conn.handle_req(&[json!("named"), json!({"kinds": [9], "#h": [channel]})])
+                .await;
+            conn.pump_pending_reqs();
+            let named_ids: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["id"].as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                named_ids.contains(&event.id),
+                "the same event must reach a filter that names its channel"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn req_hides_protected_events_from_anonymous() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -3244,6 +3340,47 @@ mod tests {
                 count[2]["count"].as_u64(),
                 Some(1),
                 "NIP-78 events are not counted for anonymous"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn count_applies_p_gating_to_membership_notices() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let target = signed_note_seeded(4, "", now, vec![]).pubkey;
+            let other = signed_note_seeded(5, "", now, vec![]).pubkey;
+            for (seed, pubkey) in [(6u8, &target), (7u8, &other)] {
+                let notice = signed_kind(seed, 44100, vec![vec!["p".into(), pubkey.clone()]], now);
+                conn.relay.db.put(notice, now).await;
+            }
+            conn.handle_count(&[json!("c"), json!({"kinds": [44100]})])
+                .await;
+            let count = outgoing_json(&conn)
+                .into_iter()
+                .rfind(|m| m[0] == "COUNT")
+                .expect("a COUNT response is sent");
+            assert_eq!(
+                count[2]["count"].as_u64(),
+                Some(0),
+                "membership notices are not counted for anonymous readers"
+            );
+
+            // The addressed member sees exactly its own notice.
+            conn.authed_pubkeys.push(target.clone());
+            conn.handle_count(&[json!("c"), json!({"kinds": [44100]})])
+                .await;
+            let count = outgoing_json(&conn)
+                .into_iter()
+                .rfind(|m| m[0] == "COUNT")
+                .expect("a COUNT response is sent");
+            assert_eq!(
+                count[2]["count"].as_u64(),
+                Some(1),
+                "the addressed member must count its own notice"
             );
             conn.relay.db.shutdown();
         });

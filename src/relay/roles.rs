@@ -5,6 +5,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::event::Event;
+use crate::nips::nip01;
 use crate::nips::nip43::RoleStore;
 use crate::util::unix_now;
 
@@ -77,10 +78,23 @@ impl super::Relay {
         mutation: super::BufferedRoleMutation,
         mutate: impl FnOnce(&mut RoleStore) -> (R, bool),
     ) -> R {
+        // Claims are snapshot-only and may accompany the old assignments we
+        // are protecting after a keyless/empty rebuild; only a role or
+        // membership change makes it safe to overwrite that snapshot.
+        let clears_preserve = !matches!(
+            &mutation,
+            super::BufferedRoleMutation::CreateClaim { .. }
+                | super::BufferedRoleMutation::DeleteClaim { .. }
+        );
         let (result, changed) = {
             let mut roles = self.roles.write().await;
             mutate(&mut roles)
         };
+        if changed && clears_preserve {
+            // A real role/membership change supersedes the snapshot we
+            // protected after an empty/keyless rebuild; persistence is safe.
+            self.release_role_snapshot_preserve();
+        }
         // Capture while a rebuild is pending, not just while its scan runs:
         // the revoked window starts at marking (`dirty`, stored before the
         // store is revoked) and ends at worker exit (`running`), but the scan
@@ -96,6 +110,15 @@ impl super::Relay {
             }
         }
         result
+    }
+
+    /// Signs a query-time relay event (a NIP-CW window or thread overlay)
+    /// without storing it. Returns false when the relay has no signing key.
+    pub(crate) fn sign_relay_event(&self, event: &mut Event) -> bool {
+        let Some(keypair) = &self.key else {
+            return false;
+        };
+        nip01::sign(event, keypair).is_ok()
     }
 
     /// Whether the relay-signed role definition for `id` survives in the
@@ -137,6 +160,21 @@ impl super::Relay {
     /// newest state because the stamps reflect the order in which the state
     /// was applied, not the order in which the events are stored.
     pub(crate) async fn store_relay_event(&self, event: &mut Event) -> Result<bool, ()> {
+        // Buzz-only relay events are side effects of group membership
+        // changes. With the Buzz layer disabled, do not publish them: the
+        // group operation itself must still succeed, so report success
+        // without touching the database.
+        if !self.config.read().await.relay.enabled_buzz
+            && matches!(
+                event.kind,
+                crate::nips::nip29::SYSTEM_MESSAGE
+                    | crate::nips::nip29::MEMBER_ADDED
+                    | crate::nips::nip29::MEMBER_REMOVED
+                    | 30622
+            )
+        {
+            return Ok(true);
+        }
         super::store_relay_event_parts(
             &self.db,
             self.key,
@@ -175,8 +213,253 @@ impl super::Relay {
         self.store_role_event(&mut event).await.is_ok()
     }
 
+    /// The pubkeys a `restrict_relay` allowlist admits, as NIP-43 member
+    /// entries. An open relay has no enforced membership, so the list is
+    /// empty and NIP-43 is not advertised (see `effective_supported_nips`).
+    pub(crate) async fn allowlisted_members(&self) -> Vec<String> {
+        let access = self.access.read().await;
+        if !access.restrict_relay {
+            return Vec::new();
+        }
+        access
+            .allowed_pubkeys
+            .iter()
+            .map(|(pubkey, _)| pubkey.to_ascii_lowercase())
+            .collect()
+    }
+
+    /// The relay's administrator identities, published as NIP-43 `owner`
+    /// entries: the advertised NIP-11 `pubkey` (`relay.pubkey`) and the
+    /// NIP-86 admin (`rpc.admin_pubkey`). Buzz's community-members panel
+    /// reads roles from `kind:13534`, so without these the operator appears
+    /// absent or, worse, as a plain member. The relay's signing key
+    /// (`relay.private_key`, NIP-11 `self`) is deliberately not included:
+    /// it is the relay's event signer, not an administrator identity, and
+    /// listing it would put a key no one controls in the member roster.
+    /// Deduplicated and sorted for a deterministic event.
+    pub(crate) async fn relay_owner_members(&self) -> Vec<String> {
+        let cfg = self.config.read().await;
+        let mut owners: Vec<String> = [cfg.relay.pubkey.trim(), cfg.rpc.admin_pubkey.trim()]
+            .into_iter()
+            .filter(|pk| !pk.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        drop(cfg);
+        owners.sort();
+        owners.dedup();
+        owners
+    }
+
+    /// Publishes the empty NIP-IA archived-identities snapshot
+    /// (`kind:13535`). nostrfy has no archive store yet, but NIP-IA-aware
+    /// clients (Buzz) query this snapshot as their archive-state check; a
+    /// missing snapshot is reported as "archived identities could not be
+    /// checked". The event is replaceable, so a fresh empty snapshot on every
+    /// startup is harmless.
+    pub(crate) async fn publish_archive_snapshot(&self) -> bool {
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return false;
+        };
+        let now = self.stamp_floor(unix_now());
+        let archived = self.archive.read().await.clone();
+        let mut event = crate::nips::nip_ia::snapshot(&relay_pubkey, now, &archived);
+        self.store_relay_event(&mut event).await.is_ok()
+    }
+
+    /// Applies a NIP-IA archive/unarchive request. The request event is
+    /// stored by the caller after this succeeds. Supported policy paths are
+    /// self and relay-admin; the NIP-OA owner-of-agent path is not enabled.
+    pub(crate) async fn apply_identity_archive(
+        &self,
+        event: &crate::event::Event,
+    ) -> Result<(), String> {
+        if !matches!(event.kind, 9035 | 9036) {
+            return Err("invalid: not a NIP-IA request".into());
+        }
+        if event.created_at.abs_diff(unix_now()) > 120 {
+            return Err("restricted: archive request is outside the freshness window".into());
+        }
+        if event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() == 1 && tag[0] == "-")
+            .count()
+            != 1
+        {
+            return Err("invalid: archive request requires exactly one NIP-70 - tag".into());
+        }
+        let mut targets = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "p")
+            .map(|tag| tag[1].to_ascii_lowercase());
+        let Some(target) = targets.next() else {
+            return Err("invalid: archive request requires one p tag".into());
+        };
+        if targets.next().is_some()
+            || target.len() != 64
+            || !target.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid: archive request target must be one hex pubkey".into());
+        }
+        let replaced_by = event
+            .tags
+            .iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "replaced-by")
+            .map(|tag| tag[1].to_ascii_lowercase());
+        if let Some(replaced_by) = &replaced_by
+            && (replaced_by.len() != 64
+                || !replaced_by.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || replaced_by == &target)
+        {
+            return Err("invalid: replaced-by must be a different hex pubkey".into());
+        }
+        let reason = event
+            .tags
+            .iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "reason")
+            .map(|tag| tag[1].as_str());
+        let self_request = event.pubkey.eq_ignore_ascii_case(&target);
+        let admin = self.is_relay_owner_or_admin(&event.pubkey).await;
+        let mut owner = if !self_request && !admin {
+            crate::nips::nip_ia::verify_owner_agent_request(event, &target)
+        } else {
+            None
+        };
+        let mut proof_profile_id = None;
+        if !self_request && !admin && owner.is_none() {
+            // Published-profile attestation: use the target's latest kind:0.
+            let filter = crate::filter::Filter {
+                kinds: Some(vec![0]),
+                authors: Some(vec![target.clone()]),
+                limit: Some(1),
+                ..crate::filter::Filter::default()
+            };
+            let Some((profiles, _)) = self
+                .db
+                .query_full_startup(vec![filter], 1, unix_now(), false)
+                .await
+            else {
+                return Err("error: database unavailable".into());
+            };
+            if let Some(profile) = profiles
+                .iter()
+                .find(|profile| profile.pubkey.eq_ignore_ascii_case(&target))
+                && let Some(owner_pubkey) =
+                    crate::nips::nip_ia::verify_owner_agent_profile(profile, &target, &event.pubkey)
+            {
+                owner = Some(owner_pubkey);
+                proof_profile_id = profile.id_bytes().map(hex::encode);
+            }
+        }
+        if !self_request && !admin && owner.is_none() {
+            return Err(
+                "restricted: only the target, a relay admin or a proven agent owner may archive \
+                 this identity"
+                    .into(),
+            );
+        }
+        if event.kind == 9036
+            && self
+                .access
+                .read()
+                .await
+                .blocked_pubkeys
+                .iter()
+                .any(|(blocked, _)| blocked.eq_ignore_ascii_case(&target))
+        {
+            return Err("restricted: an access-control ban cannot be self-unarchived".into());
+        }
+        let archived = event.kind == 9035;
+        let consent = if self_request {
+            "self"
+        } else if admin {
+            "admin"
+        } else {
+            "owner"
+        };
+        let consent_pubkey = if self_request {
+            Some(target.as_str())
+        } else if admin {
+            Some(event.pubkey.as_str())
+        } else {
+            owner.as_deref()
+        };
+        let changed = {
+            let mut archive = self.archive.write().await;
+            if archived {
+                archive.insert(target.clone())
+            } else {
+                archive.remove(&target)
+            }
+        };
+        if !changed {
+            return Ok(());
+        }
+        let data = {
+            let archive = self.archive.read().await;
+            serde_json::to_vec(&*archive).map_err(|error| format!("error: {error}"))?
+        };
+        if !self.db.save_identity_archive(data).await {
+            // Roll back so an ACKed request cannot disappear on restart.
+            let mut archive = self.archive.write().await;
+            if archived {
+                archive.remove(&target);
+            } else {
+                archive.insert(target.clone());
+            }
+            return Err("error: could not persist the archive state".into());
+        }
+        let now = self.stamp_floor(unix_now());
+        let Some(relay_pubkey) = self.relay_pubkey() else {
+            return Err("error: relay has no signing key".into());
+        };
+        let mut delta = crate::nips::nip_ia::delta(
+            &relay_pubkey,
+            now,
+            &target,
+            archived,
+            consent,
+            consent_pubkey,
+            &event.id,
+            reason,
+            replaced_by.as_deref(),
+            &event.content,
+        );
+        if let Some(profile_id) = proof_profile_id {
+            delta.tags.push(vec![
+                "e".into(),
+                profile_id,
+                String::new(),
+                "proof".into(),
+                target.clone(),
+            ]);
+        }
+        if self.store_relay_event(&mut delta).await.is_err()
+            || !self.publish_archive_snapshot().await
+        {
+            // Keep the durable set and the published snapshot in step: the
+            // request is not ACKed, so a retry must be able to make progress
+            // instead of finding an already-applied but unpublished state.
+            let mut archive = self.archive.write().await;
+            if archived {
+                archive.remove(&target);
+            } else {
+                archive.insert(target.clone());
+            }
+            if let Ok(data) = serde_json::to_vec(&*archive) {
+                let _ = self.db.save_identity_archive(data).await;
+            }
+            return Err("error: could not publish the archive state".into());
+        }
+        Ok(())
+    }
+
     /// Publishes the current membership list and an add/remove user event.
     pub(crate) async fn publish_membership(&self, change: Option<(bool, String)>) -> bool {
+        if !self.config.read().await.nip_enabled(43) {
+            return false;
+        }
         let Some(relay_pubkey) = self.relay_pubkey() else {
             return false;
         };
@@ -187,6 +470,31 @@ impl super::Relay {
             Some((add, pubkey)) => (add, Some(pubkey)),
             None => (false, None),
         };
+        // The allowlist is part of the relay's closed-community roster; read
+        // it (and the relay's own owner identities) before the role lock so
+        // the guards are never nested.
+        let extra_members = self.allowlisted_members().await;
+        let owners = self.relay_owner_members().await;
+        // Synthetic roster entries bypass `RoleStore::rebuild`'s vanish
+        // filter because they have no event behind them. Filter them here;
+        // an unavailable vanish lookup fails closed instead of republishing
+        // an erased identity.
+        let mut filtered_extra = Vec::with_capacity(extra_members.len());
+        for pubkey in extra_members {
+            match self.db.is_vanished(&pubkey).await {
+                Some(false) => filtered_extra.push(pubkey),
+                Some(true) => {}
+                None => return false,
+            }
+        }
+        let mut filtered_owners = Vec::with_capacity(owners.len());
+        for pubkey in owners {
+            match self.db.is_vanished(&pubkey).await {
+                Some(false) => filtered_owners.push(pubkey),
+                Some(true) => {}
+                None => return false,
+            }
+        }
         let events = {
             let roles = self.roles.read().await;
             // The caller re-read the rebuild flags before calling, but a
@@ -196,10 +504,13 @@ impl super::Relay {
             // is safe and the RPC reports failure.
             if self.roles_rebuild.dirty.load(Ordering::SeqCst)
                 || self.roles_rebuild.running.load(Ordering::SeqCst)
+                || self.roles_rebuild.removal_committed.load(Ordering::SeqCst)
+                || self.roles_rebuild.derived.in_flight()
             {
                 return false;
             }
-            let mut events = vec![roles.membership_event(&relay_pubkey, now)];
+            let mut events =
+                vec![roles.membership_event(&relay_pubkey, now, &filtered_extra, &filtered_owners)];
             if let Some(pubkey) = pubkey {
                 events.push(if add {
                     roles.add_user_event(&pubkey, &relay_pubkey, now)
@@ -209,9 +520,20 @@ impl super::Relay {
             }
             events
         };
+        let ids: Vec<[u8; 32]> = events.iter().filter_map(Event::id_bytes).collect();
         let mut all_stored = true;
         for event in events {
             all_stored &= self.publish_relay_event(event).await;
+        }
+        if all_stored
+            && (self.roles_rebuild.removal_committed.load(Ordering::SeqCst)
+                || self.roles_rebuild.derived.in_flight())
+        {
+            // A removal committed between the pre-check and the write. The
+            // new full list may predate the removal and would be the newest
+            // event the rebuild reads, resurrecting the removed grant.
+            let _ = self.db.remove_events_by_id(&ids).await;
+            return false;
         }
         all_stored
     }
@@ -424,6 +746,131 @@ impl super::Relay {
         } else {
             RoleChange::Failed
         }
+    }
+
+    /// Applies a Buzz/NIP-43 relay member admin command (`9030` add,
+    /// `9031` remove, `9032` change role). The command event itself is
+    /// stored by the caller; this method only mutates the authoritative
+    /// role store and republishes the roster.
+    pub(crate) async fn apply_relay_member_command(
+        &self,
+        event: &crate::event::Event,
+    ) -> Result<(), String> {
+        if !self.config.read().await.nip_enabled(43) {
+            return Err("restricted: NIP-43 is disabled".into());
+        }
+        if !self.is_relay_owner_or_admin(&event.pubkey).await {
+            return Err("restricted: only the relay owner or an admin may manage members".into());
+        }
+        let kind = event.kind;
+        if !matches!(kind, 9030..=9032) {
+            return Err("invalid: not a relay member command".into());
+        }
+        let target = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "p")
+            .map(|tag| tag[1].to_ascii_lowercase())
+            .find(|target| target.len() == 64 && target.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| "invalid: member command needs one hex p tag".to_string())?;
+        let role = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "role")
+            .map(|tag| tag[1].as_str())
+            .next();
+        if let Some(role) = role
+            && !matches!(role, "member" | "admin")
+        {
+            return Err("invalid: role must be member or admin".into());
+        }
+        if kind == 9032 && role.is_none() {
+            return Err("invalid: 9032 requires a role tag".into());
+        }
+        if kind == 9031
+            && self
+                .relay_owner_members()
+                .await
+                .iter()
+                .any(|owner| owner.eq_ignore_ascii_case(&target))
+        {
+            return Err("restricted: cannot remove a configured relay owner".into());
+        }
+        let buffer = self.roles_rebuild.buffer.lock().await;
+        if self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst)
+            || self.roles_rebuild.marking.load(Ordering::SeqCst)
+        {
+            return Err("error: role state is rebuilding; retry the command".into());
+        }
+        let mut definition_changed = false;
+        let changed = {
+            let mut roles = self.roles.write().await;
+            match kind {
+                9030 => {
+                    let desired = role.unwrap_or("member");
+                    if desired == "admin" && !roles.roles.contains_key("admin") {
+                        roles.create("admin", "admin", "", "", None);
+                        definition_changed = true;
+                    }
+                    let next = if desired == "admin" {
+                        vec!["admin".to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    let changed = roles.assignments.get(&target) != Some(&next);
+                    roles.assignments.insert(target.clone(), next);
+                    changed
+                }
+                9032 => {
+                    let desired = role.ok_or_else(|| "invalid: role is required".to_string())?;
+                    if desired == "admin" && !roles.roles.contains_key("admin") {
+                        roles.create("admin", "admin", "", "", None);
+                        definition_changed = true;
+                    }
+                    let next = if desired == "admin" {
+                        vec!["admin".to_string()]
+                    } else {
+                        Vec::new()
+                    };
+                    let changed = roles.assignments.get(&target) != Some(&next);
+                    roles.assignments.insert(target.clone(), next);
+                    changed
+                }
+                _ => {
+                    if let Some(required) = role {
+                        let current = roles.assignments.get(&target);
+                        let matches = match required {
+                            "member" => current.is_some_and(Vec::is_empty),
+                            "admin" => {
+                                current.is_some_and(|roles| roles.iter().any(|r| r == "admin"))
+                            }
+                            _ => false,
+                        };
+                        if !matches {
+                            return Err(
+                                "restricted: member does not have the requested role".into()
+                            );
+                        }
+                    }
+                    roles.remove_pubkey(&target)
+                }
+            }
+        };
+        let changed = changed || definition_changed;
+        if !changed {
+            return Ok(());
+        }
+        self.release_role_snapshot_preserve();
+        self.schedule_roles_persist();
+        if !self.publish_role_state().await {
+            return Err("error: could not publish the NIP-43 roster".into());
+        }
+        if !self.persist_roles().await {
+            return Err("error: could not persist the NIP-43 role state".into());
+        }
+        drop(buffer);
+        Ok(())
     }
 
     pub async fn assign_role(&self, pubkey: &str, role: &str) -> RoleChange {
@@ -681,7 +1128,7 @@ impl super::Relay {
             }
             super::PersistOutcome::Deferred => {
                 self.schedule_roles_persist();
-                Ok(())
+                Err(ClaimRejection::NotDurable)
             }
             super::PersistOutcome::Committed => Ok(()),
         }
@@ -938,7 +1385,7 @@ impl super::Relay {
     /// Publishes only the remove-user event for a departure applied while
     /// the live store is revoked (see [`Self::apply_leave_request`]): the
     /// full member list cannot be published from the empty store.
-    async fn publish_remove_user(&self, pubkey: &str) -> bool {
+    pub(crate) async fn publish_remove_user(&self, pubkey: &str) -> bool {
         let Some(relay_pubkey) = self.relay_pubkey() else {
             return false;
         };

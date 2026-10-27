@@ -3846,6 +3846,98 @@ fn access_load_distinguishes_missing_loaded_and_failed() {
 }
 
 #[test]
+fn role_rebuild_journal_round_trips_additively() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cfg = config();
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .expect("database must open");
+        let data = br#"[{"RemovePubkey":{"pubkey":"aa"}}]"#.to_vec();
+        assert!(db.save_role_rebuild_pending(data.clone()).await);
+        assert_eq!(
+            db.load_role_rebuild_pending().await,
+            Some(Some(data)),
+            "the journal must survive a writer round-trip"
+        );
+        assert!(db.clear_role_rebuild_pending().await);
+        assert_eq!(db.load_role_rebuild_pending().await, Some(None));
+        db.shutdown();
+    });
+}
+
+#[test]
+fn event_arrival_sequence_round_trips() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cfg = config();
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .expect("database must open");
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+        let first_seq = db
+            .assign_event_arrival(first)
+            .await
+            .expect("first sequence");
+        let second_seq = db
+            .assign_event_arrival(second)
+            .await
+            .expect("second sequence");
+        assert!(second_seq > first_seq);
+        let arrivals = db
+            .event_arrivals(vec![first.to_vec(), second.to_vec()])
+            .await
+            .expect("arrival read");
+        assert_eq!(arrivals.get(&hex::encode(first)), Some(&first_seq));
+        assert_eq!(arrivals.get(&hex::encode(second)), Some(&second_seq));
+        db.shutdown();
+    });
+}
+
+#[test]
+fn group_epoch_index_round_trips_additively() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cfg = config();
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .expect("database must open");
+        let id = [7u8; 32];
+        let create_id = "ab".repeat(32);
+        assert!(db.record_group_epoch(id, &create_id).await);
+        let map = db
+            .group_epochs_startup(vec![id.to_vec(), [8u8; 32].to_vec()])
+            .await
+            .expect("epoch lookup must answer");
+        assert_eq!(map.get(&hex::encode(id)), Some(&create_id));
+        assert_eq!(map.len(), 1);
+        db.shutdown();
+    });
+}
+
+#[test]
 fn schema_upgrade_creates_missing_tables_instantly() {
     // Simulates an ancient database that only has the `events` table (all
     // other tables were added by later versions). Opening it must create
@@ -6973,6 +7065,110 @@ fn group_and_role_snapshots_survive_restart() {
         assert!(
             restored_roles.is_member_of(crate::nips::nip29::tests::USER),
             "roles must restore"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
+fn group_snapshot_writes_a_dm_backup() {
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8)
+        .expect("database must open");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
+        let mut regular = crate::nips::nip29::Group::default();
+        regular
+            .members
+            .insert("aa".repeat(32), std::collections::HashSet::new());
+        snapshot.groups.insert("g1".into(), regular);
+        let mut dm = crate::nips::nip29::Group {
+            channel_type: "dm".into(),
+            ..crate::nips::nip29::Group::default()
+        };
+        dm.members
+            .insert("bb".repeat(32), std::collections::HashSet::new());
+        snapshot.groups.insert("dm1".into(), dm);
+        snapshot.stamp = 41;
+        snapshot.seq = 7;
+        assert!(db.save_groups(snapshot).await);
+        let backup = db
+            .load_dm_backup()
+            .await
+            .expect("backup read must answer")
+            .expect("a backup must exist");
+        assert!(backup.groups.contains_key("dm1"));
+        assert!(!backup.groups.contains_key("g1"));
+        assert_eq!(backup.stamp, 41);
+        assert_eq!(backup.seq, 7);
+        assert!(db.clear_groups_snapshot().await);
+        assert!(
+            db.load_dm_backup()
+                .await
+                .expect("backup read must answer")
+                .is_none(),
+            "a fail-closed snapshot clear must clear the DM backup too"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
+fn group_snapshot_writes_a_buzz_backup() {
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8)
+        .expect("database must open");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
+        let mut plain = crate::nips::nip29::Group::default();
+        plain
+            .members
+            .insert("aa".repeat(32), std::collections::HashSet::new());
+        snapshot.groups.insert("plain".into(), plain);
+        let mut buzz = crate::nips::nip29::Group {
+            buzz_metadata: true,
+            creator_role_explicit: true,
+            create_id: Some("cc".repeat(32)),
+            ..crate::nips::nip29::Group::default()
+        };
+        buzz.members.insert(
+            "bb".repeat(32),
+            std::iter::once("owner".to_string()).collect(),
+        );
+        buzz.members.insert(
+            "cc".repeat(32),
+            std::iter::once("guest".to_string()).collect(),
+        );
+        buzz.guests.insert("cc".repeat(32));
+        buzz.bots.insert("dd".repeat(32));
+        snapshot.groups.insert("buzz".into(), buzz);
+        snapshot.stamp = 51;
+        snapshot.seq = 9;
+        assert!(db.save_groups(snapshot).await);
+        let backup = db
+            .load_buzz_backup()
+            .await
+            .expect("Buzz backup read must answer")
+            .expect("a Buzz backup must exist");
+        assert_eq!(backup.stamp, 51);
+        assert_eq!(backup.seq, 9);
+        assert!(backup.groups.contains_key("buzz"));
+        assert!(!backup.groups.contains_key("plain"));
+        let entry = &backup.groups["buzz"];
+        assert!(entry.buzz_metadata);
+        assert!(entry.guests.contains("cc".repeat(32).as_str()));
+        assert!(entry.bots.contains("dd".repeat(32).as_str()));
+        assert!(
+            entry.roles["bb".repeat(32).as_str()].contains("owner"),
+            "separate role grants must be carried"
+        );
+        assert!(db.clear_groups_snapshot().await);
+        assert!(
+            db.load_buzz_backup()
+                .await
+                .expect("Buzz backup read must answer")
+                .is_none(),
+            "a fail-closed snapshot clear must clear the Buzz backup too"
         );
         db.shutdown();
     });

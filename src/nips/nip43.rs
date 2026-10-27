@@ -101,6 +101,15 @@ pub(crate) struct RolesSnapshot {
 }
 
 impl RoleStore {
+    /// Whether the store holds event-derived role state: a role definition
+    /// or an assignment that names at least one role. Role-empty entries can
+    /// be claim-admitted members or synthetic owner/allowlist roster rows;
+    /// they must not make an otherwise empty rebuild look authoritative over
+    /// a former-key snapshot.
+    pub fn has_role_state(&self) -> bool {
+        !self.roles.is_empty() || self.assignments.values().any(|roles| !roles.is_empty())
+    }
+
     /// Whether `pubkey` holds at least one role assignment.
     pub fn is_member_of(&self, pubkey: &str) -> bool {
         // Membership is presence on the member list: a claim-admitted
@@ -328,9 +337,23 @@ impl RoleStore {
     }
 
     /// `kind:13534` membership list: every assigned pubkey with its roles.
-    pub fn membership_event(&self, relay_pubkey: &str, now: u64) -> Event {
+    ///
+    /// `extra_members` lets a relay that enforces an allowlist include those
+    /// pubkeys as plain `member` entries, so NIP-43-aware clients (Buzz)
+    /// see the same closed community the write gate enforces. `owners` are
+    /// the relay's own administrator identities (NIP-11 `pubkey` and the
+    /// NIP-86 admin); they always carry the `owner` role, which is what Buzz's
+    /// community-members panel reads. Owner entries win over an assigned
+    /// role so a stale assignment cannot demote the relay operator.
+    pub fn membership_event(
+        &self,
+        relay_pubkey: &str,
+        now: u64,
+        extra_members: &[String],
+        owners: &[String],
+    ) -> Event {
         let mut event = Self::base(MEMBERSHIP_LIST, relay_pubkey, now);
-        let mut members: Vec<(String, Vec<String>)> = self
+        let mut members: std::collections::BTreeMap<String, Vec<String>> = self
             .assignments
             .iter()
             .map(|(pk, roles)| {
@@ -339,7 +362,12 @@ impl RoleStore {
                 (pk.clone(), roles)
             })
             .collect();
-        members.sort();
+        for pubkey in extra_members {
+            members.entry(pubkey.clone()).or_default();
+        }
+        for pubkey in owners {
+            members.insert(pubkey.clone(), vec!["owner".to_string()]);
+        }
         for (pubkey, roles) in members {
             let mut tag = vec!["member".to_string(), pubkey];
             tag.extend(roles);
@@ -793,13 +821,30 @@ mod tests {
         assert!(role.tags.contains(&vec!["label".into(), "king".into()]));
         assert!(role.tags.contains(&vec!["order".into(), "1".into()]));
 
-        let members = store.membership_event("relaypub", now);
+        let allowlisted = "dd".repeat(32);
+        let owner = "ee".repeat(32);
+        let members = store.membership_event(
+            "relaypub",
+            now,
+            std::slice::from_ref(&allowlisted),
+            std::slice::from_ref(&owner),
+        );
         assert_eq!(members.kind, MEMBERSHIP_LIST);
         assert_eq!(members.tags[0], vec!["-"]);
         assert!(
             members
                 .tags
                 .contains(&vec!["member".into(), "c308e1f8".into(), "king".into()])
+        );
+        assert!(
+            members.tags.contains(&vec!["member".into(), allowlisted]),
+            "an allowlisted pubkey must appear in the NIP-43 roster"
+        );
+        assert!(
+            members
+                .tags
+                .contains(&vec!["member".into(), owner, "owner".into()]),
+            "the relay owner must carry the owner role"
         );
 
         let add = store.add_user_event("c308e1f8", "relaypub", now);

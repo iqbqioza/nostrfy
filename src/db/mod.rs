@@ -474,6 +474,71 @@ enum Msg {
         now: u64,
         reply: oneshot::Sender<Option<(NegItems, bool)>>,
     },
+    /// Persist the group create-id epoch seen when a NIP-29 state event was
+    /// accepted. Additive hardening index; old databases have no entries.
+    RecordGroupEpoch {
+        event_id: Vec<u8>,
+        create_id: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Batch lookup of accepted group-event epochs for a rebuild page.
+    GroupEpochs {
+        event_ids: Vec<Vec<u8>>,
+        reply: oneshot::Sender<Option<std::collections::HashMap<String, String>>>,
+    },
+    /// Look up the retained metadata of a deleted NIP-CW thread root.
+    ThreadRootTombstone {
+        event_id: Vec<u8>,
+        reply: oneshot::Sender<Option<Option<(u64, String)>>>,
+    },
+    /// Batch epoch mapping write for the one-time startup backfill.
+    RecordGroupEpochsBatch {
+        entries: Vec<(Vec<u8>, String)>,
+        reply: oneshot::Sender<bool>,
+    },
+    GroupEpochsBackfilled {
+        reply: oneshot::Sender<Option<bool>>,
+    },
+    MarkGroupEpochsBackfilled {
+        reply: oneshot::Sender<bool>,
+    },
+    SaveDmCarry {
+        data: Vec<u8>,
+        reply: oneshot::Sender<bool>,
+    },
+    LoadDmCarry {
+        reply: oneshot::Sender<Option<Option<Vec<u8>>>>,
+    },
+    ClearDmCarry {
+        reply: oneshot::Sender<bool>,
+    },
+    AssignArrival {
+        event_id: Vec<u8>,
+        reply: oneshot::Sender<Option<u64>>,
+    },
+    EventArrivals {
+        event_ids: Vec<Vec<u8>>,
+        reply: oneshot::Sender<Option<std::collections::HashMap<String, u64>>>,
+    },
+    /// Persist the NIP-IA archived-identities set.
+    SaveIdentityArchive {
+        data: Vec<u8>,
+        reply: oneshot::Sender<bool>,
+    },
+    LoadIdentityArchive {
+        reply: oneshot::Sender<Option<Option<Vec<u8>>>>,
+    },
+    /// Persist the bounded role-rebuild mutation journal across shutdown.
+    SaveRoleRebuildPending {
+        data: Vec<u8>,
+        reply: oneshot::Sender<bool>,
+    },
+    LoadRoleRebuildPending {
+        reply: oneshot::Sender<Option<Option<Vec<u8>>>>,
+    },
+    ClearRoleRebuildPending {
+        reply: oneshot::Sender<bool>,
+    },
     Delete {
         targets: Vec<String>,
         addresses: Vec<nip09::Address>,
@@ -528,6 +593,14 @@ enum Msg {
         /// removed state event requires the derived state to be rebuilt,
         /// and only for the families it actually belonged to.
         reply: oneshot::Sender<Option<(usize, store::StateRemoved)>>,
+    },
+    /// NIP-62: record the pending marker without running the removal walk.
+    /// Migration uses this to make the request block later events in the
+    /// same export before the deferred removal pass.
+    RecordPendingVanish {
+        pubkey: Vec<u8>,
+        until_created: u64,
+        reply: oneshot::Sender<bool>,
     },
     /// NIP-59: delete gift wraps addressed to a pubkey (on NIP-09 deletion).
     GiftWrapPurge {
@@ -660,6 +733,17 @@ enum Msg {
     /// Loads the persisted NIP-29 group state snapshot.
     LoadGroups {
         reply: oneshot::Sender<LoadGroupsOutcome>,
+    },
+    /// Loads the same-transaction DM backup written with the group
+    /// snapshot. `None` from the client means the read failed; an inner
+    /// `None` means no backup exists.
+    LoadDmBackup {
+        reply: oneshot::Sender<Option<Option<crate::nips::nip29::GroupsSnapshot>>>,
+    },
+    /// Loads the same-transaction Buzz-specific backup. `None` from the
+    /// client means the read failed; an inner `None` means no backup exists.
+    LoadBuzzBackup {
+        reply: oneshot::Sender<Option<Option<crate::nips::nip29::BuzzBackup>>>,
     },
     /// Drops the persisted NIP-29 group state snapshot (a post-vanish
     /// rebuild failure must not leave a stale snapshot behind). The reply
@@ -1026,7 +1110,23 @@ fn msg_bytes(msg: &Msg) -> usize {
             .map(|(pubkey, reason)| pubkey.len() + reason.len())
             .sum(),
         Msg::SaveBlossomAllow { entries, .. } => entries.iter().map(String::len).sum(),
-        Msg::Vanish { pubkey, .. } | Msg::GiftWrapPurge { pubkey, .. } => pubkey.len(),
+        Msg::RecordGroupEpoch {
+            event_id,
+            create_id,
+            ..
+        } => event_id.len() + create_id.len(),
+        Msg::GroupEpochs { event_ids, .. } => event_ids.iter().map(Vec::len).sum(),
+        Msg::RecordGroupEpochsBatch { entries, .. } => entries
+            .iter()
+            .map(|(id, value)| id.len() + value.len())
+            .sum(),
+        Msg::ThreadRootTombstone { event_id, .. } => event_id.len(),
+        Msg::SaveRoleRebuildPending { data, .. }
+        | Msg::SaveIdentityArchive { data, .. }
+        | Msg::SaveDmCarry { data, .. } => data.len(),
+        Msg::Vanish { pubkey, .. }
+        | Msg::RecordPendingVanish { pubkey, .. }
+        | Msg::GiftWrapPurge { pubkey, .. } => pubkey.len(),
         _ => 0,
     }
 }
@@ -2119,6 +2219,122 @@ impl DbClient {
             .await
     }
 
+    /// Persist the create-id epoch for an accepted group state event.
+    pub async fn record_group_epoch(&self, event_id: [u8; 32], create_id: &str) -> bool {
+        self.request_write_checked(|reply| Msg::RecordGroupEpoch {
+            event_id: event_id.to_vec(),
+            create_id: create_id.to_string(),
+            reply,
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Batch lookup for a startup/rebuild page. `None` means the reader
+    /// could not answer (the caller must fail closed rather than rebuild
+    /// without the epoch index).
+    pub async fn group_epochs_startup(
+        &self,
+        event_ids: Vec<Vec<u8>>,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        self.request_read_startup(|reply| Msg::GroupEpochs { event_ids, reply })
+            .await
+            .flatten()
+    }
+
+    pub async fn thread_root_tombstone(&self, event_id: [u8; 32]) -> Option<Option<(u64, String)>> {
+        self.request_read_result(|reply| Msg::ThreadRootTombstone {
+            event_id: event_id.to_vec(),
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
+    pub async fn assign_event_arrival(&self, event_id: [u8; 32]) -> Option<u64> {
+        self.request_write_checked(|reply| Msg::AssignArrival {
+            event_id: event_id.to_vec(),
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
+    pub async fn event_arrivals(
+        &self,
+        event_ids: Vec<Vec<u8>>,
+    ) -> Option<std::collections::HashMap<String, u64>> {
+        self.request_read_startup(|reply| Msg::EventArrivals { event_ids, reply })
+            .await
+            .flatten()
+    }
+
+    pub async fn record_group_epochs_batch(&self, entries: Vec<(Vec<u8>, String)>) -> bool {
+        self.request_write_checked(|reply| Msg::RecordGroupEpochsBatch { entries, reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn group_epochs_backfilled(&self) -> Option<bool> {
+        self.request_read_startup(|reply| Msg::GroupEpochsBackfilled { reply })
+            .await
+            .flatten()
+    }
+
+    pub async fn mark_group_epochs_backfilled(&self) -> bool {
+        self.request_write_checked(|reply| Msg::MarkGroupEpochsBackfilled { reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn save_dm_carry(&self, data: Vec<u8>) -> bool {
+        self.request_write_checked(|reply| Msg::SaveDmCarry { data, reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn load_dm_carry(&self) -> Option<Option<Vec<u8>>> {
+        self.request_read_startup(|reply| Msg::LoadDmCarry { reply })
+            .await
+            .flatten()
+    }
+
+    pub async fn clear_dm_carry(&self) -> bool {
+        self.request_write_checked(|reply| Msg::ClearDmCarry { reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn save_identity_archive(&self, data: Vec<u8>) -> bool {
+        self.request_write_checked(|reply| Msg::SaveIdentityArchive { data, reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn load_identity_archive(&self) -> Option<Option<Vec<u8>>> {
+        self.request_read_startup(|reply| Msg::LoadIdentityArchive { reply })
+            .await
+            .flatten()
+    }
+
+    pub async fn save_role_rebuild_pending(&self, data: Vec<u8>) -> bool {
+        self.request_write_checked(|reply| Msg::SaveRoleRebuildPending { data, reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn load_role_rebuild_pending(&self) -> Option<Option<Vec<u8>>> {
+        self.request_read_startup(|reply| Msg::LoadRoleRebuildPending { reply })
+            .await
+            .flatten()
+    }
+
+    pub async fn clear_role_rebuild_pending(&self) -> bool {
+        self.request_write_checked(|reply| Msg::ClearRoleRebuildPending { reply })
+            .await
+            .unwrap_or(false)
+    }
+
     /// Generic REST-API reader request with the API queue cap and timeout.
     /// Admission uses [`Self::api_reserve`] (add-then-check with rollback).
     async fn api_request<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
@@ -2362,6 +2578,19 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// Records the NIP-62 in-progress marker without walking the stored
+    /// history. Used by migration so a request blocks later rows in the
+    /// export before the deferred removal pass completes the vanish.
+    pub async fn record_pending_vanish(&self, pubkey: [u8; 32], until_created: u64) -> bool {
+        self.request_write_checked(|reply| Msg::RecordPendingVanish {
+            pubkey: pubkey.to_vec(),
+            until_created,
+            reply,
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// NIP-59: deletes `kind:1059` gift wraps p-tagging `pubkey`.
@@ -2772,6 +3001,22 @@ impl DbClient {
     /// conflated with a first-run [`LoadGroupsOutcome::Missing`].
     pub async fn load_groups(&self) -> LoadGroupsOutcome {
         self.request_read_blocking(|reply| Msg::LoadGroups { reply })
+            .await
+    }
+
+    /// Loads the DM backup written atomically with the last group snapshot.
+    /// The outer `Option` reports a failed read; the inner one reports that
+    /// no backup was ever written (or it was cleared with the snapshot).
+    pub async fn load_dm_backup(&self) -> Option<Option<crate::nips::nip29::GroupsSnapshot>> {
+        self.request_read_blocking(|reply| Msg::LoadDmBackup { reply })
+            .await
+    }
+
+    /// Loads the Buzz-specific backup written atomically with the last
+    /// group snapshot. The outer `Option` reports a failed read; the inner
+    /// one reports that no backup was ever written (or it was cleared).
+    pub async fn load_buzz_backup(&self) -> Option<Option<crate::nips::nip29::BuzzBackup>> {
+        self.request_read_blocking(|reply| Msg::LoadBuzzBackup { reply })
             .await
     }
 

@@ -1291,8 +1291,35 @@ impl Store {
     pub(crate) fn save_groups(&self, snap: &crate::nips::nip29::GroupsSnapshot) -> Result<()> {
         self.disk_full_error()?;
         let data = serde_json::to_vec(snap)?;
+        // Keep a same-transaction backup of DM groups. DMs have no stored
+        // 9007/9000, so a lost main snapshot would otherwise rebuild every
+        // other group and permanently lose the DM channels. The backup is
+        // only consulted after the main snapshot is missing and its
+        // stamp/sequence still match the database generation.
+        let dm_snapshot = crate::nips::nip29::GroupsSnapshot {
+            groups: snap
+                .groups
+                .iter()
+                .filter(|(_, group)| group.channel_type == "dm")
+                .map(|(gid, group)| (gid.clone(), group.clone()))
+                .collect(),
+            deleted: std::collections::HashSet::new(),
+            ghost: std::collections::HashSet::new(),
+            stamp: snap.stamp,
+            seq: snap.seq,
+            buzz_enabled: snap.buzz_enabled,
+        };
+        let dm_data = serde_json::to_vec(&dm_snapshot)?;
+        // Buzz provenance, guest/bot tiers and separate role grants are
+        // snapshot-only for plain-mode replay. Stamp the additive copy with
+        // the same generation so a later rebuild only applies it when no
+        // intervening state removal/event can make it stale.
+        let buzz_data = serde_json::to_vec(&crate::nips::nip29::BuzzBackup::from_snapshot(snap))?;
         let mut wtxn = self.env.write_txn()?;
         self.groups.put(&mut wtxn, b"groups:snapshot", &data)?;
+        self.groups.put(&mut wtxn, b"groups:dm_backup", &dm_data)?;
+        self.groups
+            .put(&mut wtxn, b"groups:buzz_backup", &buzz_data)?;
         self.commit(wtxn)?;
         Ok(())
     }
@@ -1304,6 +1331,11 @@ impl Store {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         self.groups.delete(&mut wtxn, b"groups:snapshot")?;
+        // The backup mirrors the snapshot's generation. A fail-closed
+        // clear means the live state is stale, so the backup must not be
+        // eligible for a later merge either.
+        self.groups.delete(&mut wtxn, b"groups:dm_backup")?;
+        self.groups.delete(&mut wtxn, b"groups:buzz_backup")?;
         self.commit(wtxn)?;
         Ok(())
     }
@@ -1314,6 +1346,27 @@ impl Store {
     pub(crate) fn load_groups(&self) -> Result<Option<crate::nips::nip29::GroupsSnapshot>> {
         let rtxn = self.env.read_txn()?;
         let Some(raw) = self.groups.get(&rtxn, b"groups:snapshot")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(raw)?))
+    }
+
+    /// Loads the same-transaction DM backup written by [`Self::save_groups`].
+    /// `None` means no backup exists (a pre-backup database or a cleared
+    /// snapshot); the caller must not infer a missing snapshot from it.
+    pub(crate) fn load_dm_backup(&self) -> Result<Option<crate::nips::nip29::GroupsSnapshot>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.groups.get(&rtxn, b"groups:dm_backup")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(raw)?))
+    }
+
+    /// Loads the same-transaction Buzz-specific backup written by
+    /// [`Self::save_groups`]. `None` means no backup exists.
+    pub(crate) fn load_buzz_backup(&self) -> Result<Option<crate::nips::nip29::BuzzBackup>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.groups.get(&rtxn, b"groups:buzz_backup")? else {
             return Ok(None);
         };
         Ok(Some(serde_json::from_slice(raw)?))
@@ -2893,6 +2946,260 @@ impl Store {
         Ok((self.vanish.len(&rtxn)?, self.vanish_pending.len(&rtxn)?))
     }
 
+    fn thread_root_key(id: &[u8]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(13 + id.len());
+        key.extend_from_slice(b"thread_root:");
+        key.extend_from_slice(id);
+        key
+    }
+
+    /// Retains the minimal wire metadata of a deleted NIP-CW thread root:
+    /// `kind || gid length || gid`. The event body is gone, but thread mode
+    /// can still serve retained replies for the tombstone.
+    fn remember_thread_root_tombstone(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        event: &Event,
+        id: &[u8],
+    ) -> Result<()> {
+        if !matches!(event.kind, 9 | 40002 | 45001 | 45003) {
+            return Ok(());
+        }
+        let Some(gid) = event
+            .tags
+            .iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "h")
+            .map(|tag| tag[1].as_str())
+            .filter(|gid| !gid.is_empty())
+        else {
+            return Ok(());
+        };
+        let mut value = Vec::with_capacity(12 + gid.len());
+        value.extend_from_slice(&event.kind.to_be_bytes());
+        value.extend_from_slice(&(gid.len() as u32).to_be_bytes());
+        value.extend_from_slice(gid.as_bytes());
+        self.index_meta
+            .put(wtxn, &Self::thread_root_key(id), &value)?;
+        Ok(())
+    }
+
+    pub(crate) fn thread_root_tombstone(&self, id: &[u8]) -> Result<Option<(u64, String)>> {
+        if id.len() != ID_LEN {
+            return Ok(None);
+        }
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.index_meta.get(&rtxn, &Self::thread_root_key(id))? else {
+            return Ok(None);
+        };
+        if raw.len() < 12 {
+            return Ok(None);
+        }
+        let kind = u64::from_be_bytes(raw[..8].try_into().expect("checked length"));
+        let gid_len = u32::from_be_bytes(raw[8..12].try_into().expect("checked length")) as usize;
+        if raw.len() != 12 + gid_len {
+            return Ok(None);
+        }
+        let gid = std::str::from_utf8(&raw[12..])
+            .map_err(|_| anyhow::anyhow!("corrupt thread-root tombstone"))?
+            .to_string();
+        Ok(Some((kind, gid)))
+    }
+
+    /// Records the create-id epoch that an accepted NIP-29 state event was
+    /// validated against. This is a read-time hardening index; failures are
+    /// reported to the caller so the relay can log the reduced protection.
+    pub(crate) fn record_group_epoch(&self, event_id: &[u8], create_id: &str) -> Result<()> {
+        if event_id.len() != ID_LEN {
+            return Err(anyhow::anyhow!("invalid group-epoch event id"));
+        }
+        self.disk_full_error()?;
+        let mut key = Vec::with_capacity(12 + event_id.len());
+        key.extend_from_slice(b"group_epoch:");
+        key.extend_from_slice(event_id);
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.put(&mut wtxn, &key, create_id.as_bytes())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Reads the epoch mappings for a batch of event ids. Missing entries
+    /// are normal (old databases and events accepted before the index).
+    pub(crate) fn group_epochs_for(
+        &self,
+        event_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = std::collections::HashMap::with_capacity(event_ids.len());
+        for id in event_ids {
+            if id.len() != ID_LEN {
+                continue;
+            }
+            let mut key = Vec::with_capacity(12 + id.len());
+            key.extend_from_slice(b"group_epoch:");
+            key.extend_from_slice(id);
+            if let Some(value) = self.index_meta.get(&rtxn, &key)?
+                && let Ok(create_id) = std::str::from_utf8(value)
+            {
+                out.insert(hex::encode(id), create_id.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Persist the DM-only carry snapshot used when migration rebuilds a
+    /// destination group store from imported events. DM groups are
+    /// snapshot-only, so they are saved separately and merged after rebuild.
+    pub(crate) fn save_dm_carry(&self, data: &[u8]) -> Result<()> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.put(&mut wtxn, b"dm_carry", data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn load_dm_carry(&self) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.index_meta.get(&rtxn, b"dm_carry")?.map(<[u8]>::to_vec))
+    }
+
+    pub(crate) fn clear_dm_carry(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.delete(&mut wtxn, b"dm_carry")?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Persist the NIP-IA archived-identities set (JSON array).
+    pub(crate) fn save_identity_archive(&self, data: &[u8]) -> Result<()> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.put(&mut wtxn, b"identity_archive", data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn load_identity_archive(&self) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self
+            .index_meta
+            .get(&rtxn, b"identity_archive")?
+            .map(<[u8]>::to_vec))
+    }
+
+    /// Persist the role rebuild's bounded mutation journal. The key is
+    /// additive in `index_meta`; an old database simply has no record.
+    pub(crate) fn save_role_rebuild_pending(&self, data: &[u8]) -> Result<()> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta
+            .put(&mut wtxn, b"role_rebuild_pending", data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn load_role_rebuild_pending(&self) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self
+            .index_meta
+            .get(&rtxn, b"role_rebuild_pending")?
+            .map(<[u8]>::to_vec))
+    }
+
+    pub(crate) fn clear_role_rebuild_pending(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.delete(&mut wtxn, b"role_rebuild_pending")?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Assigns the next ingest sequence to a group-state event. The counter
+    /// and the per-event key commit together, so a restart cannot assign a
+    /// sequence twice or lose an already-assigned event.
+    pub(crate) fn assign_event_arrival(&self, event_id: &[u8]) -> Result<u64> {
+        if event_id.len() != ID_LEN {
+            return Err(anyhow::anyhow!("invalid arrival event id"));
+        }
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        let next = self
+            .index_meta
+            .get(&wtxn, b"arrival_seq")?
+            .and_then(|raw| raw.get(..8))
+            .map(|raw| u64::from_be_bytes(raw.try_into().expect("checked length")))
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.index_meta
+            .put(&mut wtxn, b"arrival_seq", &next.to_be_bytes())?;
+        let mut key = Vec::with_capacity(8 + event_id.len());
+        key.extend_from_slice(b"arrival:");
+        key.extend_from_slice(event_id);
+        self.index_meta.put(&mut wtxn, &key, &next.to_be_bytes())?;
+        wtxn.commit()?;
+        Ok(next)
+    }
+
+    pub(crate) fn event_arrivals(
+        &self,
+        event_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<String, u64>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = std::collections::HashMap::with_capacity(event_ids.len());
+        for id in event_ids {
+            if id.len() != ID_LEN {
+                continue;
+            }
+            let mut key = Vec::with_capacity(8 + id.len());
+            key.extend_from_slice(b"arrival:");
+            key.extend_from_slice(id);
+            if let Some(raw) = self.index_meta.get(&rtxn, &key)?
+                && raw.len() >= 8
+            {
+                out.insert(
+                    hex::encode(id),
+                    u64::from_be_bytes(raw[..8].try_into().expect("checked length")),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batch form used by the one-time startup backfill. One transaction
+    /// keeps a large legacy group history from paying one fsync per event.
+    pub(crate) fn record_group_epochs_batch(&self, entries: &[(Vec<u8>, String)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        for (event_id, create_id) in entries {
+            if event_id.len() != ID_LEN {
+                continue;
+            }
+            let mut key = Vec::with_capacity(12 + event_id.len());
+            key.extend_from_slice(b"group_epoch:");
+            key.extend_from_slice(event_id);
+            self.index_meta.put(&mut wtxn, &key, create_id.as_bytes())?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn group_epochs_backfilled(&self) -> Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self
+            .index_meta
+            .get(&rtxn, b"group_epochs_backfill")?
+            .is_some())
+    }
+
+    pub(crate) fn mark_group_epochs_backfilled(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta
+            .put(&mut wtxn, b"group_epochs_backfill", b"1")?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
     /// The persistent derived-group-state stamp: 0 when it was never
     /// bumped (fresh/pre-stamp database). See [`STATE_STAMP_KEY`].
     pub(crate) fn state_stamp(&self) -> Result<u64> {
@@ -3222,6 +3529,7 @@ impl Store {
 
         let raw = serde_json::to_vec(event)?;
         self.events.put(wtxn, &id, &raw)?;
+        self.index_meta.delete(wtxn, &Self::thread_root_key(&id))?;
         self.put_indexes(wtxn, event, &id, &pubkey)?;
         // The derived-state sequence advances in the same commit as the
         // state-relevant event it describes: a snapshot can claim a
@@ -3952,6 +4260,15 @@ impl Store {
             return Ok(());
         };
 
+        let mut epoch_key = Vec::with_capacity(12 + id.len());
+        epoch_key.extend_from_slice(b"group_epoch:");
+        epoch_key.extend_from_slice(id);
+        self.index_meta.delete(wtxn, &epoch_key)?;
+        let mut arrival_key = Vec::with_capacity(8 + id.len());
+        arrival_key.extend_from_slice(b"arrival:");
+        arrival_key.extend_from_slice(id);
+        self.index_meta.delete(wtxn, &arrival_key)?;
+        self.remember_thread_root_tombstone(wtxn, &event, id)?;
         self.events.delete(wtxn, id)?;
         self.by_created
             .delete(wtxn, &created_key(event.created_at, id))?;
@@ -4071,6 +4388,14 @@ impl Store {
         {
             capped.push("by_word");
         }
+        let mut epoch_key = Vec::with_capacity(12 + id.len());
+        epoch_key.extend_from_slice(b"group_epoch:");
+        epoch_key.extend_from_slice(id);
+        self.index_meta.delete(wtxn, &epoch_key)?;
+        let mut arrival_key = Vec::with_capacity(8 + id.len());
+        arrival_key.extend_from_slice(b"arrival:");
+        arrival_key.extend_from_slice(id);
+        self.index_meta.delete(wtxn, &arrival_key)?;
         self.events.delete(wtxn, id)?;
         if !capped.is_empty() {
             log::warn!(

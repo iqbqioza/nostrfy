@@ -1917,6 +1917,7 @@ fn migrate_options(
         apply_vanish,
         nip62_enabled: cfg.nip_enabled(62),
         nip40_enabled: cfg.nip_enabled(40),
+        enabled_buzz: cfg.relay.enabled_buzz,
         // Only recorded when the new-pubkey gate is configured: with the
         // gate off the table is never reaped.
         first_seen: cfg.relay.new_pubkey_min_age_secs > 0,

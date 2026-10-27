@@ -1381,7 +1381,7 @@ impl Store {
     /// Persists the in-progress vanish record (pubkey -> furthest
     /// `until_created`) and returns the merged bound, so a re-delivered
     /// older request resumes the interrupted one's full cut.
-    fn record_pending_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<u64> {
+    pub(crate) fn record_pending_vanish(&self, pubkey: &[u8], until_created: u64) -> Result<u64> {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         let until = self

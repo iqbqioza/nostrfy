@@ -13,6 +13,7 @@ The guides are written to be friendly and practical, with real command examples 
 | [HTTP REST API Reference (API.md)](API.md) | The `/api/v1` endpoint: paths, parameters, responses, pagination, errors | You want to query events from scripts or other programs |
 | [Troubleshooting (TROUBLESHOOTING.md)](TROUBLESHOOTING.md) | Common errors and their step-by-step fixes | You hit an error or something behaves unexpectedly |
 | [Migrating from strfry (MIGRATING-FROM-STRFRY.md)](MIGRATING-FROM-STRFRY.md) | The complete runbook for moving a strfry relay's events into nostrfy: preparation, dry run, migration, verification, cut-over, rollback | You are switching from strfry to nostrfy |
+| [Buzz compatibility (BUZZ-COMPATIBILITY.md)](BUZZ-COMPATIBILITY.md) | The Buzz desktop app's HTTP bridge, NIP-CL channel metadata, DMs and media aliases | You want to connect Buzz to your relay |
 
 ## Quick Start (30-second guide)
 
