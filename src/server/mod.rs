@@ -1472,6 +1472,8 @@ async fn purge_expired_group_messages_paged(relay: &Relay, page: usize) -> Resul
                     !crate::nips::nip29::is_group_action_kind(event.kind)
                         && !(crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
                             .contains(&event.kind)
+                        && !crate::nips::nip29::is_membership_notice_kind(event.kind)
+                        && event.kind != 30622
                 })
                 .filter_map(|event| event.id_bytes())
                 .collect();

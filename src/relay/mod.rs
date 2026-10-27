@@ -7820,6 +7820,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leave_revokes_allowlist_and_method_grants() {
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        let target = "bb".repeat(32);
+        {
+            let mut access = relay.access.write().await;
+            access.restrict_relay = true;
+            access
+                .allowed_pubkeys
+                .push((target.clone(), "temporary".into()));
+            access.method_grants.insert(
+                target.clone(),
+                vec!["assignrole".to_string(), "banpubkey".to_string()],
+            );
+        }
+        assert!(relay.persist_access().await);
+        let mut leave = crate::event::Event {
+            id: String::new(),
+            pubkey: target.clone(),
+            created_at: crate::util::unix_now(),
+            kind: crate::nips::nip43::LEAVE,
+            tags: vec![vec!["-".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        leave.id = crate::nips::nip01::compute_id(&leave);
+        relay.apply_leave_request(&leave).await;
+        assert!(
+            relay
+                .access
+                .read()
+                .await
+                .allowed_pubkeys
+                .iter()
+                .all(|(pubkey, _)| pubkey != &target)
+        );
+        assert!(
+            !relay
+                .access
+                .read()
+                .await
+                .method_grants
+                .contains_key(&target)
+        );
+        let crate::db::LoadAccessOutcome::Loaded(persisted) = relay.db.load_access().await else {
+            panic!("access state must load");
+        };
+        assert!(
+            persisted
+                .allowed_pubkeys
+                .iter()
+                .all(|(pubkey, _)| pubkey != &target),
+            "the leave must persist the allowlist revocation"
+        );
+        assert!(
+            !persisted.method_grants.contains_key(&target),
+            "the leave must persist the method-grant revocation"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn leave_marked_mid_flight_is_buffered_not_lost() {
         // The rebuild mark landing between the leave's pending snapshot and
         // its mutation must not lose the leave: the mutation re-reads the

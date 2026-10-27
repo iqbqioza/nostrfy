@@ -1463,6 +1463,61 @@ impl super::Relay {
         // store and its membership list are authoritative.
         super::buffer_pubkey_removal(&mut buffer, &self.roles_rebuild, &event.pubkey);
         drop(buffer);
+        self.revoke_leave_access(&event.pubkey).await;
+    }
+
+    /// A NIP-43 LEAVE withdraws the member from the relay, not just from
+    /// the role map. Invite-admitted members are normally absent from the
+    /// allowlist already; an allowlisted member or NIP-86 grantee who leaves
+    /// must not keep write/management access. Configured owners are kept so
+    /// their operator identity cannot be removed by a self-request.
+    async fn revoke_leave_access(&self, pubkey: &str) {
+        if self
+            .relay_owner_members()
+            .await
+            .iter()
+            .any(|owner| owner.eq_ignore_ascii_case(pubkey))
+        {
+            return;
+        }
+        let (removed_allow, methods) = {
+            let mut access = self.access.write().await;
+            let before = access.allowed_pubkeys.len();
+            access
+                .allowed_pubkeys
+                .retain(|(allowed, _)| !allowed.eq_ignore_ascii_case(pubkey));
+            (
+                access.allowed_pubkeys.len() != before,
+                access
+                    .method_grants
+                    .remove(&pubkey.to_ascii_lowercase())
+                    .unwrap_or_default(),
+            )
+        };
+        let mut ops = Vec::new();
+        if removed_allow {
+            ops.push(crate::config::AccessOp::UnallowPubkey {
+                pubkey: pubkey.to_string(),
+                insensitive: false,
+            });
+        }
+        ops.extend(
+            methods
+                .into_iter()
+                .map(|method| crate::config::AccessOp::UngrantMethod {
+                    pubkey: pubkey.to_string(),
+                    method,
+                }),
+        );
+        if ops.is_empty() {
+            return;
+        }
+        self.push_access_ops(ops);
+        if !self.persist_access().await {
+            log::warn!(
+                "apply_leave_request: access revocation for {pubkey} is live but not durable"
+            );
+        }
     }
 
     /// Publishes only the add-user event for an admission applied while the
