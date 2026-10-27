@@ -170,19 +170,39 @@ impl super::Conn {
         self.send_control_tagged(json!(["NEG-ERR", echo_id, reason, extra]), tag);
     }
 
-    pub(crate) fn send_neg_msg(&mut self, sub_id: &str, message: &[u8]) {
-        self.send_neg_msg_with_echo(sub_id, sub_id, message);
+    pub(crate) fn send_neg_msg(&mut self, sub_id: &str, message: &[u8]) -> bool {
+        self.send_neg_msg_with_echo(sub_id, sub_id, message)
     }
 
     /// Sends a NEG-MSG echoing `echo_id` while tagging the frame with the
-    /// raw id (see [`Self::send_neg_err_with_echo`]).
-    pub(crate) fn send_neg_msg_with_echo(&mut self, raw_id: &str, echo_id: &str, message: &[u8]) {
+    /// raw id (see [`Self::send_neg_err_with_echo`]). Returns `false` when
+    /// the relay-wide NEG reply budget or the last-resort control queue
+    /// refused the frame; the caller must close/retry the sync instead of
+    /// assuming it reached the wire.
+    pub(crate) fn send_neg_msg_with_echo(
+        &mut self,
+        raw_id: &str,
+        echo_id: &str,
+        message: &[u8],
+    ) -> bool {
         // NEG frames are tagged with the (NIP-77-namespaced) id so a
         // NEG-CLOSE or same-id re-open can purge them from the outgoing
         // queue: a replaced sync must not deliver the previous
         // incarnation's rounds under the same id.
         let tag = (!raw_id.is_empty()).then(|| super::neg_sub_fingerprint(raw_id));
-        self.send_control_tagged(json!(["NEG-MSG", echo_id, hex::encode(message)]), tag);
+        let Ok(text) = serde_json::to_string(&json!(["NEG-MSG", echo_id, hex::encode(message)]))
+        else {
+            return false;
+        };
+        let budget = super::neg_response_budget(&self.relay);
+        let Some(bytes) = budget.try_reserve(
+            text.len() as u64,
+            super::neg_response_budget_bytes(self.req_response_bytes),
+        ) else {
+            return false;
+        };
+        let reservation = super::NegResponseReservation::new(budget, bytes);
+        self.queue_control_text(text, tag, Some(reservation))
     }
 
     /// Whether the outgoing queue is too deep for another (potentially
@@ -384,7 +404,8 @@ impl super::Conn {
         // The negentropy query only needs (created_at, id) records, so it
         // never materializes every matching full event in memory.
         let system_filter = filter.clone();
-        let Some((items, more)) = self.relay.db.neg_query_result(filter, max_items, now).await
+        let Some((items, more, effective_items)) =
+            self.relay.db.neg_query_result(filter, max_items, now).await
         else {
             // A failed sync must never be answered with an empty item set:
             // the peer would conclude everything is gone locally and delete
@@ -407,7 +428,7 @@ impl super::Conn {
                 &sub_id,
                 &echo,
                 "blocked: this query is too big",
-                json!(max_items),
+                json!(effective_items),
             );
             return;
         }
@@ -565,10 +586,11 @@ impl super::Conn {
         // Bound the initial response like the NEG-MSG replies: a mode-2
         // answer returns every id of the range, and without the cap a
         // large max_neg_items would let one NEG-OPEN bypass the REQ
-        // response budget entirely. The wire size is the hex encoding
-        // (2x) plus the JSON frame, so budget against that.
+        // response budget entirely. NEG-6: the wire size is the hex
+        // encoding plus the JSON frame, conservatively 2.2x the binary
+        // payload, not the old 2x undercount.
         let budget = self.req_response_bytes;
-        if budget > 0 && response.len() as u64 * 2 > budget {
+        if budget > 0 && super::neg_wire_size(response.len()) > budget {
             self.neg_err(
                 &sub_id,
                 "blocked: negentropy response too large (increase limits.max_req_response_bytes)",
@@ -629,7 +651,13 @@ impl super::Conn {
             self.neg_err(&sub_id, "blocked: overloaded, please retry");
             return;
         }
-        self.send_neg_msg(&sub_id, &response);
+        if !self.send_neg_msg(&sub_id, &response) {
+            // The response was not queued (relay-wide NEG reply budget or
+            // the last-resort control queue). NEG-ERR closes the id; the
+            // client can retry with a narrower filter.
+            self.neg_err(&sub_id, "error: overloaded, please retry");
+            return;
+        }
         // NEG-OPEN subscriptions are created subscriptions too: count a new
         // id in `subscriptions_total` (a same-id replacement only reuses
         // the slot, like a REQ replacement, so the total stays consistent
@@ -772,9 +800,9 @@ impl super::Conn {
                 // into hundreds of MiB of bandwidth.
                 let budget = self.req_response_bytes;
                 // The response is sent hex-encoded inside a JSON array
-                // (roughly 2.2x the binary size), so budget against the
-                // wire size, not the binary size.
-                let wire_size = response.len() as u64 * 2;
+                // (2.2x the binary size conservatively), so budget against
+                // the wire size, not the binary size.
+                let wire_size = super::neg_wire_size(response.len());
                 let over_budget = budget > 0 && wire_size > budget;
                 if over_budget {
                     // The raw id owns the state and the purge; the echo id
@@ -792,7 +820,10 @@ impl super::Conn {
                     self.neg_err_with_echo(&sub_id, &echo_id, "blocked: overloaded, please retry");
                     return;
                 }
-                self.send_neg_msg_with_echo(&sub_id, &echo_id, &response);
+                if !self.send_neg_msg_with_echo(&sub_id, &echo_id, &response) {
+                    self.neg_err_with_echo(&sub_id, &echo_id, "error: overloaded, please retry");
+                    return;
+                }
                 // The round succeeded: refresh this sync and reclaim the
                 // other silent ones. Failing rounds must not sweep — one
                 // bad frame must not close unrelated syncs.

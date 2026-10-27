@@ -895,14 +895,18 @@ impl Store {
 
     /// Collects only `(created_at, id)` records of the matching events
     /// (NIP-77 negentropy). Keeps the memory footprint small instead of
-    /// materializing every full event.
+    /// materializing every full event. The third return value is the
+    /// effective item limit the scan could apply (the smallest of the
+    /// caller's cap, a search over-fetch cap, and the work budget), so the
+    /// connection layer can put the truthful value in NEG-ERR's optional
+    /// fourth element.
     pub(crate) fn scan_neg(
         &self,
         filter: &Filter,
         now: u64,
         max_items: usize,
         budget: usize,
-    ) -> Result<(NegItems, bool)> {
+    ) -> Result<(NegItems, bool, usize)> {
         // See `scan`: test-only scan failure for the reported NEG/aggregate
         // paths.
         #[cfg(test)]
@@ -919,6 +923,13 @@ impl Store {
         } else {
             max_items
         };
+        // The advertised processable-record limit is the smallest of the
+        // configured per-query cap, the collector's cap (a search filter
+        // over-fetches only up to SEARCH_BUDGET_MAX), and the shared work
+        // budget (a broad filter can be stopped before it reaches either
+        // item cap). NEG-ERR must report this effective value, not the
+        // config value when the scan stopped earlier.
+        let effective_items = max_items.min(collect_cap).min(budget);
         let mut out = ItemCollector::new(collect_cap);
         let more = self.scan_collect(
             std::slice::from_ref(filter),
@@ -933,7 +944,7 @@ impl Store {
             // skips: those NEG queries fall back to the full path.
             !filter.has_search(),
         )?;
-        Ok((out.items, more))
+        Ok((out.items, more, effective_items))
     }
 
     /// Shared scan core: applies the filters through the index-selected

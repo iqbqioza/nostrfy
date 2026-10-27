@@ -125,18 +125,45 @@ impl PendingResponseBudget {
 /// bound at all.
 pub(crate) const PENDING_RESPONSE_BUDGET_FACTOR: u64 = 16;
 
+/// The documented default of `limits.max_req_response_bytes`, also used to
+/// size a relay-wide budget when the per-response limit is disabled.
+pub(crate) const DEFAULT_REQ_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Sizes the relay-wide budget from `limits.max_req_response_bytes`; when
 /// the per-response budget is disabled (`0` = unlimited) the documented
 /// default is used, so the relay-wide bound still exists.
 pub(crate) fn pending_response_budget_bytes(per_response: u64) -> u64 {
-    /// The documented default of `limits.max_req_response_bytes`.
-    const DEFAULT_PER_RESPONSE: u64 = 32 * 1024 * 1024;
     let per_response = if per_response == 0 {
-        DEFAULT_PER_RESPONSE
+        DEFAULT_REQ_RESPONSE_BYTES
     } else {
         per_response
     };
     per_response.saturating_mul(PENDING_RESPONSE_BUDGET_FACTOR)
+}
+
+/// Relay-wide budget for queued NEG-MSG reply bytes as a multiple of the
+/// per-response byte budget. NEG replies are completion-critical and bypass
+/// the normal outgoing queue cap, so without a separate aggregate bound a
+/// few slow readers could pin many full-size responses at once.
+pub(crate) const NEG_RESPONSE_BUDGET_FACTOR: u64 = 4;
+
+/// Sizes the relay-wide NEG reply budget from `limits.max_req_response_bytes`
+/// (the same per-response limit that bounds one NEG-MSG).
+pub(crate) fn neg_response_budget_bytes(per_response: u64) -> u64 {
+    let per_response = if per_response == 0 {
+        DEFAULT_REQ_RESPONSE_BYTES
+    } else {
+        per_response
+    };
+    per_response.saturating_mul(NEG_RESPONSE_BUDGET_FACTOR)
+}
+
+/// A conservative wire-size estimate for a NEG-MSG frame whose binary
+/// payload is `binary_len` bytes: hex doubles it, and the NIP-77 JSON
+/// envelope/range headers add a little more. The previous `2x` estimate
+/// under-counted the actual frame at the budget boundary.
+pub(crate) fn neg_wire_size(binary_len: usize) -> u64 {
+    (binary_len as u64).saturating_mul(22).div_ceil(10)
 }
 
 /// Relay-wide NEG budget as a multiple of the per-query item cap, mirroring
@@ -204,6 +231,13 @@ fn pending_response_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
 /// The relay-wide NEG budget of one relay (see [`relay_budget`] for the
 /// registry rationale).
 fn neg_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
+    static BUDGETS: BudgetRegistry = std::sync::OnceLock::new();
+    relay_budget(&BUDGETS, relay)
+}
+
+/// The relay-wide queued NEG-MSG byte budget (see
+/// [`neg_response_budget_bytes`]).
+pub(crate) fn neg_response_budget(relay: &Arc<Relay>) -> Arc<PendingResponseBudget> {
     static BUDGETS: BudgetRegistry = std::sync::OnceLock::new();
     relay_budget(&BUDGETS, relay)
 }
@@ -413,6 +447,29 @@ const MAX_PENDING_REQS: usize = 4;
 pub(crate) struct OutFrame {
     pub(crate) message: Message,
     event_sub: Option<u64>,
+    /// Relay-wide NEG reply-byte reservation held while this frame is
+    /// queued; dropping the frame (sent, purged, or connection closed)
+    /// releases it through [`NegResponseReservation`]'s `Drop`.
+    _neg_reservation: Option<NegResponseReservation>,
+}
+
+/// RAII reservation for one queued NEG-MSG frame in the relay-wide byte
+/// budget.
+pub(crate) struct NegResponseReservation {
+    budget: Arc<PendingResponseBudget>,
+    bytes: u64,
+}
+
+impl NegResponseReservation {
+    pub(crate) fn new(budget: Arc<PendingResponseBudget>, bytes: u64) -> Self {
+        NegResponseReservation { budget, bytes }
+    }
+}
+
+impl Drop for NegResponseReservation {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
 }
 
 /// A stable-enough fingerprint of a subscription id: only equality between
@@ -827,6 +884,7 @@ impl Conn {
         self.outgoing.push_back(OutFrame {
             message: msg,
             event_sub,
+            _neg_reservation: None,
         });
         true
     }
@@ -859,45 +917,60 @@ impl Conn {
     /// so the client can never receive a frame belonging to a replaced
     /// subscription (including a CLOSED queued by an earlier failed REQ).
     /// The control-queue caps and overflow accounting are unchanged.
-    pub(crate) fn send_control_tagged(&mut self, value: Value, event_sub: Option<u64>) {
+    pub(crate) fn send_control_tagged(&mut self, value: Value, event_sub: Option<u64>) -> bool {
+        let Ok(text) = serde_json::to_string(&value) else {
+            return false;
+        };
+        self.queue_control_text(text, event_sub, None)
+    }
+
+    /// Queues an already-serialized control frame. Returns `false` when the
+    /// last-resort queue or byte ceiling refused it; the caller may then
+    /// fail the operation instead of assuming the frame reached the wire.
+    /// A passed NEG byte reservation is released if the frame is refused.
+    pub(crate) fn queue_control_text(
+        &mut self,
+        text: String,
+        event_sub: Option<u64>,
+        neg_reservation: Option<NegResponseReservation>,
+    ) -> bool {
         if self.outgoing.len() >= OUT_QUEUE_LIMIT * 2 {
             self.dropped += 1;
             self.control_overflowed = true;
             self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
-            return;
+            return false;
         }
-        if let Ok(text) = serde_json::to_string(&value) {
-            let size = text.len();
-            // Control frames are exempt from the *configured* per-connection
-            // cap (a dropped EOSE would hang a completing subscription), but
-            // they are not exempt from an absolute bound. The exemption used
-            // to hold whenever a cap was configured, which left the frame
-            // count as the only limit: an OK frame echoes the client-supplied
-            // `id` verbatim, a malformed event can carry one as large as
-            // `max_ws_message_bytes`, and `OUT_QUEUE_LIMIT * 2` such frames
-            // pin gigabytes per connection. The other control sources are
-            // already small or self-limiting (a subscription id is bounded by
-            // `max_sub_id_len`, COUNT by `max_count`, and NEG separately by
-            // its own backpressure guard), so this ceiling only binds the
-            // echo. It applies whether or not a cap is configured, and like
-            // `send_tagged` it never drops the first frame of an empty
-            // queue, so a lone over-ceiling frame is still delivered.
-            if !self.outgoing.is_empty()
-                && self.out_bytes.saturating_add(size) > self.control_ceiling()
-            {
-                self.dropped += 1;
-                self.control_overflowed = true;
-                self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
-                return;
-            }
-            self.out_bytes += size;
-            self.out_msgs += 1;
-            self.out_bytes_total += size as u64;
-            self.outgoing.push_back(OutFrame {
-                message: Message::Text(text.into()),
-                event_sub,
-            });
+        let size = text.len();
+        // Control frames are exempt from the *configured* per-connection
+        // cap (a dropped EOSE would hang a completing subscription), but
+        // they are not exempt from an absolute bound. The exemption used
+        // to hold whenever a cap was configured, which left the frame
+        // count as the only limit: an OK frame echoes the client-supplied
+        // `id` verbatim, a malformed event can carry one as large as
+        // `max_ws_message_bytes`, and `OUT_QUEUE_LIMIT * 2` such frames
+        // pin gigabytes per connection. The other control sources are
+        // already small or self-limiting (a subscription id is bounded by
+        // `max_sub_id_len`, COUNT by `max_count`, and NEG separately by
+        // its own backpressure guard), so this ceiling only binds the
+        // echo. It applies whether or not a cap is configured, and like
+        // `send_tagged` it never drops the first frame of an empty
+        // queue, so a lone over-ceiling frame is still delivered.
+        if !self.outgoing.is_empty() && self.out_bytes.saturating_add(size) > self.control_ceiling()
+        {
+            self.dropped += 1;
+            self.control_overflowed = true;
+            self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
+            return false;
         }
+        self.out_bytes += size;
+        self.out_msgs += 1;
+        self.out_bytes_total += size as u64;
+        self.outgoing.push_back(OutFrame {
+            message: Message::Text(text.into()),
+            event_sub,
+            _neg_reservation: neg_reservation,
+        });
+        true
     }
 
     /// The absolute byte ceiling for control frames when the configured
@@ -957,6 +1030,7 @@ impl Conn {
                 reason: "reconnect required: limits increased".into(),
             })),
             event_sub: None,
+            _neg_reservation: None,
         });
         self.out_msgs = self.out_msgs.saturating_add(1);
     }
@@ -973,6 +1047,7 @@ impl Conn {
                 reason: "message too big".into(),
             })),
             event_sub: None,
+            _neg_reservation: None,
         });
         self.out_msgs = self.out_msgs.saturating_add(1);
     }
@@ -1223,6 +1298,7 @@ impl Conn {
                 self.outgoing.push_back(OutFrame {
                     message: Message::Text(text.into()),
                     event_sub: Some(sub_fingerprint(&front.sub_id)),
+                    _neg_reservation: None,
                 });
             }
             if budget_exceeded {
@@ -1291,6 +1367,7 @@ impl Conn {
             self.outgoing.push_back(OutFrame {
                 message: Message::Text(text.into()),
                 event_sub: Some(sub_fingerprint(&pending.sub_id)),
+                _neg_reservation: None,
             });
         }
     }
@@ -2816,6 +2893,7 @@ mod tests {
             conn.outgoing.push_back(OutFrame {
                 message: Message::Text("x".into()),
                 event_sub: None,
+                _neg_reservation: None,
             });
         }
         for i in 0..=MAP_SHRINK_THRESHOLD {
@@ -5304,6 +5382,7 @@ mod tests {
         conn.outgoing.push_back(super::OutFrame {
             message: Message::Text(serde_json::json!(["NEG-MSG", raw, ""]).to_string().into()),
             event_sub: Some(tag),
+            _neg_reservation: None,
         });
         conn.handle_neg_open(&[json!(raw)]).await;
         assert!(
@@ -5609,6 +5688,73 @@ mod tests {
                 }
                 other => panic!("live bus did not deliver: {other:?}"),
             }
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_response_budget_is_relay_wide_and_reusable_after_drain() {
+        // Two connections on one relay share the queue-byte reservation:
+        // the first frame consumes it even though the second connection's
+        // own outgoing queue is empty (the old empty-queue exception had no
+        // relay-wide bound). Dropping the first frame makes the bytes
+        // available again.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with("").await;
+            let mut a = build_conn_on(Arc::clone(&relay)).await;
+            let mut b = build_conn_on(Arc::clone(&relay)).await;
+            a.req_response_bytes = 1_000;
+            b.req_response_bytes = 1_000;
+            let budget = super::neg_response_budget(&relay);
+            let payload = [0u8; 1_000];
+            assert!(a.send_neg_msg("a", &payload));
+            assert!(
+                !b.send_neg_msg("b", &payload),
+                "the second connection must see the shared reservation"
+            );
+            assert!(budget.used() > 0);
+            a.outgoing.clear();
+            assert_eq!(budget.used(), 0);
+            assert!(
+                b.send_neg_msg("b", &payload),
+                "the released relay-wide bytes must be reusable"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_response_budget_is_released_with_the_queued_frame() {
+        // NEG-MSG bypasses the per-connection queue cap, so its wire bytes
+        // are reserved against a relay-wide budget and released only when
+        // the frame is sent or purged.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.req_response_bytes = 1_000;
+            let budget = super::neg_response_budget(&conn.relay);
+            assert_eq!(budget.used(), 0);
+
+            // A 3000-byte binary payload becomes >4000 wire bytes (hex +
+            // JSON), exceeding 4 * max_req_response_bytes.
+            assert!(
+                !conn.send_neg_msg("too-big", &[0u8; 3_000]),
+                "an over-budget NEG frame must be refused"
+            );
+            assert_eq!(budget.used(), 0, "a refused frame must not reserve");
+
+            assert!(
+                conn.send_neg_msg("ok", &[0u8; 100]),
+                "a small NEG frame must be queued"
+            );
+            assert!(budget.used() > 0, "a queued frame must hold its bytes");
+            conn.outgoing.clear();
+            assert_eq!(
+                budget.used(),
+                0,
+                "dropping the queued frame must release its reservation"
+            );
             conn.relay.db.shutdown();
         });
     }
@@ -6226,12 +6372,18 @@ mod tests {
             }
             conn.handle_neg_open(&[json!("big"), json!({"search": "needle"}), json!("61000000")])
                 .await;
-            assert!(
-                outgoing_json(&conn)
-                    .iter()
-                    .any(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too big")),
-                "a search query over the cap must close with NEG-ERR: {:?}",
-                outgoing_json(&conn)
+            let too_big = outgoing_json(&conn)
+                .into_iter()
+                .find(|m| m[0] == "NEG-ERR" && m[2].as_str().unwrap().contains("too big"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a search query over the cap must close: {:?}",
+                        outgoing_json(&conn)
+                    )
+                });
+            assert_eq!(
+                too_big[3], 2,
+                "NEG-ERR must report the effective item limit, not an unrelated cap"
             );
             conn.outgoing.clear();
             {
@@ -10169,6 +10321,25 @@ mod tests {
             neg_budget_bytes(0),
             100_000 * NEG_ITEM_BYTES * NEG_BUDGET_FACTOR,
             "a zero item cap still gets the relay-wide default (0 would disable the budget)"
+        );
+    }
+
+    #[test]
+    fn neg_response_budget_and_wire_estimate_are_conservative() {
+        assert_eq!(
+            neg_response_budget_bytes(1_000),
+            1_000 * NEG_RESPONSE_BUDGET_FACTOR
+        );
+        assert_eq!(
+            neg_response_budget_bytes(0),
+            32 * 1024 * 1024 * NEG_RESPONSE_BUDGET_FACTOR,
+            "a disabled per-response budget still gets the relay-wide default"
+        );
+        assert_eq!(neg_wire_size(0), 0);
+        assert_eq!(neg_wire_size(1_000), 2_200, "2.2x the binary payload");
+        assert!(
+            neg_wire_size(1_000) > 2_000,
+            "the old 2x estimate under-counted the wire frame"
         );
     }
 

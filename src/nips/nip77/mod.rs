@@ -28,6 +28,13 @@ pub const PROTOCOL_VERSION: u8 = 0x61;
 /// is budgeted to keep a single frame's CPU cost bounded (the round
 /// budget then caps the total).
 pub(crate) const MAX_NEG_RANGES_PER_MSG: usize = 1024;
+/// The maximum number of ranges the server emits in one response. A client
+/// may send up to [`MAX_NEG_RANGES_PER_MSG`] mismatching fingerprint ranges,
+/// each of which can bisect into several server ranges (measured >3,000);
+/// above this bound the response is collapsed into one id list, which is a
+/// valid (if less bandwidth-efficient) full description of the set. The
+/// response byte budget still bounds that list.
+pub(crate) const MAX_NEG_RESPONSE_RANGES: usize = MAX_NEG_RANGES_PER_MSG;
 /// Ranges with at most this many items are answered with an id list instead
 /// of being bisected.
 pub const ID_LIST_THRESHOLD: usize = 100;
@@ -112,6 +119,48 @@ fn fingerprint(items: &[Item]) -> [u8; 16] {
 
 // ----- server response -----
 
+/// Writes one response bound unless that would exceed the response range
+/// cap. The caller falls back to [`id_list_all`] on `None`.
+fn write_response_bound(
+    out: &mut Vec<u8>,
+    bound: &Bound,
+    prev_ts: &mut u64,
+    written: &mut usize,
+) -> Option<()> {
+    *written += 1;
+    if *written > MAX_NEG_RESPONSE_RANGES {
+        return None;
+    }
+    write_bound(out, bound, prev_ts);
+    Some(())
+}
+
+/// A valid response that lists every server item in one range. Used when a
+/// detailed response would exceed [`MAX_NEG_RESPONSE_RANGES`]; the client
+/// can still reconcile the complete set, and the normal response byte budget
+/// caps the frame.
+fn id_list_all(items: &[Item]) -> Vec<u8> {
+    let mut out = vec![PROTOCOL_VERSION];
+    let mut prev_ts = 0u64;
+    write_bound(
+        &mut out,
+        &Bound {
+            ts: u64::MAX,
+            prefix: Vec::new(),
+        },
+        &mut prev_ts,
+    );
+    let mut buf = [0u8; 10];
+    let n = write_varint(&mut buf, 2);
+    out.extend_from_slice(&buf[..n]);
+    let n = write_varint(&mut buf, items.len() as u64);
+    out.extend_from_slice(&buf[..n]);
+    for (_, id) in items {
+        out.extend_from_slice(id);
+    }
+    out
+}
+
 /// Computes the server's response to a client message.
 ///
 /// `items` must already be sorted ascending by (timestamp, id) via
@@ -169,6 +218,7 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
     let mut out: Vec<u8> = Vec::new();
     out.push(PROTOCOL_VERSION);
     let mut prev_ts = 0u64;
+    let mut written_ranges = 0usize;
 
     let mut lower = Bound {
         ts: 0,
@@ -182,7 +232,11 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
         // panicked. Reject anything after infinity explicitly.
         let lower_infinity = lower.ts == u64::MAX && lower.prefix.is_empty();
         let upper_infinity = upper.ts == u64::MAX && upper.prefix.is_empty();
-        if lower_infinity && !upper_infinity {
+        // Once a range ends at infinity the space is covered: any further
+        // range is a zero-width duplicate (including a non-canonical
+        // max-timestamp bound that was normalized to infinity by the
+        // parser).
+        if lower_infinity {
             return Err(anyhow!("ranges after infinity"));
         }
         // Ranges must be adjacent and ascending. The empty prefix is only
@@ -198,7 +252,11 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
         }
         match &range.mode {
             Mode::Skip => {
-                write_bound(&mut out, upper, &mut prev_ts);
+                if write_response_bound(&mut out, upper, &mut prev_ts, &mut written_ranges)
+                    .is_none()
+                {
+                    return Ok(id_list_all(items));
+                }
                 let mut buf = [0u8; 10];
                 let n = write_varint(&mut buf, 0);
                 out.extend_from_slice(&buf[..n]);
@@ -206,7 +264,11 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
             }
             Mode::IdList => {
                 let ids = ids_in(items, &lower, upper);
-                write_bound(&mut out, upper, &mut prev_ts);
+                if write_response_bound(&mut out, upper, &mut prev_ts, &mut written_ranges)
+                    .is_none()
+                {
+                    return Ok(id_list_all(items));
+                }
                 let mut buf = [0u8; 10];
                 let n = write_varint(&mut buf, 2);
                 out.extend_from_slice(&buf[..n]);
@@ -229,7 +291,11 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
                     let fp = fingerprint(slice);
                     if fp == *client_fp {
                         // In sync for this range.
-                        write_bound(&mut out, upper, &mut prev_ts);
+                        if write_response_bound(&mut out, upper, &mut prev_ts, &mut written_ranges)
+                            .is_none()
+                        {
+                            return Ok(id_list_all(items));
+                        }
                         let mut buf = [0u8; 10];
                         let n = write_varint(&mut buf, 0);
                         out.extend_from_slice(&buf[..n]);
@@ -239,7 +305,11 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
                     if slice.len() <= ID_LIST_THRESHOLD {
                         // Answer the whole range with an id list.
                         let ids: Vec<[u8; 32]> = slice.iter().map(|(_, id)| *id).collect();
-                        write_bound(&mut out, upper, &mut prev_ts);
+                        if write_response_bound(&mut out, upper, &mut prev_ts, &mut written_ranges)
+                            .is_none()
+                        {
+                            return Ok(id_list_all(items));
+                        }
                         let mut buf = [0u8; 10];
                         let n = write_varint(&mut buf, 2);
                         out.extend_from_slice(&buf[..n]);
@@ -257,7 +327,11 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> anyhow::Result<Vec<u8>>
                     let mid_item = &slice[mid];
                     let mid_bound = split_bound(&slice[mid - 1], mid_item);
                     let first = &slice[..mid];
-                    write_bound(&mut out, &mid_bound, &mut prev_ts);
+                    if write_response_bound(&mut out, &mid_bound, &mut prev_ts, &mut written_ranges)
+                        .is_none()
+                    {
+                        return Ok(id_list_all(items));
+                    }
                     let mut buf = [0u8; 10];
                     let n = write_varint(&mut buf, 1);
                     out.extend_from_slice(&buf[..n]);
@@ -427,6 +501,230 @@ mod tests {
             response,
             vec![PROTOCOL_VERSION, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
         );
+    }
+
+    enum ParsedMode {
+        Skip,
+        Fingerprint,
+        IdList(Vec<[u8; 32]>),
+    }
+
+    struct ParsedRange {
+        upper: Bound,
+        mode: ParsedMode,
+    }
+
+    fn parse_response_with_ids(data: &[u8]) -> Vec<ParsedRange> {
+        let mut pos = 1usize;
+        let mut prev_ts = 0u64;
+        let mut ranges = Vec::new();
+        while pos < data.len() {
+            let upper = codec::read_bound(data, &mut pos, &mut prev_ts).expect("bound");
+            let mode = codec::read_varint(data, &mut pos).expect("mode");
+            let mode = match mode {
+                0 => ParsedMode::Skip,
+                1 => {
+                    pos += 16;
+                    ParsedMode::Fingerprint
+                }
+                2 => {
+                    let count = codec::read_varint(data, &mut pos).expect("id count") as usize;
+                    let mut ids = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let id: [u8; 32] = data[pos..pos + 32].try_into().expect("id");
+                        pos += 32;
+                        ids.push(id);
+                    }
+                    ParsedMode::IdList(ids)
+                }
+                other => panic!("unexpected response mode {other}"),
+            };
+            ranges.push(ParsedRange { upper, mode });
+        }
+        ranges
+    }
+
+    fn client_ids_in(items: &[Item], lower: &Bound, upper: &Bound) -> Vec<[u8; 32]> {
+        items
+            .iter()
+            .filter(|item| {
+                item_cmp(item, lower) != Ordering::Less && item_cmp(item, upper) == Ordering::Less
+            })
+            .map(|(_, id)| *id)
+            .collect()
+    }
+
+    /// Build the next client message from the server's response: list our
+    /// own IDs for ranges the server fingerprinted, and skip the ranges it
+    /// already listed. This is the standard negentropy bisection, reduced to
+    /// the client-side decisions needed to prove that the server's response
+    /// converges.
+    fn client_reply(client: &[Item], response: &[ParsedRange]) -> (Vec<u8>, Vec<[u8; 32]>) {
+        let mut out = vec![PROTOCOL_VERSION];
+        let mut prev_ts = 0u64;
+        let mut lower = Bound {
+            ts: 0,
+            prefix: Vec::new(),
+        };
+        let mut learned = Vec::new();
+        let mut buf = [0u8; 10];
+        for range in response {
+            write_bound(&mut out, &range.upper, &mut prev_ts);
+            match &range.mode {
+                ParsedMode::Skip => {
+                    // A matching fingerprint means the server has the same
+                    // records as the client in this range (for this test
+                    // data; a fingerprint collision would be indistinguishable
+                    // anyway). A skipped range is therefore already known.
+                    learned.extend(client_ids_in(client, &lower, &range.upper));
+                    let n = write_varint(&mut buf, 0);
+                    out.extend_from_slice(&buf[..n]);
+                }
+                ParsedMode::Fingerprint => {
+                    let ids = client_ids_in(client, &lower, &range.upper);
+                    let n = write_varint(&mut buf, 2);
+                    out.extend_from_slice(&buf[..n]);
+                    let n = write_varint(&mut buf, ids.len() as u64);
+                    out.extend_from_slice(&buf[..n]);
+                    for id in ids {
+                        out.extend_from_slice(&id);
+                    }
+                }
+                ParsedMode::IdList(ids) => {
+                    // The server already told us these IDs; no further work
+                    // for this range is needed.
+                    learned.extend_from_slice(ids);
+                    let n = write_varint(&mut buf, 0);
+                    out.extend_from_slice(&buf[..n]);
+                }
+            }
+            lower = range.upper.clone();
+        }
+        (out, learned)
+    }
+
+    #[test]
+    fn a_client_reconciles_with_the_server_set() {
+        // End-to-end protocol simulation: the client starts with a subset
+        // of the server's events, receives bisected fingerprints/id lists,
+        // replies with its own id lists for the unresolved ranges, and must
+        // eventually learn every server id. This catches response-bound
+        // ordering, split, and id-list bugs that unit-testing one response
+        // in isolation would miss.
+        let server = sort_items(
+            (0..300u64)
+                .map(|i| item(i, (i % 251) as u8))
+                .collect::<Vec<_>>(),
+        );
+        let client = server
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 3 == 0)
+            .map(|(_, item)| *item)
+            .collect::<Vec<_>>();
+
+        let mut message = vec![PROTOCOL_VERSION];
+        let mut prev_ts = 0u64;
+        write_bound(
+            &mut message,
+            &Bound {
+                ts: u64::MAX,
+                prefix: Vec::new(),
+            },
+            &mut prev_ts,
+        );
+        let mut buf = [0u8; 10];
+        let n = write_varint(&mut buf, 1); // client fingerprint
+        message.extend_from_slice(&buf[..n]);
+        message.extend_from_slice(&fingerprint(&client));
+
+        let mut learned: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        for round in 0..8 {
+            let response = respond(&server, &message).expect("response");
+            let parsed = parse_response_with_ids(&response);
+            let (next, ids) = client_reply(&client, &parsed);
+            learned.extend(ids);
+            let unresolved = parsed
+                .iter()
+                .any(|range| matches!(range.mode, ParsedMode::Fingerprint));
+            if !unresolved {
+                let server_ids: std::collections::HashSet<[u8; 32]> =
+                    server.iter().map(|(_, id)| *id).collect();
+                assert_eq!(
+                    learned, server_ids,
+                    "round {round}: the client must learn every server id"
+                );
+                return;
+            }
+            message = next;
+            assert!(round < 7, "the sync must converge");
+        }
+        panic!("the client did not converge");
+    }
+
+    #[test]
+    fn prefixed_max_upper_bound_is_treated_as_infinity_in_a_response() {
+        // NEG-2 end-to-end: a client can send (u64::MAX, non-empty prefix)
+        // with a mismatching fingerprint. The parser normalizes it to
+        // infinity, so the response is one ascending range and does not
+        // append a descending implicit infinity tail.
+        let mut msg = vec![PROTOCOL_VERSION];
+        let mut buf = [0u8; 10];
+        let n = write_varint(&mut buf, 0); // infinity-encoded timestamp
+        msg.extend_from_slice(&buf[..n]);
+        let n = write_varint(&mut buf, 1); // non-canonical prefix
+        msg.extend_from_slice(&buf[..n]);
+        msg.push(0xaa);
+        let n = write_varint(&mut buf, 1); // fingerprint
+        msg.extend_from_slice(&buf[..n]);
+        msg.extend_from_slice(&[0u8; 16]);
+
+        let items = sort_items(vec![item(1, 1), item(2, 2)]);
+        let response = respond(&items, &msg).expect("the response must be built");
+        let ranges =
+            parse_message(&response, MAX_NEG_RESPONSE_RANGES + 1).expect("the response must parse");
+        assert_eq!(ranges.len(), 1, "no implicit descending infinity tail");
+        assert_eq!(ranges[0].upper.ts, u64::MAX);
+        assert!(ranges[0].upper.prefix.is_empty());
+        assert!(matches!(ranges[0].mode, Mode::IdList));
+    }
+
+    #[test]
+    fn oversized_response_falls_back_to_one_id_list() {
+        // NEG-4: 1024 client ranges plus the implicit infinity tail would
+        // make the relay emit 1025 ranges even though every one is a Skip.
+        // The response range cap must collapse the answer rather than emit
+        // an unbounded range list; the one id list still describes the
+        // complete server set.
+        let mut msg = vec![PROTOCOL_VERSION];
+        let mut prev_ts = 0u64;
+        for i in 0..MAX_NEG_RANGES_PER_MSG {
+            write_bound(
+                &mut msg,
+                &Bound {
+                    ts: i as u64 + 1,
+                    prefix: Vec::new(),
+                },
+                &mut prev_ts,
+            );
+            let mut buf = [0u8; 10];
+            let n = write_varint(&mut buf, 0); // Skip
+            msg.extend_from_slice(&buf[..n]);
+        }
+        let items = sort_items(vec![item(1, 1), item(2, 2)]);
+        let response = respond(&items, &msg).expect("the response must be built");
+        let ranges = parse_message(&response, MAX_NEG_RESPONSE_RANGES + 1).expect("valid response");
+        assert_eq!(
+            ranges.len(),
+            1,
+            "an over-cap response must collapse to one range"
+        );
+        assert!(
+            matches!(ranges[0].mode, Mode::IdList),
+            "the fallback must list every server id"
+        );
+        assert_eq!(ranges[0].upper.ts, u64::MAX);
+        assert!(ranges[0].upper.prefix.is_empty());
     }
 
     #[test]
