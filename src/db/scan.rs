@@ -41,6 +41,9 @@ pub(crate) struct NegItem {
     /// gate is on.
     pub app_specific: bool,
     pub gid: Option<String>,
+    /// Bearer invite code on a NIP-29 JOIN. NEG has no event body to apply
+    /// the member-only visibility rule later, so carry the code here.
+    pub invite_code: Option<String>,
     /// p-tag recipients of a NIP-59 gift wrap (kind 1059), `None` for every
     /// other kind. Kept so the connection layer can serve wraps only to
     /// their recipients without loading the full events back.
@@ -120,6 +123,7 @@ fn neg_item_size_estimate(item: &NegItem) -> usize {
             .state_recipients
             .as_ref()
             .map_or(0, |recipients| recipients.iter().map(String::len).sum())
+        + item.invite_code.as_deref().map_or(0, str::len)
 }
 
 /// Upper bound on the number of query terms used for a search: the word
@@ -551,6 +555,15 @@ impl ScanCollector for ItemCollector {
         } else {
             None
         };
+        let invite_code = if event.kind == crate::nips::nip29::JOIN {
+            event
+                .tags
+                .iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == "code")
+                .map(|tag| tag[1].clone())
+        } else {
+            None
+        };
         let item = NegItem {
             created: event.created_at,
             id,
@@ -559,6 +572,7 @@ impl ScanCollector for ItemCollector {
             protected,
             app_specific: crate::nips::nip78::is_app_specific(&event),
             gid,
+            invite_code,
             wrap_recipients,
             state_recipients,
         };
@@ -601,6 +615,15 @@ impl ScanCollector for ItemCollector {
         } else {
             None
         };
+        let invite_code = if event.kind() == crate::nips::nip29::JOIN {
+            event
+                .tags()
+                .iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == "code")
+                .map(|tag| tag[1].clone())
+        } else {
+            None
+        };
         let item = NegItem {
             created: event.created_at(),
             id,
@@ -609,6 +632,7 @@ impl ScanCollector for ItemCollector {
             protected,
             app_specific: crate::nips::nip78::is_app_specific_kind(event.kind()),
             gid,
+            invite_code,
             wrap_recipients,
             state_recipients,
         };

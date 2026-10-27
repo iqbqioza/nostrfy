@@ -457,20 +457,41 @@ fn excluded_tags(params: &ApiParams) -> Vec<&'static str> {
 /// is enforced separately by [`api_auth_middleware`]; this predicate stays
 /// the anonymous-visibility one, so an authorized caller sees the same
 /// event set as before (the API exposes no identity-scoped reads).
-fn api_visible(
+fn api_visible_filtered(
     event: &Event,
     groups: Option<&nip29::GroupStore>,
     excluded: &[&str],
     nip78: bool,
     relay_pubkey: Option<&str>,
+    filters: &[Filter],
 ) -> bool {
     if let Some(groups) = groups
         && groups.channel_ttl_expired(event, unix_now())
     {
         return false;
     }
+    // A global REST filter must not receive a system channel's state just
+    // because the API lacks the WebSocket path's filter-aware gate. The
+    // caller passes the request filters so an explicit `#h`/`#d`/`#t`/`#P`
+    // selection still works.
+    let system_channel_visible = groups.is_none_or(|groups| {
+        let Some(gid) = nip29::group_id_any(event) else {
+            return true;
+        };
+        if !groups
+            .groups
+            .get(gid)
+            .is_some_and(|group| group.channel_type == "system")
+        {
+            return true;
+        }
+        filters
+            .iter()
+            .any(|filter| crate::server::bridge::nip_cl_visible(filter, event, groups))
+    });
 
-    !nip70::hidden_from_anonymous(event, relay_pubkey)
+    system_channel_visible
+        && !nip70::hidden_from_anonymous(event, relay_pubkey)
         && event.kind != nip62::GIFT_WRAP_KIND
         // These are per-pubkey state (Buzz membership notices and the
         // NIP-DV DM visibility snapshot). The public REST API has no
@@ -481,6 +502,20 @@ fn api_visible(
         && !excluded
             .iter()
             .any(|name| event.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
+}
+
+/// Compatibility wrapper for callers without a request-filter context.
+/// It deliberately hides system-channel state (an empty filter set names no
+/// channel), which is the safe anonymous default.
+#[cfg(test)]
+fn api_visible(
+    event: &Event,
+    groups: Option<&nip29::GroupStore>,
+    excluded: &[&str],
+    nip78: bool,
+    relay_pubkey: Option<&str>,
+) -> bool {
+    api_visible_filtered(event, groups, excluded, nip78, relay_pubkey, &[])
 }
 
 /// Whether the NIP-78 AUTH gate is active in the current config.
@@ -853,12 +888,13 @@ pub async fn api_monthly_handler(
                 start_ts = events
                     .iter()
                     .find(|e| {
-                        api_visible(
+                        api_visible_filtered(
                             e,
                             groups.as_deref(),
                             &no_tags_probe,
                             nip78_probe,
                             relay.relay_pubkey.as_deref(),
+                            std::slice::from_ref(&probe),
                         )
                     })
                     .map(|e| e.created_at);
@@ -933,6 +969,7 @@ pub async fn api_monthly_handler(
             until: Some(end),
             ..Default::default()
         };
+        let visibility_filter = filter.clone();
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
         };
@@ -950,12 +987,13 @@ pub async fn api_monthly_handler(
         let count = events
             .iter()
             .filter(|e| {
-                api_visible(
+                api_visible_filtered(
                     e,
                     groups.as_deref(),
                     &no_tags,
                     nip78,
                     relay.relay_pubkey.as_deref(),
+                    std::slice::from_ref(&visibility_filter),
                 )
             })
             .count();
@@ -1039,6 +1077,7 @@ pub async fn api_count_handler(
     // agree with the visible rows of a `no_p` query).
     let no_tags = excluded_tags(&params);
     let nip78 = enabled_nip78_auth_active(&relay).await;
+    let visibility_filter = filter.clone();
     let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
         return db_unavailable();
     };
@@ -1054,12 +1093,13 @@ pub async fn api_count_handler(
     let count = events
         .iter()
         .filter(|e| {
-            api_visible(
+            api_visible_filtered(
                 e,
                 groups.as_deref(),
                 &no_tags,
                 nip78,
                 relay.relay_pubkey.as_deref(),
+                std::slice::from_ref(&visibility_filter),
             )
         })
         .count();
@@ -1111,6 +1151,7 @@ pub async fn api_kinds_handler(
         &params,
         search_enabled,
     );
+    let visibility_filter = filter.clone();
     let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
         return db_unavailable();
     };
@@ -1126,12 +1167,13 @@ pub async fn api_kinds_handler(
     let nip78 = enabled_nip78_auth_active(&relay).await;
     let mut by_kind: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
     for e in events.iter().filter(|e| {
-        api_visible(
+        api_visible_filtered(
             e,
             groups.as_deref(),
             &no_tags,
             nip78,
             relay.relay_pubkey.as_deref(),
+            std::slice::from_ref(&visibility_filter),
         )
     }) {
         *by_kind.entry(e.kind).or_default() += 1;
@@ -1236,6 +1278,7 @@ pub async fn api_daily_handler(
             &params,
             search_enabled,
         );
+        let visibility_filter = filter.clone();
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
         };
@@ -1250,12 +1293,13 @@ pub async fn api_daily_handler(
         let count = events
             .iter()
             .filter(|e| {
-                api_visible(
+                api_visible_filtered(
                     e,
                     groups.as_deref(),
                     &no_tags,
                     nip78,
                     relay.relay_pubkey.as_deref(),
+                    std::slice::from_ref(&visibility_filter),
                 )
             })
             .count();
@@ -1384,12 +1428,13 @@ pub async fn api_stats_handler(
     let mut by_kind: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
     let mut total = 0usize;
     for e in events.iter().filter(|e| {
-        api_visible(
+        api_visible_filtered(
             e,
             groups.as_deref(),
             &no_tags,
             nip78,
             relay.relay_pubkey.as_deref(),
+            std::slice::from_ref(&filter),
         )
     }) {
         *by_kind.entry(e.kind).or_default() += 1;
@@ -1441,23 +1486,25 @@ pub async fn api_stats_handler(
             };
             if first_visible.is_none() {
                 first_visible = first.into_iter().find(|e| {
-                    api_visible(
+                    api_visible_filtered(
                         e,
                         stats_groups.as_deref(),
                         &no_tags,
                         nip78,
                         relay.relay_pubkey.as_deref(),
+                        std::slice::from_ref(&filter),
                     )
                 });
             }
             if last_visible.is_none() {
                 last_visible = last.into_iter().find(|e| {
-                    api_visible(
+                    api_visible_filtered(
                         e,
                         stats_groups.as_deref(),
                         &no_tags,
                         nip78,
                         relay.relay_pubkey.as_deref(),
+                        std::slice::from_ref(&filter),
                     )
                 });
             }
@@ -1597,6 +1644,7 @@ pub async fn api_hourly_handler(
             &params,
             search_enabled,
         );
+        let visibility_filter = filter.clone();
         let Some((events, more)) = relay.db.api_count(vec![filter], count_limit, now).await else {
             return db_unavailable();
         };
@@ -1611,12 +1659,13 @@ pub async fn api_hourly_handler(
         let count = events
             .iter()
             .filter(|e| {
-                api_visible(
+                api_visible_filtered(
                     e,
                     groups.as_deref(),
                     &no_tags,
                     nip78,
                     relay.relay_pubkey.as_deref(),
+                    std::slice::from_ref(&visibility_filter),
                 )
             })
             .count();
@@ -2223,12 +2272,13 @@ async fn query_and_respond_dtag(
         let visible_count = events
             .iter()
             .filter(|e| {
-                api_visible(
+                api_visible_filtered(
                     e,
                     groups.as_deref(),
                     no_tags,
                     nip78,
                     relay.relay_pubkey.as_deref(),
+                    &filters,
                 ) && required_dtag.is_none_or(|d| crate::nips::nip33::dtag(e) == d)
             })
             .count();
@@ -2257,12 +2307,13 @@ async fn query_and_respond_dtag(
     let visible: Vec<Event> = events
         .into_iter()
         .filter(|e| {
-            api_visible(
+            api_visible_filtered(
                 e,
                 groups.as_deref(),
                 no_tags,
                 nip78,
                 relay.relay_pubkey.as_deref(),
+                &filters,
             ) && required_dtag.is_none_or(|d| crate::nips::nip33::dtag(e) == d)
         })
         .collect();
@@ -2865,6 +2916,28 @@ mod tests {
                 !api_visible(&per_pubkey, None, &[], false, None),
                 "the anonymous REST API must not expose per-pubkey kind {kind}"
             );
+            let mut groups = nip29::GroupStore::default();
+            let system = nip29::Group {
+                channel_type: "system".into(),
+                ..nip29::Group::default()
+            };
+            groups.groups.insert("sys".into(), system);
+            let mut system_state = plain.clone();
+            system_state.kind = nip29::GROUP_META;
+            system_state.tags = vec![vec!["d".into(), "sys".into()]];
+            let named: Filter = serde_json::from_value(serde_json::json!({
+                "kinds": [nip29::GROUP_META],
+                "#d": ["sys"],
+            }))
+            .unwrap();
+            assert!(
+                !api_visible_filtered(&system_state, Some(&groups), &[], false, None, &[],),
+                "a global REST filter must not receive system-channel state"
+            );
+            assert!(
+                api_visible_filtered(&system_state, Some(&groups), &[], false, None, &[named],),
+                "a filter that names the system channel may receive it"
+            );
             let item = crate::db::NegItem {
                 created: 0,
                 id: [0u8; 32],
@@ -2873,6 +2946,7 @@ mod tests {
                 protected: false,
                 app_specific: false,
                 gid: None,
+                invite_code: None,
                 wrap_recipients: None,
                 state_recipients: None,
             };
