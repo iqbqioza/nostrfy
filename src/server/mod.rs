@@ -765,6 +765,328 @@ async fn filter_vanished_group_snapshot(
     Ok(())
 }
 
+/// Reconstructs DM groups from the relay-signed metadata a DM leaves behind
+/// (`39000` settings, `39001` roles, `39002` members and `30622` hidden-DM
+/// snapshots). The synthetic `9007`/`9000` are not stored, so this is the
+/// only event-derived fallback when both the main snapshot and the additive
+/// DM backup are missing. It only fills ids the rebuilt store does not know,
+/// never overwrites a live group, and skips deleted/ghosted ids.
+async fn restore_dm_metadata(relay: &Relay) -> Result<usize> {
+    let Some(relay_pubkey) = relay.relay_pubkey() else {
+        return Ok(0);
+    };
+    if relay.groups.read().await.is_unrestored() {
+        return Ok(0);
+    }
+    let now = unix_now();
+    let Some(meta_events) =
+        query_dm_metadata(relay, crate::nips::nip29::GROUP_META, &relay_pubkey, now).await
+    else {
+        log::warn!("could not read DM group metadata; leaving DM recovery to the snapshot");
+        return Ok(0);
+    };
+    let Some(admin_events) =
+        query_dm_metadata(relay, crate::nips::nip29::GROUP_ADMINS, &relay_pubkey, now).await
+    else {
+        log::warn!("could not read DM admin metadata; leaving DM recovery to the snapshot");
+        return Ok(0);
+    };
+    let Some(member_events) =
+        query_dm_metadata(relay, crate::nips::nip29::GROUP_MEMBERS, &relay_pubkey, now).await
+    else {
+        log::warn!("could not read DM member metadata; leaving DM recovery to the snapshot");
+        return Ok(0);
+    };
+    let meta = latest_dm_events(meta_events);
+    let admins = latest_dm_events(admin_events);
+    let members = latest_dm_events(member_events);
+    let hidden = match query_dm_visibility(relay, &relay_pubkey, now).await {
+        Some(events) => hidden_dm_viewers(events),
+        None => {
+            log::warn!("could not read hidden-DM snapshots; recovering DMs without them");
+            std::collections::HashMap::new()
+        }
+    };
+    let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
+    {
+        let groups = relay.groups.read().await;
+        for (gid, meta) in meta {
+            if groups.group(&gid).is_some() || groups.is_deleted(&gid) || groups.is_ghosted(&gid) {
+                continue;
+            }
+            let Some(group) = dm_group_from_metadata(
+                &meta,
+                admins.get(&gid),
+                members.get(&gid),
+                hidden.get(&gid),
+            ) else {
+                continue;
+            };
+            snapshot.groups.insert(gid, group);
+        }
+    }
+    if snapshot.groups.is_empty() {
+        return Ok(0);
+    }
+    // A vanished participant must not be re-added by relay metadata created
+    // before the vanish. This is the same filter used for snapshot restores.
+    filter_vanished_group_snapshot(relay, &mut snapshot).await?;
+    snapshot.groups.retain(|_, group| !group.members.is_empty());
+    if snapshot.groups.is_empty() {
+        return Ok(0);
+    }
+    let changed = relay.groups.write().await.merge_dm_snapshot(snapshot);
+    if changed {
+        info!("recovered DM group state from stored relay metadata");
+    }
+    Ok(if changed { 1 } else { 0 })
+}
+
+async fn query_dm_metadata(
+    relay: &Relay,
+    kind: u64,
+    relay_pubkey: &str,
+    now: u64,
+) -> Option<Vec<crate::event::Event>> {
+    let mut filter = crate::filter::Filter {
+        kinds: Some(vec![kind]),
+        authors: Some(vec![relay_pubkey.to_string()]),
+        ..crate::filter::Filter::default()
+    };
+    filter.tags.insert("#t".to_string(), json!(["dm"]));
+    let (events, more) = relay
+        .db
+        .query_full_startup(vec![filter], 100_000, now, false)
+        .await?;
+    if more {
+        log::warn!("DM metadata scan was truncated; recovering the events that fit");
+    }
+    Some(events)
+}
+
+async fn query_dm_visibility(
+    relay: &Relay,
+    relay_pubkey: &str,
+    now: u64,
+) -> Option<Vec<crate::event::Event>> {
+    let filter = crate::filter::Filter {
+        kinds: Some(vec![30622]),
+        authors: Some(vec![relay_pubkey.to_string()]),
+        ..crate::filter::Filter::default()
+    };
+    let (events, more) = relay
+        .db
+        .query_full_startup(vec![filter], 100_000, now, false)
+        .await?;
+    if more {
+        log::warn!("hidden-DM snapshot scan was truncated; recovering the events that fit");
+    }
+    Some(events)
+}
+
+fn latest_dm_events(
+    events: Vec<crate::event::Event>,
+) -> std::collections::HashMap<String, crate::event::Event> {
+    let mut latest = std::collections::HashMap::new();
+    for event in events {
+        let Some(gid) = crate::nips::nip29::group_id_d(&event) else {
+            continue;
+        };
+        let replace = latest
+            .get(gid)
+            .is_none_or(|current: &crate::event::Event| current.created_at <= event.created_at);
+        if replace {
+            latest.insert(gid.to_string(), event);
+        }
+    }
+    latest
+}
+
+fn hidden_dm_viewers(
+    events: Vec<crate::event::Event>,
+) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+    let mut hidden: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for event in events {
+        let Some(viewer) = dm_tag(&event, "d") else {
+            continue;
+        };
+        if !crate::nips::nip29::is_pubkey_hex(viewer) {
+            continue;
+        }
+        for gid in dm_tag_values(&event, "h") {
+            hidden
+                .entry(gid.to_string())
+                .or_default()
+                .insert(viewer.to_ascii_lowercase());
+        }
+    }
+    hidden
+}
+
+fn dm_group_from_metadata(
+    meta: &crate::event::Event,
+    admins: Option<&crate::event::Event>,
+    members: Option<&crate::event::Event>,
+    hidden: Option<&std::collections::HashSet<String>>,
+) -> Option<crate::nips::nip29::Group> {
+    use crate::nips::nip29::{Group, GroupSettings};
+    let mut group = Group {
+        channel_type: "dm".into(),
+        buzz_metadata: true,
+        settings: GroupSettings {
+            private: true,
+            restricted: true,
+            closed: true,
+            hidden: true,
+            name: "Direct message".into(),
+            ..GroupSettings::default()
+        },
+        ..Group::default()
+    };
+    for tag in &meta.tags {
+        if tag.len() < 2 {
+            continue;
+        }
+        let value = tag[1].as_str();
+        match tag[0].as_str() {
+            "name" => group.settings.name = value.to_string(),
+            "picture" => group.settings.picture = value.to_string(),
+            "banner" => group.settings.banner = value.to_string(),
+            "about" => group.settings.about = value.to_string(),
+            "topic" => group.settings.topic = Some(value.to_string()),
+            "purpose" => group.settings.purpose = Some(value.to_string()),
+            "ttl" => group.settings.ttl = value.parse().ok(),
+            "archived" => group.settings.archived = true,
+            "join_role" => group.settings.join_role = Some(value.to_string()),
+            "livekit" => group.settings.livekit = true,
+            "supported_kinds" => {
+                group.settings.supported_kinds = Some(
+                    tag.iter()
+                        .skip(1)
+                        .filter_map(|kind| kind.parse().ok())
+                        .collect(),
+                );
+            }
+            "t" if value != "dm" => group.labels.push(value.to_string()),
+            "P" if crate::nips::nip29::is_pubkey_hex(value) => {
+                group.creator = Some(value.to_ascii_lowercase());
+            }
+            "created_at" => group.created_at = value.parse().ok(),
+            "parent" => group.parent = Some(value.to_string()),
+            "child" => group.children.push(value.to_string()),
+            _ => {}
+        }
+    }
+    for tag in &meta.tags {
+        if tag.len() == 1 {
+            match tag[0].as_str() {
+                "archived" => group.settings.archived = true,
+                "livekit" => group.settings.livekit = true,
+                _ => {}
+            }
+        }
+    }
+    let mut guest_set = std::collections::HashSet::new();
+    let mut bot_set = std::collections::HashSet::new();
+    let add_tag =
+        |tag: &[String],
+         members: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+         guests: &mut std::collections::HashSet<String>,
+         bots: &mut std::collections::HashSet<String>| {
+            if tag.len() < 2 || tag[0] != "p" || !crate::nips::nip29::is_pubkey_hex(&tag[1]) {
+                return;
+            }
+            let pubkey = tag[1].to_ascii_lowercase();
+            members.entry(pubkey.clone()).or_default();
+            for role in tag.iter().skip(2).filter(|role| !role.is_empty()) {
+                match role.as_str() {
+                    "member" => {}
+                    "guest" => {
+                        guests.insert(pubkey.clone());
+                    }
+                    "bot" => {
+                        bots.insert(pubkey.clone());
+                    }
+                    other => {
+                        members
+                            .get_mut(&pubkey)
+                            .expect("member inserted above")
+                            .insert(other.to_string());
+                    }
+                }
+            }
+        };
+    if let Some(members) = members {
+        for tag in &members.tags {
+            add_tag(tag, &mut group.members, &mut guest_set, &mut bot_set);
+        }
+    }
+    if let Some(admins) = admins {
+        for tag in &admins.tags {
+            add_tag(tag, &mut group.members, &mut guest_set, &mut bot_set);
+        }
+    }
+    // The 39000 participant list is a fallback for an old database that
+    // lacks a 39002 roster. Once a roster exists, do not union the older
+    // 39000 p tags back in: a member removed by a later roster event must
+    // stay removed.
+    if group.members.is_empty() {
+        for pubkey in dm_tag_values(meta, "p") {
+            if crate::nips::nip29::is_pubkey_hex(pubkey) {
+                group
+                    .members
+                    .entry(pubkey.to_ascii_lowercase())
+                    .or_default();
+            }
+        }
+        if let Some(creator) = group.creator.clone() {
+            group.members.entry(creator).or_default();
+        }
+    }
+    if group.members.is_empty() {
+        return None;
+    }
+    group.guests.extend(
+        guest_set
+            .into_iter()
+            .filter(|pk| group.members.contains_key(pk)),
+    );
+    group.bots.extend(
+        bot_set
+            .into_iter()
+            .filter(|pk| group.members.contains_key(pk)),
+    );
+    if let Some(hidden) = hidden {
+        group.hidden_for.extend(
+            hidden
+                .iter()
+                .filter(|pk| group.members.contains_key(*pk))
+                .cloned(),
+        );
+    }
+    Some(group)
+}
+
+fn dm_tag<'a>(event: &'a crate::event::Event, name: &str) -> Option<&'a str> {
+    event
+        .tags
+        .iter()
+        .find(|tag| tag.len() >= 2 && tag[0] == name)
+        .map(|tag| tag[1].as_str())
+}
+
+fn dm_tag_values<'a>(
+    event: &'a crate::event::Event,
+    name: &'a str,
+) -> impl Iterator<Item = &'a str> {
+    event
+        .tags
+        .iter()
+        .filter(move |tag| tag.len() >= 2 && tag[0] == name)
+        .map(|tag| tag[1].as_str())
+}
+
 async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
     let mut snapshot = match relay.db.load_groups().await {
         crate::db::LoadGroupsOutcome::Loaded(snapshot) => snapshot,
@@ -890,6 +1212,11 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
     // Buzz backups may still be current. Merge them before this rebuild's
     // snapshot write replaces the backups with event-derived state.
     merge_dm_backup(relay).await?;
+    // The snapshot and its additive backup may both be absent, but a DM
+    // still leaves relay-signed 39000/39001/39002/30622 metadata in the
+    // database. Recover what the available metadata proves before the
+    // rebuild snapshot is written.
+    restore_dm_metadata(relay).await?;
     merge_buzz_backup(relay).await?;
     // The rebuilt state has no (or stale) relay-signed metadata: publish the
     // current 39000/39001/39002/39005 for every group so clients can see
@@ -4546,6 +4873,55 @@ mod tests {
             .expect("carry merge must succeed");
         assert!(relay.groups.read().await.group("dm-carry").is_some());
         assert_eq!(relay.db.load_dm_carry().await, Some(None));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dm_metadata_reconstructs_after_snapshot_loss() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        relay.config.write().await.relay.enabled_buzz = true;
+        relay.groups.write().await.buzz_enabled = true;
+        let a = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
+        let b = secp256k1::Keypair::from_secret_bytes([8u8; 32]).unwrap();
+        let a_pk = secp256k1::XOnlyPublicKey::from_keypair(&a).0.to_string();
+        let b_pk = secp256k1::XOnlyPublicKey::from_keypair(&b).0.to_string();
+        let open = Event {
+            id: String::new(),
+            pubkey: a_pk.clone(),
+            created_at: unix_now(),
+            kind: crate::nips::nip29::DM_OPEN,
+            tags: vec![vec!["p".into(), b_pk.clone()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let channel = match relay.handle_dm_open(&open, &[]).await {
+            crate::db::PutOutcome::Duplicate(message) => {
+                let json = message.strip_prefix("response:").expect("DM response");
+                serde_json::from_str::<serde_json::Value>(json).unwrap()["channel_id"]
+                    .as_str()
+                    .expect("channel id")
+                    .to_string()
+            }
+            other => panic!("DM open failed: {other:?}"),
+        };
+        // Simulate a database whose main snapshot and additive DM backup are
+        // both gone, while the relay-signed metadata remains.
+        relay
+            .groups
+            .write()
+            .await
+            .restore(crate::nips::nip29::GroupsSnapshot::default());
+        let recovered = restore_dm_metadata(&relay)
+            .await
+            .expect("DM metadata recovery must succeed");
+        assert!(recovered > 0);
+        let groups = relay.groups.read().await;
+        let group = groups.group(&channel).expect("recovered DM group");
+        assert_eq!(group.channel_type, "dm");
+        assert!(group.is_member(&a_pk));
+        assert!(group.is_member(&b_pk));
+        assert!(group.settings.private && group.settings.hidden);
+        drop(groups);
         relay.db.shutdown();
     }
 

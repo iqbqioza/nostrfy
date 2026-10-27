@@ -35,6 +35,11 @@ const THREAD_DEPTH_MAX: u32 = 100;
 const AUX_LIMIT: usize = 1_000;
 /// Cap on events walked for one set of thread-summary trees.
 const SUMMARY_TREE_MAX: usize = 10_000;
+/// Fetch bound for the direct-reply and frontier queries that feed a summary.
+/// The walk itself is capped by `SUMMARY_TREE_MAX`; keeping the query bound
+/// equal to that cap lets a dense same-second thread be counted completely
+/// instead of silently stopping at the old 1,000-row page.
+const SUMMARY_QUERY_LIMIT: usize = SUMMARY_TREE_MAX;
 
 /// NIP-CW's thread-summary kind. The same integer is NIP-29's group-pins
 /// event; Buzz never asks for pins in a window, so the two never mix.
@@ -558,14 +563,14 @@ async fn thread_summaries(
     let row_ids: Vec<String> = rows.iter().map(|event| event.id.clone()).collect();
     let mut filter = Filter {
         kinds: Some(THREAD_CONTENT_KINDS.to_vec()),
-        limit: Some(AUX_LIMIT),
+        limit: Some(SUMMARY_QUERY_LIMIT),
         ..Filter::default()
     };
     filter.tags.insert("#e".to_string(), json!(row_ids.clone()));
     filter.tags.insert("#h".to_string(), json!([channel]));
     let Some((events, _)) = relay
         .db
-        .api_query(vec![filter], AUX_LIMIT, unix_now(), false)
+        .api_query(vec![filter], SUMMARY_QUERY_LIMIT, unix_now(), false)
         .await
     else {
         return Err((
@@ -636,14 +641,14 @@ async fn thread_summaries(
         for chunk in frontier.chunks(crate::filter::MAX_FILTER_MEMBERS) {
             let mut filter = Filter {
                 kinds: Some(THREAD_CONTENT_KINDS.to_vec()),
-                limit: Some(AUX_LIMIT),
+                limit: Some(SUMMARY_QUERY_LIMIT),
                 ..Filter::default()
             };
             filter.tags.insert("#e".to_string(), json!(chunk));
             filter.tags.insert("#h".to_string(), json!([channel]));
             let Some((events, _)) = relay
                 .db
-                .api_query(vec![filter], AUX_LIMIT, unix_now(), false)
+                .api_query(vec![filter], SUMMARY_QUERY_LIMIT, unix_now(), false)
                 .await
             else {
                 return Err((

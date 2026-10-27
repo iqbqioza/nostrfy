@@ -189,8 +189,9 @@ host, because Buzz signs the relay URL it uploads to.
   `descendant_count`, `last_reply_at` and the 10 most recent participants.
   Hidden intermediates are traversed without being counted themselves, and
   the NIP-10 root marker keeps visible descendants behind a deleted/missing
-  parent in the count. A larger tree or a frontier capped at the
-  per-query 1,000-event bound can still undercount the summary.
+  parent in the count. The direct/frontier query bound matches the
+  10,000-event walk cap; a tree larger than that can still undercount the
+  summary.
 - `thread_window:true` / `kind:39007` thread mode walks descendants to the
   requested depth, bounded at 8,192 events and 1,000 rows per frontier query.
   Its bounds binding names the request `Host` authority, so a reverse proxy
@@ -209,14 +210,17 @@ host, because Buzz signs the relay URL it uploads to.
   `groups:dm_backup` copy of the DM groups in the same LMDB transaction.
   If the main snapshot is missing but the database generation still
   matches, startup merges those DMs after the event rebuild; a backup that
-  predates a state removal/event is rejected. A new database, or a
-  migration with neither the main snapshot nor the backup, still has no DM
-  state; the migration carry handles its own transition. Runtime
-  state-removal rebuilds carry live DM groups across the swap. Creation and
-  hide persist the snapshot synchronously before the ACK (a failed save is
-  retryable), so a crash cannot leave a current pre-DM snapshot that makes
-  the unknown channel public. Hidden-DM sets are snapshot-backed for the
-  same reason.
+  predates a state removal/event is rejected. When that backup is also
+  missing, the rebuild reconstructs a DM from the relay-signed
+  `39000`/`39001`/`39002` and `30622` metadata (current relay key only),
+  skipping deleted/ghosted ids and vanished participants. A truly new
+  database, or a migration with no snapshot, backup, or metadata events,
+  still has no DM state; the migration carry handles its own transition.
+  Runtime state-removal rebuilds carry live DM groups across the swap.
+  Creation and hide persist the snapshot synchronously before the ACK (a
+  failed save is retryable), so a crash cannot leave a current pre-DM
+  snapshot that makes the unknown channel public. Hidden-DM sets are
+  snapshot-backed for the same reason.
 - Enabling or disabling `enabled_buzz` on an existing relay upgrades/maps
   the creator role in the restored snapshot and records the mode in the
   group snapshot. The next startup detects a mode change (including an old
