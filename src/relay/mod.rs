@@ -3433,13 +3433,16 @@ impl Relay {
             event.kind,
             crate::nips::nip29::DM_OPEN | crate::nips::nip29::DM_HIDE
         );
-        // NIP-43 invite-code brute-force guard (N43-L05): reserve the attempt
+        // Invite-code brute-force guard (N43-L05): reserve the attempt
         // before the signature check (`precheck` verifies inline when
         // `verified` is None) and before the vanish lookup / claim
-        // comparison. The mixed batch path passes a verdict it already
-        // reserved before its parallel signature pass, so this never charges
-        // the same attempt twice.
-        if cfg.nip_enabled(43) && event.kind == nip43::JOIN {
+        // comparison. NIP-29 closed-group JOINs carry the same bearer-code
+        // risk and use the same bounded window. The mixed batch path passes
+        // a verdict it already reserved before its parallel signature pass,
+        // so this never charges the same attempt twice.
+        let join_attempt_kind = (cfg.nip_enabled(43) && event.kind == nip43::JOIN)
+            || (cfg.nip_enabled(29) && event.kind == nip29::JOIN);
+        if join_attempt_kind {
             let allowed = match join_attempt {
                 Some(allowed) => allowed,
                 None => self.allow_join_pubkey_attempt(&event.pubkey, now),
@@ -4010,11 +4013,15 @@ impl Relay {
         // is charged exactly once. The fixed window is per author; the
         // configured publish rate is charged later, after the signature.
         let now = unix_now();
-        let nip43_enabled = self.config.read().await.nip_enabled(43);
+        let (nip43_enabled, nip29_enabled) = {
+            let cfg = self.config.read().await;
+            (cfg.nip_enabled(43), cfg.nip_enabled(29))
+        };
         let join_attempts: Vec<Option<bool>> = events
             .iter()
             .map(|event| {
-                (nip43_enabled && event.kind == nip43::JOIN)
+                ((nip43_enabled && event.kind == nip43::JOIN)
+                    || (nip29_enabled && event.kind == nip29::JOIN))
                     .then(|| self.allow_join_pubkey_attempt(&event.pubkey, now))
             })
             .collect();
@@ -4805,7 +4812,7 @@ impl Relay {
             .await
             .due_membership_events(&relay_pubkey, now);
         for mut event in events {
-            if self.store_relay_event(&mut event).await.is_err() {
+            if self.store_group_event(&mut event).await.is_err() {
                 log::warn!("could not republish a throttled NIP-29 member list");
             }
         }
@@ -4844,7 +4851,7 @@ impl Relay {
         let expected = events.len();
         let mut stored = 0usize;
         for mut event in events {
-            if self.store_relay_event(&mut event).await.is_ok() {
+            if self.store_group_event(&mut event).await.is_ok() {
                 stored += 1;
             }
         }
@@ -4953,7 +4960,7 @@ impl Relay {
         };
         let mut all_stored = true;
         for mut event in events {
-            all_stored &= self.store_relay_event(&mut event).await.is_ok();
+            all_stored &= self.store_role_event(&mut event).await.is_ok();
         }
         all_stored
     }
@@ -6947,7 +6954,7 @@ impl Relay {
             } else {
                 None
             };
-            let result = self.store_relay_event(&mut ev).await;
+            let result = self.store_group_event(&mut ev).await;
             if let Some(gid) = participants_gid
                 && result.is_ok()
             {

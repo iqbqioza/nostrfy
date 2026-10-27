@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 
 use crate::event::Event;
 use crate::nips::nip01;
-use crate::nips::nip43::RoleStore;
+use crate::nips::nip43::{MAX_RELAY_MEMBERS, RoleStore};
 use crate::util::unix_now;
 
 /// Outcome of an RPC-facing role grant/revoke. NIP-86 reports `true`
@@ -183,6 +183,34 @@ impl super::Relay {
             &self.stats,
             event,
             false,
+        )
+        .await
+    }
+
+    /// Stores a relay-generated NIP-29 event, retrying a same-timestamp
+    /// replacement tie at the stamp clock's ceiling. Group metadata is
+    /// replaceable too: without this a newer 39000/39001/39002 can lose the
+    /// NIP-01 id tie and leave a stale roster until the next edit.
+    pub(super) async fn store_group_event(&self, event: &mut Event) -> Result<bool, ()> {
+        if !self.config.read().await.relay.enabled_buzz
+            && matches!(
+                event.kind,
+                crate::nips::nip29::SYSTEM_MESSAGE
+                    | crate::nips::nip29::MEMBER_ADDED
+                    | crate::nips::nip29::MEMBER_REMOVED
+                    | 30622
+            )
+        {
+            return Ok(true);
+        }
+        super::store_relay_event_parts(
+            &self.db,
+            self.key,
+            &self.stamps,
+            &self.live_tx,
+            &self.stats,
+            event,
+            true,
         )
         .await
     }
@@ -856,6 +884,14 @@ impl super::Relay {
         {
             return Err("error: role state is rebuilding; retry the command".into());
         }
+        if matches!(kind, 9030 | 9032) {
+            let roles = self.roles.read().await;
+            if !roles.assignments.contains_key(&target)
+                && roles.assignments.len() >= MAX_RELAY_MEMBERS
+            {
+                return Err("restricted: the relay member list is full".into());
+            }
+        }
         let mut definition_changed = false;
         let changed = {
             let mut roles = self.roles.write().await;
@@ -951,6 +987,15 @@ impl super::Relay {
         if check_pending && !self.role_definition_exists(role).await {
             drop(buffer);
             return RoleChange::Unknown;
+        }
+        {
+            let roles = self.roles.read().await;
+            if !roles.assignments.contains_key(pubkey)
+                && roles.assignments.len() >= MAX_RELAY_MEMBERS
+            {
+                drop(buffer);
+                return RoleChange::Failed;
+            }
         }
         let (outcome, was_member) = self
             .mutate_roles(

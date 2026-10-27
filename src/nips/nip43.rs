@@ -236,6 +236,9 @@ impl RoleStore {
         if !self.roles.contains_key(role) {
             return false;
         }
+        if !self.assignments.contains_key(pubkey) && self.assignments.len() >= MAX_RELAY_MEMBERS {
+            return false;
+        }
         let roles = self.assignments.entry(pubkey.to_string()).or_default();
         // Unlike `unassign` (which reports whether anything changed), the
         // old code always reported success: a duplicate assignment
