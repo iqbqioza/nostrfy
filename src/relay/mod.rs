@@ -739,13 +739,16 @@ impl Drop for DerivedMutationGuard<'_> {
 }
 
 /// Result of the post-commit side effects (see [`Relay::after_put`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RemovalAck {
     /// The side effects applied; the bool is whether live delivery succeeded.
     Applied(bool),
     /// A required removal (NIP-09 deletion or NIP-29 9005) was not applied
     /// (writer overload): the client must be told to retry, not `OK true`.
     NotApplied,
+    /// Apply-time capacity lost a race against another mutation. The stored
+    /// event was removed so a retry can be admitted; report the reason.
+    Rejected(String),
 }
 
 /// Result of a snapshot persist attempt.
@@ -3686,7 +3689,7 @@ impl Relay {
         // Buzz kind:9033 is an admin command that changes the NIP-11 icon.
         // Authorize and validate it before the event write; the config write
         // happens after the read guards are dropped below.
-        let workspace_icon = if event.kind == 9033 {
+        let _workspace_icon = if event.kind == 9033 {
             if !self.is_relay_owner_or_admin(&event.pubkey).await {
                 self.stats.bump(&self.stats.events_rejected, 1);
                 return PutOutcome::Invalid(
@@ -3765,22 +3768,6 @@ impl Relay {
             // back to the legacy rank/id order on replay.
             let _ = self.db.assign_event_arrival(event_id).await;
         }
-        if let Some(icon) = workspace_icon.as_deref()
-            && !self.apply_workspace_icon(icon).await
-        {
-            self.publish_rate_rollback(&event.pubkey, now);
-            self.stats.bump(&self.stats.events_rejected, 1);
-            return PutOutcome::Invalid(
-                "error: cannot persist the workspace icon; the command was not accepted".into(),
-            );
-        }
-        if matches!(event.kind, 9035 | 9036)
-            && let Err(reason) = self.apply_identity_archive(&event).await
-        {
-            self.publish_rate_rollback(&event.pubkey, now);
-            self.stats.bump(&self.stats.events_rejected, 1);
-            return PutOutcome::Invalid(reason);
-        }
         let outcome = self
             .db
             .put_with_first_seen(Arc::clone(&event), now, first_seen)
@@ -3826,6 +3813,10 @@ impl Relay {
                         PutOutcome::Invalid(
                             "error: database overloaded: removal was not applied; retry".into(),
                         )
+                    }
+                    RemovalAck::Rejected(reason) => {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        PutOutcome::Invalid(reason)
                     }
                 }
             }
@@ -4586,10 +4577,34 @@ impl Relay {
                 );
             }
         }
+        if event.kind == 9033
+            && let Some(icon) = event
+                .tags
+                .iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == "icon")
+                .map(|tag| tag[1].as_str())
+            && !self.apply_workspace_icon(icon).await
+        {
+            log::warn!(
+                "stored workspace icon command {} but could not persist the icon",
+                event.id
+            );
+        }
+        if matches!(event.kind, 9035 | 9036)
+            && let Err(reason) = self.apply_identity_archive(&event).await
+        {
+            log::warn!(
+                "stored identity archive command {} but could not apply it: {reason}",
+                event.id
+            );
+        }
         if nip29_enabled && nip29::is_group_action(&event) {
-            let (applied, group_unapplied) = self
+            let (applied, group_unapplied, capacity_rejection) = self
                 .apply_group_event(&event, now, expected_group_create)
                 .await;
+            if let Some(reason) = capacity_rejection {
+                return RemovalAck::Rejected(reason);
+            }
             if !applied {
                 removal_failed = true;
             }
@@ -4949,8 +4964,15 @@ impl Relay {
                 None => return false,
             }
         }
-        let events = {
+        let mut events = {
             let roles = self.roles.read().await;
+            if self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                || self.roles_rebuild.running.load(Ordering::SeqCst)
+                || self.roles_rebuild.removal_committed.load(Ordering::SeqCst)
+                || self.roles_rebuild.derived.in_flight()
+            {
+                return false;
+            }
             let mut events =
                 vec![roles.membership_event(&relay_pubkey, now, &extra_members, &owners)];
             for id in roles.roles.keys() {
@@ -4958,9 +4980,31 @@ impl Relay {
             }
             events
         };
+        // Sign before collecting IDs so a removal racing the publish can
+        // remove exactly the events this call actually stored. `store_role_event`
+        // signs again; the signature is deterministic for the same event.
+        if !events.iter_mut().all(|event| self.sign_relay_event(event)) {
+            return false;
+        }
+        let mut stored_ids = Vec::with_capacity(events.len());
         let mut all_stored = true;
         for mut event in events {
-            all_stored &= self.store_role_event(&mut event).await.is_ok();
+            let id = event.id_bytes();
+            let stored = self.store_role_event(&mut event).await.is_ok();
+            if stored && let Some(id) = id {
+                stored_ids.push(id);
+            }
+            all_stored &= stored;
+        }
+        if (self.roles_rebuild.removal_committed.load(Ordering::SeqCst)
+            || self.roles_rebuild.derived.in_flight())
+            && !stored_ids.is_empty()
+        {
+            // A removal began between the pre-check and the write. Remove
+            // whichever roster/definitions this call stored so the rebuild
+            // cannot resurrect the revoked grant.
+            let _ = self.db.remove_events_by_id(&stored_ids).await;
+            return false;
         }
         all_stored
     }
@@ -6555,7 +6599,7 @@ impl Relay {
         event: &Event,
         now: u64,
         expected_group_create: Option<&str>,
-    ) -> (Vec<Event>, bool) {
+    ) -> (Vec<Event>, bool, Option<String>) {
         let relay_pubkey = self.relay_pubkey().unwrap_or_default();
         // Relay-generated events are stamped with the strictly monotonic
         // clock (not plain `now`): two events applied in the same second
@@ -6577,7 +6621,7 @@ impl Relay {
                 .and_then(|gid| groups.group(gid))
                 .and_then(|group| group.create_id.as_deref());
             if current != Some(expected) {
-                return (Vec::new(), false);
+                return (Vec::new(), false, None);
             }
         }
         // Re-check authorization and the incarnation timestamp while the
@@ -6592,15 +6636,18 @@ impl Relay {
                     .and_then(|group| group.created_at)
                     .is_some_and(|created| event.created_at < created)
             {
-                return (Vec::new(), false);
+                return (Vec::new(), false, None);
             }
             if let Err(reason) = groups.authorize_live_state_event(event, &relay_pubkey) {
                 log::warn!(
                     "dropping group state event {} after apply-time authorization: {reason}",
                     event.id
                 );
-                return (Vec::new(), false);
+                return (Vec::new(), false, None);
             }
+        }
+        if let Some(reason) = groups.capacity_rejection(event) {
+            return (Vec::new(), false, Some(reason));
         }
         if buffer.scanning {
             if event.kind == nip29::DELETE_GROUP {
@@ -6615,7 +6662,7 @@ impl Relay {
             }
         }
         let generated = groups.apply(event, &relay_pubkey, stamp, self.has_relay_key(), false);
-        (generated, true)
+        (generated, true, None)
     }
 
     /// Marks a `9008` id as a ghost on the live store, before the delete is
@@ -6727,7 +6774,11 @@ impl Relay {
         event: &Event,
         now: u64,
         expected_group_create: Option<&str>,
-    ) -> (bool, Option<crate::db::store::PendingDeletion>) {
+    ) -> (
+        bool,
+        Option<crate::db::store::PendingDeletion>,
+        Option<String>,
+    ) {
         // Serialize the apply and its generated events with a LiveKit
         // refresh for the same group: a refresh that passed
         // `is_livekit_group` before a 9002 left LiveKit could otherwise
@@ -6756,7 +6807,7 @@ impl Relay {
             else {
                 // Stale incarnation: the event remains stored but must not
                 // purge or tombstone the current group.
-                return (true, None);
+                return (true, None, None);
             };
             if self.persist_groups_outcome().await == PersistOutcome::Failed
                 && let Some(gid) = nip29::group_id(event)
@@ -6782,13 +6833,23 @@ impl Relay {
         } else {
             Vec::new()
         };
-        let (generated, state_applied) = self
+        let (generated, state_applied, capacity_rejection) = self
             .apply_group_state(event, now, expected_group_create)
             .await;
         // Debounced persistence: restarts restore from the snapshot instead
         // of replaying history, and a skipped save is detected at startup
         // through the group-state sequence (`DbClient::state_seq_group`).
         self.schedule_groups_persist();
+        if let Some(reason) = capacity_rejection {
+            // The intake validation saw free capacity, but another event
+            // took it before this apply. The event is stored; remove it so
+            // a retry can actually be admitted (a duplicate would otherwise
+            // be a permanent no-op), and report the rejection to the client.
+            if let Some(id) = event.id_bytes() {
+                let _ = self.db.remove_events_by_id(&[id]).await;
+            }
+            return (true, None, Some(reason));
+        }
         if !state_applied {
             // The event is stored, but its apply-time authorization or
             // incarnation check rejected it. In particular, a revoked
@@ -6802,7 +6863,7 @@ impl Relay {
                     groups.clear_ghost(gid);
                 }
             }
-            return (true, None);
+            return (true, None, None);
         }
 
         if event.kind == 9005 {
@@ -6992,7 +7053,7 @@ impl Relay {
                 );
             }
         }
-        (!removal_failed, unapplied)
+        (!removal_failed, unapplied, None)
     }
 }
 
@@ -7092,6 +7153,10 @@ impl PendingBatch {
                             ack_override = Some(PutOutcome::Invalid(
                                 "error: database overloaded: removal was not applied; retry".into(),
                             ));
+                        }
+                        RemovalAck::Rejected(reason) => {
+                            relay.stats.bump(&relay.stats.events_rejected, 1);
+                            ack_override = Some(PutOutcome::Invalid(reason));
                         }
                     }
                 }
@@ -15518,7 +15583,7 @@ mod tests {
             .await
             .apply(&create, "", now, false, false);
         let delete = signed_group_event(&admin, 9008, "g1", vec![], now + 1);
-        let (applied, unapplied) = relay
+        let (applied, unapplied, _) = relay
             .apply_group_event(&delete, now + 1, Some("old-create-id"))
             .await;
         assert!(
@@ -15563,7 +15628,7 @@ mod tests {
             vec![vec!["e".into(), target.id.clone()]],
             now + 2,
         );
-        let (applied, _) = relay
+        let (applied, _, _) = relay
             .apply_group_event(&delete, now + 2, Some("old-create-id"))
             .await;
         assert!(applied);
@@ -15599,7 +15664,7 @@ mod tests {
             vec![vec!["p".into(), target.clone()]],
             now + 1,
         );
-        let (applied, _) = relay.apply_group_event(&grant, now + 1, None).await;
+        let (applied, _, _) = relay.apply_group_event(&grant, now + 1, None).await;
         assert!(
             applied,
             "the queued event is stored; only its state mutation is ignored"
@@ -15647,7 +15712,7 @@ mod tests {
             content: String::new(),
             sig: String::new(),
         };
-        let (stale, applied) = relay
+        let (stale, applied, _) = relay
             .apply_group_state(&edit, now + 1, Some("old-create-id"))
             .await;
         assert!(stale.is_empty());
@@ -15665,7 +15730,7 @@ mod tests {
             .create_id
             .clone()
             .expect("create id");
-        let (_, applied) = relay
+        let (_, applied, _) = relay
             .apply_group_state(&edit, now + 1, Some(create_id.as_str()))
             .await;
         assert!(applied);

@@ -1094,13 +1094,18 @@ async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
             return rebuild_group_state(relay, groups_enabled).await;
         }
         crate::db::LoadGroupsOutcome::Failed => {
-            // The store would start empty, and every unknown group id
-            // reads as public: refuse to start rather than expose private
-            // group content, regardless of the NIP toggle.
-            return Err(anyhow::anyhow!(
-                "cannot read the persisted NIP-29 group snapshot; refusing to start with an \
-                 empty group store (missing groups would expose private content)"
-            ));
+            // A corrupt/unreadable snapshot must not make the relay
+            // permanently unstartable. Rebuild from the surviving events
+            // exactly like a missing snapshot; if the database itself is
+            // unavailable the rebuild fails closed and leaves the store
+            // unrestored, so unknown ids are still withheld. The additive
+            // DM/Buzz backups are merged by the rebuild path when their
+            // generation matches.
+            log::warn!(
+                "cannot read the persisted NIP-29 group snapshot; rebuilding from the \
+                 surviving events instead of refusing startup"
+            );
+            return rebuild_group_state(relay, groups_enabled).await;
         }
     };
     populate_group_create_ids(relay, &mut snapshot).await?;
@@ -4859,20 +4864,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_refuses_an_unreadable_group_snapshot_even_when_disabled() {
-        // A snapshot that cannot be read (corrupt bytes, dead reader) must
-        // stop the relay even with NIP-29 disabled: the store would start
-        // empty, and every unknown group id reads as public, so starting
-        // would silently expose private group content.
+    async fn startup_rebuilds_an_unreadable_group_snapshot_fail_closed() {
+        // A corrupt/unreadable snapshot must not make the relay permanently
+        // unstartable. With the reader gone, the event rebuild is
+        // unavailable too, so the store must end up unrestored (unknown ids
+        // withheld) rather than looking like a healthy empty public store.
         let relay = blossom_relay().await;
         relay.db.shutdown();
-        let err = restore_group_state(&relay, false).await.unwrap_err();
+        restore_group_state(&relay, false)
+            .await
+            .expect("an unreadable snapshot must fall back to a fail-closed rebuild");
         assert!(
-            err.to_string().contains("refusing to start"),
-            "an unreadable snapshot must stop startup, got: {err}"
+            relay.groups.read().await.is_unrestored(),
+            "a failed fallback rebuild must keep the group store unrestored"
         );
-        // The pre-existing snapshot path still distinguishes a first run:
-        // tested through the stale-snapshot test below.
     }
 
     #[tokio::test]
