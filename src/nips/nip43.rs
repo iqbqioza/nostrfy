@@ -400,17 +400,45 @@ impl RoleStore {
     /// applied as it arrives, so memory stays bounded by one page.
     pub async fn rebuild(&mut self, db: &DbClient, relay_pubkey: &str) -> bool {
         // A vanished pubkey must not be resurrected as a role holder by a
-        // pre-vanish membership list.
-        // Streamed in bounded pages (see the NIP-29 rebuild).
-        let mut vanished: std::collections::HashSet<String> = std::collections::HashSet::new();
-        if db
-            .vanish_pubkeys_each(|key| {
-                // Both hex spellings (see the NIP-29 rebuild).
-                vanished.insert(hex::encode(key));
-                vanished.insert(hex::encode_upper(key));
-            })
+        // pre-vanish membership list. The vanish table is permanent and
+        // attacker-growable, so do not materialize every marker: collect the
+        // bounded candidate set from the latest membership list and keep
+        // only candidates that are actually vanished.
+        let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let member_filter = Filter {
+            kinds: Some(vec![MEMBERSHIP_LIST]),
+            authors: Some(vec![relay_pubkey.to_string()]),
+            limit: Some(1),
+            ..Filter::default()
+        };
+        let Some((latest_members, _)) = db
+            .query_full_startup(vec![member_filter], 1, unix_now(), false)
             .await
-            .is_none()
+        else {
+            log::error!(
+                "role state rebuild aborted: the latest membership list could not be read; \
+                 refusing to persist an incomplete role store"
+            );
+            return false;
+        };
+        for event in latest_members {
+            for tag in event.tags.iter().filter(|tag| tag.len() >= 2) {
+                if tag[0] == "member" && crate::nips::nip29::is_pubkey_hex(&tag[1]) {
+                    candidates.insert(tag[1].to_ascii_lowercase());
+                }
+            }
+        }
+        let mut vanished: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if !candidates.is_empty()
+            && db
+                .vanish_pubkeys_each(|key| {
+                    let lower = hex::encode(key);
+                    if candidates.contains(&lower) {
+                        vanished.insert(lower);
+                    }
+                })
+                .await
+                .is_none()
         {
             log::error!(
                 "role state rebuild aborted: the vanished-pubkey list is unavailable; \

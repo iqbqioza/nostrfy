@@ -762,10 +762,21 @@ impl GroupStore {
             // A rebuilt/event-derived group is authoritative for its id.
             // The carry and the backup only fill DM ids the rebuild could
             // not recreate, never overwrite a live group.
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.groups.entry(gid) {
-                slot.insert(group);
-                changed = true;
+            //
+            // A rebuilt/event-derived group is authoritative for its id.
+            // The carry and backup only fill DM ids the rebuild could not
+            // recreate, never overwrite a live group. A confirmed delete or
+            // an unresolved ghost is also authoritative: adopting a carry
+            // over it could expose history whose purge was never confirmed.
+            if self.deleted.contains(&gid)
+                || self.ghost.contains(&gid)
+                || self.groups.contains_key(&gid)
+            {
+                continue;
             }
+            self.groups.insert(gid.clone(), group);
+            self.stale_groups.remove(&gid);
+            changed = true;
         }
         if changed {
             self.recompute_derived();
@@ -831,6 +842,13 @@ impl GroupStore {
         self.groups = snap.groups;
         self.deleted = snap.deleted;
         self.ghost = snap.ghost;
+        // A crash between the pre-delete ghost snapshot and the final
+        // unghost/delete persist can leave a group entry beside its
+        // fail-closed marker. Such an entry is not live state: restoring it
+        // would let the ghost reaper/create path expose the old membership
+        // and invite set after the purge already removed the history.
+        self.groups
+            .retain(|gid, _| !self.deleted.contains(gid) && !self.ghost.contains(gid));
         // Snapshots written before the creator role became `owner` still
         // carry the old default `admin`. In Buzz mode, upgrade only that
         // exact default: a creator who was demoted (no roles) or explicitly
@@ -3599,6 +3617,7 @@ impl GroupStore {
         // leaving a tombstone a fresh create could clear.
         let mut seen_gids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen_h_gids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_dm_gids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut until: Option<u64> = None;
         loop {
             let filter = Filter {
@@ -3660,6 +3679,12 @@ impl GroupStore {
                     // keep the conservative rule.
                     if relay_pubkey.is_none_or(|pk| event.pubkey.eq_ignore_ascii_case(pk)) {
                         seen_gids.insert(gid.to_string());
+                        if event.kind == GROUP_META && tag_value(event, "t") == Some("dm") {
+                            // DM groups deliberately have no stored create;
+                            // this metadata is the proof that the id is a
+                            // live DM rather than an orphaned history set.
+                            seen_dm_gids.insert(gid.to_string());
+                        }
                     }
                 }
             }
@@ -3671,6 +3696,13 @@ impl GroupStore {
             until = Some(min_created - 1);
         }
         for gid in seen_gids {
+            if seen_dm_gids.contains(&gid) && !self.deleted.contains(&gid) {
+                // A DM's synthetic create is intentionally absent from the
+                // event history; do not turn its metadata/messages into a
+                // permanent ghost. A confirmed tombstone still wins.
+                self.ghost.remove(&gid);
+                continue;
+            }
             if self.groups.contains_key(&gid) || self.ghost.contains(&gid) {
                 continue;
             }

@@ -495,7 +495,7 @@ impl super::Relay {
                 None => return false,
             }
         }
-        let events = {
+        let mut events = {
             let roles = self.roles.read().await;
             // The caller re-read the rebuild flags before calling, but a
             // removal can mark the store and revoke it between that read and
@@ -520,19 +520,40 @@ impl super::Relay {
             }
             events
         };
-        let ids: Vec<[u8; 32]> = events.iter().filter_map(Event::id_bytes).collect();
+        // Sign before collecting IDs. The role builders intentionally return
+        // an unsigned event (id empty), and signing happens inside the store
+        // helper; collecting IDs first therefore produced an empty list and
+        // made the race cleanup below a no-op.
+        if !events.iter_mut().all(|event| self.sign_relay_event(event)) {
+            return false;
+        }
+        let mut stored_ids = Vec::with_capacity(events.len());
+        let mut list_stored = false;
         let mut all_stored = true;
         for event in events {
-            all_stored &= self.publish_relay_event(event).await;
+            let id = event.id_bytes();
+            let kind = event.kind;
+            let stored = self.publish_relay_event(event).await;
+            if stored {
+                if let Some(id) = id {
+                    stored_ids.push(id);
+                }
+                if kind == crate::nips::nip43::MEMBERSHIP_LIST {
+                    list_stored = true;
+                }
+            }
+            all_stored &= stored;
         }
-        if all_stored
+        if (list_stored || !stored_ids.is_empty())
             && (self.roles_rebuild.removal_committed.load(Ordering::SeqCst)
                 || self.roles_rebuild.derived.in_flight())
         {
             // A removal committed between the pre-check and the write. The
             // new full list may predate the removal and would be the newest
             // event the rebuild reads, resurrecting the removed grant.
-            let _ = self.db.remove_events_by_id(&ids).await;
+            // Remove whatever this call actually stored, not a pre-signing
+            // empty id list.
+            let _ = self.db.remove_events_by_id(&stored_ids).await;
             return false;
         }
         all_stored
@@ -748,16 +769,22 @@ impl super::Relay {
         }
     }
 
-    /// Applies a Buzz/NIP-43 relay member admin command (`9030` add,
-    /// `9031` remove, `9032` change role). The command event itself is
-    /// stored by the caller; this method only mutates the authoritative
-    /// role store and republishes the roster.
-    pub(crate) async fn apply_relay_member_command(
+    /// Validates a Buzz/NIP-43 relay member admin command without mutating
+    /// the role store. Used by the pre-store accept path so an unauthorized
+    /// or malformed command is still rejected instead of being stored as an
+    /// inert event (the mutation itself runs after the put).
+    pub(crate) async fn validate_relay_member_command(
         &self,
         event: &crate::event::Event,
     ) -> Result<(), String> {
         if !self.config.read().await.nip_enabled(43) {
             return Err("restricted: NIP-43 is disabled".into());
+        }
+        if self.roles_rebuild.dirty.load(Ordering::SeqCst)
+            || self.roles_rebuild.running.load(Ordering::SeqCst)
+            || self.roles_rebuild.marking.load(Ordering::SeqCst)
+        {
+            return Err("error: role state is rebuilding; retry the command".into());
         }
         if !self.is_relay_owner_or_admin(&event.pubkey).await {
             return Err("restricted: only the relay owner or an admin may manage members".into());
@@ -796,6 +823,32 @@ impl super::Relay {
         {
             return Err("restricted: cannot remove a configured relay owner".into());
         }
+        Ok(())
+    }
+
+    /// Applies a Buzz/NIP-43 relay member admin command (`9030` add,
+    /// `9031` remove, `9032` change role). The command event itself is
+    /// stored by the caller; this method only mutates the authoritative
+    /// role store and republishes the roster.
+    pub(crate) async fn apply_relay_member_command(
+        &self,
+        event: &crate::event::Event,
+    ) -> Result<(), String> {
+        self.validate_relay_member_command(event).await?;
+        let kind = event.kind;
+        let target = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "p")
+            .map(|tag| tag[1].to_ascii_lowercase())
+            .find(|target| target.len() == 64 && target.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| "invalid: member command needs one hex p tag".to_string())?;
+        let role = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "role")
+            .map(|tag| tag[1].as_str())
+            .next();
         let buffer = self.roles_rebuild.buffer.lock().await;
         if self.roles_rebuild.dirty.load(Ordering::SeqCst)
             || self.roles_rebuild.running.load(Ordering::SeqCst)
