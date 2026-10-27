@@ -6719,3 +6719,95 @@ fn privileged_put_user_wins_over_a_guest_tier() {
         "a privileged role must not leave a contradictory guest tier"
     );
 }
+
+#[test]
+fn encoded_persisted_snapshot_matches_the_typed_format() {
+    // The persistence hot path now serializes borrowed group state instead
+    // of cloning a `GroupsSnapshot` first. The bytes must stay
+    // deserializable by the same readers (and by older binaries): compare
+    // the JSON value of the encoded main/DM/Buzz copies with the typed
+    // snapshot and the previous owned Buzz-backup builder.
+    let mut store = GroupStore::with_cap(10);
+    let mut plain = Group::default();
+    plain
+        .members
+        .insert("aa".repeat(32), std::iter::once("member".into()).collect());
+    store.groups.insert("plain".into(), plain);
+    let mut dm = Group {
+        channel_type: "dm".into(),
+        create_id: Some("dd".repeat(32)),
+        ..Group::default()
+    };
+    dm.members
+        .insert("bb".repeat(32), std::iter::once("owner".into()).collect());
+    store.groups.insert("dm".into(), dm);
+    let mut buzz = Group {
+        buzz_metadata: true,
+        creator_role_explicit: true,
+        create_id: Some("cc".repeat(32)),
+        ..Group::default()
+    };
+    buzz.members
+        .insert("cc".repeat(32), std::iter::once("guest".into()).collect());
+    buzz.guests.insert("cc".repeat(32));
+    buzz.bots.insert("ee".repeat(32));
+    store.groups.insert("buzz".into(), buzz);
+
+    let (data, dm_data, buzz_data) = store.encode_persisted(42, 7).expect("encode");
+    let mut expected = store.snapshot();
+    expected.stamp = 42;
+    expected.seq = 7;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&data).unwrap(),
+        serde_json::to_value(&expected).unwrap(),
+        "the main snapshot JSON must not drift"
+    );
+
+    let dm_expected = GroupsSnapshot {
+        groups: expected
+            .groups
+            .iter()
+            .filter(|(_, group)| group.channel_type == "dm")
+            .map(|(gid, group)| (gid.clone(), group.clone()))
+            .collect(),
+        deleted: std::collections::HashSet::new(),
+        ghost: std::collections::HashSet::new(),
+        stamp: 42,
+        seq: 7,
+        buzz_enabled: Some(store.buzz_enabled),
+    };
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&dm_data).unwrap(),
+        serde_json::to_value(&dm_expected).unwrap(),
+        "the DM backup JSON must not drift"
+    );
+
+    let mut buzz_expected = BuzzBackup {
+        stamp: 42,
+        seq: 7,
+        groups: std::collections::HashMap::new(),
+    };
+    for (gid, group) in &expected.groups {
+        if !group.buzz_metadata && group.guests.is_empty() && group.bots.is_empty() {
+            continue;
+        }
+        buzz_expected.groups.insert(
+            gid.clone(),
+            BuzzGroupBackup {
+                create_id: group.create_id.clone(),
+                buzz_metadata: group.buzz_metadata,
+                creator_role_explicit: group.creator_role_explicit,
+                guests: group.guests.clone(),
+                bots: group.bots.clone(),
+                roles: group.members.clone(),
+            },
+        );
+    }
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&buzz_data).unwrap(),
+        serde_json::to_value(&buzz_expected).unwrap(),
+        "the Buzz backup JSON must not drift"
+    );
+    // And the bytes remain loadable through the normal reader.
+    assert!(serde_json::from_slice::<GroupsSnapshot>(&data).is_ok());
+}

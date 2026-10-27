@@ -1288,38 +1288,18 @@ impl Store {
     /// Persists the NIP-29 group state snapshot under a single fixed key.
     /// Written on every group mutation (join/leave/moderation/vanish), so
     /// restarts restore groups without replaying the full history.
-    pub(crate) fn save_groups(&self, snap: &crate::nips::nip29::GroupsSnapshot) -> Result<()> {
+    pub(crate) fn save_groups_encoded(
+        &self,
+        data: &[u8],
+        dm_data: &[u8],
+        buzz_data: &[u8],
+    ) -> Result<()> {
         self.disk_full_error()?;
-        let data = serde_json::to_vec(snap)?;
-        // Keep a same-transaction backup of DM groups. DMs have no stored
-        // 9007/9000, so a lost main snapshot would otherwise rebuild every
-        // other group and permanently lose the DM channels. The backup is
-        // only consulted after the main snapshot is missing and its
-        // stamp/sequence still match the database generation.
-        let dm_snapshot = crate::nips::nip29::GroupsSnapshot {
-            groups: snap
-                .groups
-                .iter()
-                .filter(|(_, group)| group.channel_type == "dm")
-                .map(|(gid, group)| (gid.clone(), group.clone()))
-                .collect(),
-            deleted: std::collections::HashSet::new(),
-            ghost: std::collections::HashSet::new(),
-            stamp: snap.stamp,
-            seq: snap.seq,
-            buzz_enabled: snap.buzz_enabled,
-        };
-        let dm_data = serde_json::to_vec(&dm_snapshot)?;
-        // Buzz provenance, guest/bot tiers and separate role grants are
-        // snapshot-only for plain-mode replay. Stamp the additive copy with
-        // the same generation so a later rebuild only applies it when no
-        // intervening state removal/event can make it stale.
-        let buzz_data = serde_json::to_vec(&crate::nips::nip29::BuzzBackup::from_snapshot(snap))?;
         let mut wtxn = self.env.write_txn()?;
-        self.groups.put(&mut wtxn, b"groups:snapshot", &data)?;
-        self.groups.put(&mut wtxn, b"groups:dm_backup", &dm_data)?;
+        self.groups.put(&mut wtxn, b"groups:snapshot", data)?;
+        self.groups.put(&mut wtxn, b"groups:dm_backup", dm_data)?;
         self.groups
-            .put(&mut wtxn, b"groups:buzz_backup", &buzz_data)?;
+            .put(&mut wtxn, b"groups:buzz_backup", buzz_data)?;
         self.commit(wtxn)?;
         Ok(())
     }
@@ -1451,11 +1431,10 @@ impl Store {
 
     /// Persists the NIP-43 role state snapshot under a single fixed key.
     /// Same lifecycle as [`Self::save_groups`].
-    pub(crate) fn save_roles(&self, snap: &crate::nips::nip43::RolesSnapshot) -> Result<()> {
+    pub(crate) fn save_roles_encoded(&self, data: &[u8]) -> Result<()> {
         self.disk_full_error()?;
-        let data = serde_json::to_vec(snap)?;
         let mut wtxn = self.env.write_txn()?;
-        self.roles.put(&mut wtxn, b"roles:snapshot", &data)?;
+        self.roles.put(&mut wtxn, b"roles:snapshot", data)?;
         self.commit(wtxn)?;
         Ok(())
     }

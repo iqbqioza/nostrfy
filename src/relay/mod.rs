@@ -302,8 +302,8 @@ pub struct Relay {
     /// Connection id counter: the id identifies a connection in the
     /// subscription index and the queue map.
     pub next_conn_id: std::sync::atomic::AtomicU64,
-    live_tx: mpsc::Sender<(Arc<Event>, Arc<String>)>,
-    live_rx: Option<mpsc::Receiver<(Arc<Event>, Arc<String>)>>,
+    live_tx: mpsc::Sender<Arc<Event>>,
+    live_rx: Option<mpsc::Receiver<Arc<Event>>>,
     live_batch_interval_ms: u64,
     live_batch_size: usize,
     pub groups: Arc<RwLock<GroupStore>>,
@@ -379,9 +379,10 @@ pub struct Relay {
     /// `GroupsRebuild::persist_lock`.
     persist_roles_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Debounced NIP-29/NIP-43 snapshot persistence: the hot mutation paths
-    /// set a dirty flag and let one background worker clone+save at most
+    /// set a dirty flag and let one background worker serialize+save at most
     /// once per [`SNAPSHOT_PERSIST_INTERVAL_MS`], instead of paying the
-    /// O(total state) clone+serialize on every event.
+    /// O(total state) serialization on every event. The encoder borrows the
+    /// live store, so the pass does not clone the maps first.
     snapshot_persist: std::sync::Arc<SnapshotPersist>,
     /// Serializes the Blossom allowlist snapshot capture and write (NIP-86
     /// or the `/blossom allow|deny` command events, and the SIGHUP reload):
@@ -551,12 +552,15 @@ impl StampClock {
 /// the role rebuild worker (which republishes the membership list without a
 /// [`Relay`] handle).
 async fn broadcast_with(
-    live_tx: &mpsc::Sender<(Arc<Event>, Arc<String>)>,
+    live_tx: &mpsc::Sender<Arc<Event>>,
     stats: &Stats,
     event: Arc<Event>,
 ) -> Result<(), ()> {
-    let json = Arc::new(serde_json::to_string(&*event).unwrap_or_default());
-    if live_tx.send((event, json)).await.is_err() {
+    // Serialization belongs to the bus: it knows whether any connection is a
+    // candidate, so an event with no live subscriber costs no JSON encoding
+    // and no JSON string sits in the queue (the queued item is just the
+    // already-shared Event).
+    if live_tx.send(event).await.is_err() {
         log::error!("live bus stopped before an accepted event could be broadcast");
         stats.bump(&stats.db_errors, 1);
         return Err(());
@@ -579,7 +583,7 @@ async fn store_relay_event_parts(
     db: &DbClient,
     key: Option<Keypair>,
     stamps: &StampClock,
-    live_tx: &mpsc::Sender<(Arc<Event>, Arc<String>)>,
+    live_tx: &mpsc::Sender<Arc<Event>>,
     stats: &Stats,
     event: &mut Event,
     retry_tie: bool,
@@ -879,7 +883,13 @@ impl GroupsRebuild {
                 PersistOutcome::Failed
             };
         };
-        let mut snapshot = groups.read().await.snapshot();
+        // Encode the three copies while holding the read guard: this is the
+        // same consistent point the old `snapshot()` clone captured, but it
+        // avoids materializing the clone (and the DM/Buzz copies) in memory.
+        let encoded = {
+            let groups = groups.read().await;
+            groups.encode_persisted(stamp, seq)
+        };
         if self.pending.load(Ordering::SeqCst) {
             return if db.clear_groups_snapshot().await {
                 PersistOutcome::Committed
@@ -916,15 +926,22 @@ impl GroupsRebuild {
                     PersistOutcome::Failed
                 }
             }
-            Some(_) => {
-                snapshot.stamp = stamp;
-                snapshot.seq = seq;
-                if db.save_groups(snapshot).await {
-                    PersistOutcome::Committed
-                } else {
+            Some(_) => match encoded {
+                Ok((data, dm, buzz)) => {
+                    if db.save_groups_encoded(data, dm, buzz).await {
+                        PersistOutcome::Committed
+                    } else {
+                        PersistOutcome::Failed
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "cannot encode the group state snapshot ({e}); keeping the live state \
+                         and retrying the save"
+                    );
                     PersistOutcome::Failed
                 }
-            }
+            },
         }
     }
 }
@@ -1384,7 +1401,7 @@ impl RolesRebuild {
 struct RoleStatePublisher {
     key: Option<Keypair>,
     stamps: Arc<StampClock>,
-    live_tx: mpsc::Sender<(Arc<Event>, Arc<String>)>,
+    live_tx: mpsc::Sender<Arc<Event>>,
     stats: Arc<Stats>,
     /// Synthetic roster entries are config/access-derived and are not in the
     /// event-rebuilt assignments; carry them so the post-rebuild 13534 still
@@ -1748,7 +1765,18 @@ async fn persist_fresh_roles(
         );
         return PersistOutcome::Failed;
     };
-    let mut snapshot = roles.read().await.snapshot();
+    // Encode under the read guard instead of cloning the role maps first:
+    // the writer receives bytes, and a large member list is not copied just
+    // to be serialized on another thread.
+    let (encoded, preserve_empty) = {
+        let roles = roles.read().await;
+        let preserve_empty = roles.roles.is_empty()
+            && roles
+                .assignments
+                .values()
+                .all(|assigned| assigned.is_empty());
+        (roles.encode_snapshot(stamp, seq), preserve_empty)
+    };
     // A removal that landed after the swap check replaced the live store
     // with the fail-closed empty one: saving it with the current generation
     // would make the next startup accept state that predates the removal.
@@ -1758,21 +1786,27 @@ async fn persist_fresh_roles(
     if state.marking.load(Ordering::SeqCst) {
         return PersistOutcome::Deferred;
     }
-    if state.preserve_snapshot.load(Ordering::SeqCst)
-        && snapshot.roles.is_empty()
-        && snapshot.assignments.values().all(|roles| roles.is_empty())
-    {
+    if state.preserve_snapshot.load(Ordering::SeqCst) && preserve_empty {
         return PersistOutcome::Failed;
     }
     if state.derived.in_flight() {
         return PersistOutcome::Deferred;
     }
-    snapshot.stamp = stamp;
-    snapshot.seq = seq;
-    if db.save_roles(snapshot).await {
-        PersistOutcome::Committed
-    } else {
-        PersistOutcome::Failed
+    match encoded {
+        Ok(data) => {
+            if db.save_roles_encoded(data).await {
+                PersistOutcome::Committed
+            } else {
+                PersistOutcome::Failed
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "cannot encode the role state snapshot ({e}); keeping the live state and \
+                 retrying the save"
+            );
+            PersistOutcome::Failed
+        }
     }
 }
 
@@ -1827,28 +1861,44 @@ async fn persist_roles_now(
         );
         return PersistOutcome::Failed;
     };
-    let mut snapshot = roles.read().await.snapshot();
+    // Encode under the read guard (see `persist_fresh_roles`): no role map
+    // clone is needed for the writer, which only stores the JSON bytes.
+    let (encoded, preserve_empty) = {
+        let roles = roles.read().await;
+        let preserve_empty = roles.roles.is_empty()
+            && roles
+                .assignments
+                .values()
+                .all(|assigned| assigned.is_empty());
+        (roles.encode_snapshot(stamp, seq), preserve_empty)
+    };
     // Re-check after the capture: a removal that landed while the store
     // was being captured must not have its pre-removal grants stamped
     // with the removal's generation.
     if stale() {
         return PersistOutcome::Failed;
     }
-    if state.preserve_snapshot.load(Ordering::SeqCst)
-        && snapshot.roles.is_empty()
-        && snapshot.assignments.values().all(|roles| roles.is_empty())
-    {
+    if state.preserve_snapshot.load(Ordering::SeqCst) && preserve_empty {
         return PersistOutcome::Failed;
     }
     if state.derived.in_flight() {
         return PersistOutcome::Deferred;
     }
-    snapshot.stamp = stamp;
-    snapshot.seq = seq;
-    if db.save_roles(snapshot).await {
-        PersistOutcome::Committed
-    } else {
-        PersistOutcome::Failed
+    match encoded {
+        Ok(data) => {
+            if db.save_roles_encoded(data).await {
+                PersistOutcome::Committed
+            } else {
+                PersistOutcome::Failed
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "cannot encode the role state snapshot ({e}); keeping the live state and \
+                 retrying the save"
+            );
+            PersistOutcome::Failed
+        }
     }
 }
 
@@ -2208,7 +2258,7 @@ async fn groups_rebuild_worker(
 }
 
 /// Minimum time between two debounced snapshot passes. A burst of group or
-/// role mutations coalesces into one clone+serialize per store instead of
+/// role mutations coalesces into one serialize+write per store instead of
 /// one per event; correctness never depends on the debounce, because every
 /// state event advances its family's database sequence (`state_seq_group` /
 /// `state_seq_role`) and a snapshot that was skipped (or a crash before the
@@ -2228,7 +2278,7 @@ const SNAPSHOT_FINISH_GRACE: std::time::Duration = std::time::Duration::from_sec
 
 /// Debounced persistence of the NIP-29 group and NIP-43 role snapshots.
 /// The mutation paths only set a dirty flag and schedule the single
-/// background worker, so the O(total state) clone+serialize stays off the
+/// background worker, so the O(total state) serialization stays off the
 /// event path (see [`SNAPSHOT_PERSIST_INTERVAL_MS`]). Rare fail-closed
 /// paths (a pre-delete ghost, a stale-state clear or the rebuild workers)
 /// keep using the immediate `persist_groups`/`persist_roles` calls.
@@ -2782,12 +2832,12 @@ impl Relay {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut batch: Vec<(Arc<Event>, Arc<String>)> = Vec::with_capacity(batch_size);
-            let flush = |batch: &mut Vec<(Arc<Event>, Arc<String>)>| {
+            let mut batch: Vec<Arc<Event>> = Vec::with_capacity(batch_size);
+            let flush = |batch: &mut Vec<Arc<Event>>| {
                 if batch.is_empty() {
                     return;
                 }
-                let batch = Arc::new(std::mem::take(batch));
+                let events = std::mem::take(batch);
                 // Deliver to the candidate connections only: the
                 // subscription index maps each event's components to the
                 // connections that could match, so an event wakes the
@@ -2798,11 +2848,31 @@ impl Relay {
                 let conns = {
                     let index = sub_index.read().unwrap_or_else(|p| p.into_inner());
                     let mut conns = std::collections::HashSet::new();
-                    for (event, _) in batch.iter() {
+                    for event in &events {
                         index.extend_candidates(event, &mut conns);
                     }
                     conns
                 };
+                // No candidate connection: the event was already persisted,
+                // but no subscriber can receive it, so do not pay for JSON
+                // serialization or retain a JSON string in the queue.
+                if conns.is_empty() {
+                    return;
+                }
+                // Serialize once for every subscriber that may match. The
+                // JSON is shared through the per-connection batch, exactly
+                // as before; the difference is that it is built only when a
+                // candidate exists (and after the event left the accept
+                // path), not for every accepted event.
+                let batch = Arc::new(
+                    events
+                        .into_iter()
+                        .map(|event| {
+                            let json = Arc::new(serde_json::to_string(&*event).unwrap_or_default());
+                            (event, json)
+                        })
+                        .collect::<Vec<_>>(),
+                );
                 // Collect the candidate queues under the lock, then drop
                 // the lock before delivering. A full queue signals its
                 // connection to close instead of silently losing a batch.
@@ -2819,14 +2889,14 @@ impl Relay {
                         .collect()
                 };
                 for queue in queues {
-                    enqueue_live_batch(&queue, batch.clone());
+                    enqueue_live_batch(&queue, Arc::clone(&batch));
                 }
             };
             loop {
                 tokio::select! {
                     event = rx.recv() => match event {
-                        Some((event, json)) => {
-                            batch.push((event, json));
+                        Some(event) => {
+                            batch.push(event);
                             if batch.len() >= batch_size {
                                 // A panic in candidate lookup must not kill
                                 // the bus (which would silently stop all live
@@ -2876,10 +2946,12 @@ impl Relay {
 
     /// Queues an event for live delivery to subscribers. Backpressure from
     /// the bounded live buffer is propagated to the accepting task so an
-    /// accepted event is never silently lost before fan-out. The JSON is
-    /// encoded once here — every subscriber shares the same serialization.
-    /// Accepts an [`Arc<Event>`] (or an owned [`Event`]) so the accept path
-    /// can share one allocation with the database write.
+    /// accepted event is never silently lost before fan-out. The queue holds
+    /// the shared [`Event`] only; the live bus encodes the JSON once per
+    /// batch and only when the subscription index has a candidate, so an
+    /// event with no live subscriber costs no serialization. Accepts an
+    /// [`Arc<Event>`] (or an owned [`Event`]) so the accept path can share
+    /// one allocation with the database write.
     pub async fn broadcast(&self, event: impl Into<Arc<Event>>) -> Result<(), ()> {
         broadcast_with(&self.live_tx, &self.stats, event.into()).await
     }
@@ -5460,7 +5532,7 @@ impl Relay {
 
     /// Marks the group snapshot dirty and wakes the debounced worker (see
     /// [`SnapshotPersist`]). The hot mutation paths use this instead of
-    /// [`Self::persist_groups`]: the clone+serialize is coalesced into one
+    /// [`Self::persist_groups`]: the serialization is coalesced into one
     /// background pass, and a skipped save is detected at startup through
     /// the database sequence.
     fn schedule_groups_persist(&self) {

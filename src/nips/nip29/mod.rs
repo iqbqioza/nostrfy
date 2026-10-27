@@ -665,33 +665,90 @@ pub(crate) struct BuzzGroupBackup {
     pub roles: HashMap<String, HashSet<String>>,
 }
 
-impl BuzzBackup {
-    pub(crate) fn from_snapshot(snapshot: &GroupsSnapshot) -> Self {
-        let mut groups = HashMap::new();
-        for (gid, group) in &snapshot.groups {
-            // A plain-origin group with no Buzz provenance replays its
-            // roles with plain semantics, so it does not need a backup.
-            if !group.buzz_metadata && group.guests.is_empty() && group.bots.is_empty() {
-                continue;
-            }
-            groups.insert(
-                gid.clone(),
-                BuzzGroupBackup {
-                    create_id: group.create_id.clone(),
+/// Borrowed form of [`GroupsSnapshot`] used to write the DM backup without
+/// cloning every DM group (and its member/role maps) just to filter it.
+#[derive(serde::Serialize)]
+struct DmBackupRef<'a> {
+    groups: HashMap<&'a str, &'a Group>,
+    deleted: &'a HashSet<String>,
+    ghost: &'a HashSet<String>,
+    stamp: u64,
+    seq: u64,
+    buzz_enabled: Option<bool>,
+}
+
+/// Serializes the DM-only snapshot. The backup carries the same generation
+/// as the main snapshot and is only consulted when the main snapshot is
+/// missing; the JSON shape matches [`GroupsSnapshot`].
+pub(crate) fn dm_backup_json(
+    groups: &HashMap<String, Group>,
+    stamp: u64,
+    seq: u64,
+    buzz_enabled: Option<bool>,
+) -> serde_json::Result<Vec<u8>> {
+    let empty = HashSet::new();
+    let view = DmBackupRef {
+        groups: groups
+            .iter()
+            .filter(|(_, group)| group.channel_type == "dm")
+            .map(|(gid, group)| (gid.as_str(), group))
+            .collect(),
+        deleted: &empty,
+        ghost: &empty,
+        stamp,
+        seq,
+        buzz_enabled,
+    };
+    serde_json::to_vec(&view)
+}
+
+/// Borrowed form of [`BuzzBackup`] so the additive backup can be encoded
+/// without cloning the guest/bot sets and role maps of every group.
+#[derive(serde::Serialize)]
+struct BuzzBackupRef<'a> {
+    stamp: u64,
+    seq: u64,
+    groups: HashMap<&'a str, BuzzGroupBackupRef<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct BuzzGroupBackupRef<'a> {
+    create_id: Option<&'a str>,
+    buzz_metadata: bool,
+    creator_role_explicit: bool,
+    guests: &'a HashSet<String>,
+    bots: &'a HashSet<String>,
+    roles: &'a HashMap<String, HashSet<String>>,
+}
+
+/// Serializes the Buzz-specific backup directly from the snapshot. Groups
+/// with no Buzz provenance are omitted, matching the previous owned-copy
+/// builder; the JSON shape is unchanged for the loader.
+pub(crate) fn buzz_backup_json(
+    groups: &HashMap<String, Group>,
+    stamp: u64,
+    seq: u64,
+) -> serde_json::Result<Vec<u8>> {
+    let groups = groups
+        .iter()
+        .filter(|(_, group)| {
+            group.buzz_metadata || !group.guests.is_empty() || !group.bots.is_empty()
+        })
+        .map(|(gid, group)| {
+            (
+                gid.as_str(),
+                BuzzGroupBackupRef {
+                    create_id: group.create_id.as_deref(),
                     buzz_metadata: group.buzz_metadata,
                     creator_role_explicit: group.creator_role_explicit,
-                    guests: group.guests.clone(),
-                    bots: group.bots.clone(),
-                    roles: group.members.clone(),
+                    guests: &group.guests,
+                    bots: &group.bots,
+                    roles: &group.members,
                 },
-            );
-        }
-        Self {
-            stamp: snapshot.stamp,
-            seq: snapshot.seq,
-            groups,
-        }
-    }
+            )
+        })
+        .collect();
+    serde_json::to_vec(&BuzzBackupRef { stamp, seq, groups })
 }
 
 /// Verifies that a rebuild page delivered every event of its boundary
@@ -735,6 +792,7 @@ impl GroupStore {
     /// Persisted snapshot of the group state (see the `GROUP` table): the
     /// live groups plus the delete/ghost markers. `max_groups` is config,
     /// not state, and is never persisted.
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> GroupsSnapshot {
         GroupsSnapshot {
             groups: self.groups.clone(),
@@ -747,6 +805,42 @@ impl GroupStore {
             seq: 0,
             buzz_enabled: Some(self.buzz_enabled),
         }
+    }
+
+    /// Serializes the three persisted group copies (main snapshot, DM
+    /// backup, Buzz backup) directly from the live store, using borrowed
+    /// views. This is the hot persistence path: the previous
+    /// `snapshot()` + DM/Buzz clone materialized three additional copies of
+    /// every group's member/role maps before the database even saw the
+    /// bytes, which doubled the peak memory of a large group store. The
+    /// caller holds the read guard across this call, so the three copies
+    /// describe one consistent state.
+    pub(crate) fn encode_persisted(
+        &self,
+        stamp: u64,
+        seq: u64,
+    ) -> serde_json::Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        #[derive(serde::Serialize)]
+        struct SnapshotRef<'a> {
+            groups: &'a HashMap<String, Group>,
+            deleted: &'a HashSet<String>,
+            ghost: &'a HashSet<String>,
+            stamp: u64,
+            seq: u64,
+            buzz_enabled: Option<bool>,
+        }
+        let snapshot = SnapshotRef {
+            groups: &self.groups,
+            deleted: &self.deleted,
+            ghost: &self.ghost,
+            stamp,
+            seq,
+            buzz_enabled: Some(self.buzz_enabled),
+        };
+        let data = serde_json::to_vec(&snapshot)?;
+        let dm = dm_backup_json(&self.groups, stamp, seq, Some(self.buzz_enabled))?;
+        let buzz = buzz_backup_json(&self.groups, stamp, seq)?;
+        Ok((data, dm, buzz))
     }
 
     /// Merges DM groups carried across a migration rebuild. The rebuilt
