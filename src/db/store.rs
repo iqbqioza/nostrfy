@@ -1310,9 +1310,16 @@ impl Store {
             buzz_enabled: snap.buzz_enabled,
         };
         let dm_data = serde_json::to_vec(&dm_snapshot)?;
+        // Buzz provenance, guest/bot tiers and separate role grants are
+        // snapshot-only for plain-mode replay. Stamp the additive copy with
+        // the same generation so a later rebuild only applies it when no
+        // intervening state removal/event can make it stale.
+        let buzz_data = serde_json::to_vec(&crate::nips::nip29::BuzzBackup::from_snapshot(snap))?;
         let mut wtxn = self.env.write_txn()?;
         self.groups.put(&mut wtxn, b"groups:snapshot", &data)?;
         self.groups.put(&mut wtxn, b"groups:dm_backup", &dm_data)?;
+        self.groups
+            .put(&mut wtxn, b"groups:buzz_backup", &buzz_data)?;
         self.commit(wtxn)?;
         Ok(())
     }
@@ -1328,6 +1335,7 @@ impl Store {
         // clear means the live state is stale, so the backup must not be
         // eligible for a later merge either.
         self.groups.delete(&mut wtxn, b"groups:dm_backup")?;
+        self.groups.delete(&mut wtxn, b"groups:buzz_backup")?;
         self.commit(wtxn)?;
         Ok(())
     }
@@ -1349,6 +1357,16 @@ impl Store {
     pub(crate) fn load_dm_backup(&self) -> Result<Option<crate::nips::nip29::GroupsSnapshot>> {
         let rtxn = self.env.read_txn()?;
         let Some(raw) = self.groups.get(&rtxn, b"groups:dm_backup")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(raw)?))
+    }
+
+    /// Loads the same-transaction Buzz-specific backup written by
+    /// [`Self::save_groups`]. `None` means no backup exists.
+    pub(crate) fn load_buzz_backup(&self) -> Result<Option<crate::nips::nip29::BuzzBackup>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.groups.get(&rtxn, b"groups:buzz_backup")? else {
             return Ok(None);
         };
         Ok(Some(serde_json::from_slice(raw)?))

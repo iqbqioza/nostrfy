@@ -116,6 +116,73 @@ fn dm_snapshot_merge_only_fills_missing_dm_groups() {
 }
 
 #[test]
+fn buzz_backup_restores_metadata_without_adding_members() {
+    let mut store = GroupStore::with_cap(100);
+    let mut group = Group {
+        create_id: Some("aa".repeat(32)),
+        channel_type: "stream".into(),
+        ..Group::default()
+    };
+    group
+        .members
+        .insert(USER.into(), std::iter::once("admin".to_string()).collect());
+    store.groups.insert("g1".into(), group);
+    let mut recreated = Group {
+        create_id: Some("bb".repeat(32)),
+        ..Group::default()
+    };
+    recreated
+        .members
+        .insert(USER.into(), std::collections::HashSet::new());
+    store.groups.insert("recreated".into(), recreated);
+
+    let backup = BuzzBackup {
+        stamp: 0,
+        seq: 0,
+        groups: std::collections::HashMap::from([
+            (
+                "g1".into(),
+                BuzzGroupBackup {
+                    create_id: Some("aa".repeat(32)),
+                    buzz_metadata: true,
+                    creator_role_explicit: true,
+                    guests: std::collections::HashSet::from([USER.to_string()]),
+                    bots: std::collections::HashSet::from([ADMIN.to_string()]),
+                    roles: std::collections::HashMap::from([(
+                        USER.to_string(),
+                        std::collections::HashSet::from(["owner".to_string()]),
+                    )]),
+                },
+            ),
+            (
+                "recreated".into(),
+                BuzzGroupBackup {
+                    create_id: Some("cc".repeat(32)),
+                    ..BuzzGroupBackup::default()
+                },
+            ),
+        ]),
+    };
+    assert!(store.merge_buzz_backup(backup));
+    let group = &store.groups["g1"];
+    assert!(group.buzz_metadata);
+    assert!(group.creator_role_explicit);
+    assert!(
+        group.members[USER].contains("owner"),
+        "the snapshot role grant must replace the plain replay"
+    );
+    assert!(group.guests.contains(USER));
+    assert!(
+        !group.bots.contains(ADMIN),
+        "a backup must not add a member the rebuild does not have"
+    );
+    assert!(
+        !store.groups["recreated"].buzz_metadata,
+        "a deleted/recreated group must not inherit the old incarnation's metadata"
+    );
+}
+
+#[test]
 fn same_second_removal_uses_arrival_sequence() {
     let mut remove = event(
         REMOVE_USER,

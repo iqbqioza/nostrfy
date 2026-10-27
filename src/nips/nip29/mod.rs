@@ -631,6 +631,69 @@ pub(crate) struct GroupsSnapshot {
     pub buzz_enabled: Option<bool>,
 }
 
+/// The additive, snapshot-generation-stamped copy of the Buzz-specific
+/// group state. A plain-mode event rebuild cannot reconstruct the guest/bot
+/// tiers, separate role grants, or the `buzz_metadata` provenance, so this
+/// backup restores them only when its generation still matches the rebuilt
+/// events.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BuzzBackup {
+    #[serde(default)]
+    pub stamp: u64,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub groups: HashMap<String, BuzzGroupBackup>,
+}
+
+/// The per-group subset carried by [`BuzzBackup`]. Membership is not used to
+/// add or remove members; only roles of members the event rebuild already
+/// has are restored.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BuzzGroupBackup {
+    #[serde(default)]
+    pub create_id: Option<String>,
+    #[serde(default)]
+    pub buzz_metadata: bool,
+    #[serde(default)]
+    pub creator_role_explicit: bool,
+    #[serde(default)]
+    pub guests: HashSet<String>,
+    #[serde(default)]
+    pub bots: HashSet<String>,
+    #[serde(default)]
+    pub roles: HashMap<String, HashSet<String>>,
+}
+
+impl BuzzBackup {
+    pub(crate) fn from_snapshot(snapshot: &GroupsSnapshot) -> Self {
+        let mut groups = HashMap::new();
+        for (gid, group) in &snapshot.groups {
+            // A plain-origin group with no Buzz provenance replays its
+            // roles with plain semantics, so it does not need a backup.
+            if !group.buzz_metadata && group.guests.is_empty() && group.bots.is_empty() {
+                continue;
+            }
+            groups.insert(
+                gid.clone(),
+                BuzzGroupBackup {
+                    create_id: group.create_id.clone(),
+                    buzz_metadata: group.buzz_metadata,
+                    creator_role_explicit: group.creator_role_explicit,
+                    guests: group.guests.clone(),
+                    bots: group.bots.clone(),
+                    roles: group.members.clone(),
+                },
+            );
+        }
+        Self {
+            stamp: snapshot.stamp,
+            seq: snapshot.seq,
+            groups,
+        }
+    }
+}
+
 /// Verifies that a rebuild page delivered every event of its boundary
 /// second. The scan collector has hard caps (twice the page size for
 /// same-timestamp ties, 64 MiB of content) that can cut a second while
@@ -706,6 +769,57 @@ impl GroupStore {
         }
         if changed {
             self.recompute_derived();
+        }
+        changed
+    }
+
+    /// Restores the Buzz-specific snapshot fields that the plain event
+    /// replay cannot reconstruct. The create id must still match, so a
+    /// deleted/recreated group never inherits the old incarnation's tiers
+    /// or roles; membership itself is never added or removed here.
+    pub(crate) fn merge_buzz_backup(&mut self, backup: BuzzBackup) -> bool {
+        let mut changed = false;
+        for (gid, entry) in backup.groups {
+            let Some(group) = self.groups.get_mut(&gid) else {
+                continue;
+            };
+            if group.create_id != entry.create_id {
+                continue;
+            }
+            for (pubkey, roles) in entry.roles {
+                if let Some(current) = group.members.get_mut(&pubkey)
+                    && *current != roles
+                {
+                    *current = roles;
+                    changed = true;
+                }
+            }
+            let guests: HashSet<String> = entry
+                .guests
+                .into_iter()
+                .filter(|pubkey| group.members.contains_key(pubkey))
+                .collect();
+            if group.guests != guests {
+                group.guests = guests;
+                changed = true;
+            }
+            let bots: HashSet<String> = entry
+                .bots
+                .into_iter()
+                .filter(|pubkey| group.members.contains_key(pubkey))
+                .collect();
+            if group.bots != bots {
+                group.bots = bots;
+                changed = true;
+            }
+            if entry.buzz_metadata && !group.buzz_metadata {
+                group.buzz_metadata = true;
+                changed = true;
+            }
+            if group.creator_role_explicit != entry.creator_role_explicit {
+                group.creator_role_explicit = entry.creator_role_explicit;
+                changed = true;
+            }
         }
         changed
     }

@@ -255,19 +255,23 @@ host, because Buzz signs the relay URL it uploads to.
 - If Buzz is disabled and the group state has to be rebuilt from events,
   the create's privacy floor is kept and a Buzz-created channel that carries
   a `channel_type`/`visibility` marker keeps its channel type and metadata.
-  Guest/bot tiers and separate `role` tag grants are replayed with plain
-  NIP-29 semantics and may be lost; the normal snapshot restore keeps them.
-  A plain-mode full `9002` on a Buzz-origin channel is replayed as a Buzz
-  partial edit, so an omitted `parent`/`child`, `supported_kinds` or other
-  field is preserved rather than cleared; use explicit empty values where
-  the field supports one, or keep the snapshot. This is the replay
+  The same-transaction `groups:buzz_backup` restores the `buzz_metadata`
+  provenance, guest/bot tiers and separate `role` grants for matching
+  groups when its generation still matches; a new database or a migration
+  without that backup replays them with plain NIP-29 semantics and may lose
+  them. A plain-mode full `9002` on a Buzz-origin channel is replayed as a
+  Buzz partial edit, so an omitted `parent`/`child`, `supported_kinds` or
+  other field is preserved rather than cleared; use explicit empty values
+  where the field supports one, or keep the snapshot. This is the replay
   counterpart of the live privacy floor.
 - The `buzz_metadata` provenance of a plain-origin group edited while Buzz
-  was enabled is snapshot-backed. A snapshot-less rebuild can infer Buzz
-  origin from `channel_type` or a `visibility=private` edit, but not from a
-  Buzz edit that carried only ordinary fields (for example a name-only
-  rename); such a group falls back to plain whole-metadata replay and may
-  lose its privacy floor. Keep the snapshot if this transition matters.
+  was enabled is snapshot-backed. A snapshot-less rebuild can recover the
+  marker from the additive `groups:buzz_backup` when the generation still
+  matches; without it, inference from `channel_type` or a
+  `visibility=private` edit covers most cases, but not a Buzz edit that
+  carried only ordinary fields (for example a name-only rename). Such a
+  group then falls back to plain whole-metadata replay and may lose its
+  privacy floor.
 - Plain-mode events imported from an older database or migration may still
   carry `channel_type`/`visibility` even though new plain-mode submissions
   reject them. The history replay applies their privacy floor; the live

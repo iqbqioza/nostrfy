@@ -886,10 +886,11 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
         relay.persist_groups().await;
         return Ok(());
     }
-    // The main snapshot is absent/stale, but the same-transaction DM
-    // backup may still be current. Merge it before this rebuild's snapshot
-    // write replaces the backup with the event-derived (DM-less) state.
+    // The main snapshot is absent/stale, but the same-transaction DM and
+    // Buzz backups may still be current. Merge them before this rebuild's
+    // snapshot write replaces the backups with event-derived state.
     merge_dm_backup(relay).await?;
+    merge_buzz_backup(relay).await?;
     // The rebuilt state has no (or stale) relay-signed metadata: publish the
     // current 39000/39001/39002/39005 for every group so clients can see
     // them (a migrated database never had them).
@@ -1022,6 +1023,49 @@ async fn restore_dm_backup(relay: &Relay) -> Result<()> {
     if merge_dm_backup(relay).await? && !relay.persist_groups().await {
         log::warn!(
             "could not persist the restored DM backup; the backup remains for the next startup"
+        );
+    }
+    Ok(())
+}
+
+/// Restores the Buzz-specific group fields (provenance, guest/bot tiers and
+/// separate role grants) that a plain-mode event replay cannot reconstruct.
+/// The backup is generation-stamped with the snapshot, so a rebuild after a
+/// later state removal/event rejects it.
+async fn merge_buzz_backup(relay: &Relay) -> Result<bool> {
+    if relay.groups.read().await.is_unrestored() {
+        return Ok(false);
+    }
+    let Some(backup) = relay.db.load_buzz_backup().await else {
+        log::warn!("could not read the Buzz backup; continuing with the replayed group state");
+        return Ok(false);
+    };
+    let Some(backup) = backup else {
+        return Ok(false);
+    };
+    let Some(stamp) = relay.db.state_stamp().await else {
+        log::warn!("could not verify the Buzz backup generation; skipping it");
+        return Ok(false);
+    };
+    let Some(seq) = relay.db.state_seq_group().await else {
+        log::warn!("could not verify the Buzz backup sequence; skipping it");
+        return Ok(false);
+    };
+    if !crate::nips::nip29::GroupStore::snapshot_is_current(backup.stamp, stamp)
+        || !crate::nips::nip29::GroupStore::snapshot_is_current(backup.seq, seq)
+    {
+        log::warn!(
+            "discarding a stale Buzz backup: it predates the current group-state generation"
+        );
+        return Ok(false);
+    }
+    Ok(relay.groups.write().await.merge_buzz_backup(backup))
+}
+
+async fn restore_buzz_backup(relay: &Relay) -> Result<()> {
+    if merge_buzz_backup(relay).await? && !relay.persist_groups().await {
+        log::warn!(
+            "could not persist the restored Buzz backup; the backup remains for the next startup"
         );
     }
     Ok(())
@@ -1574,6 +1618,7 @@ pub async fn run_server(
         relay.finish_startup_group_recovery().await;
         restore_dm_carry(&relay).await?;
         restore_dm_backup(&relay).await?;
+        restore_buzz_backup(&relay).await?;
         backfill_group_epochs(&relay).await?;
         purge_expired_group_messages(&relay).await?;
     }

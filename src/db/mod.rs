@@ -740,6 +740,11 @@ enum Msg {
     LoadDmBackup {
         reply: oneshot::Sender<Option<Option<crate::nips::nip29::GroupsSnapshot>>>,
     },
+    /// Loads the same-transaction Buzz-specific backup. `None` from the
+    /// client means the read failed; an inner `None` means no backup exists.
+    LoadBuzzBackup {
+        reply: oneshot::Sender<Option<Option<crate::nips::nip29::BuzzBackup>>>,
+    },
     /// Drops the persisted NIP-29 group state snapshot (a post-vanish
     /// rebuild failure must not leave a stale snapshot behind). The reply
     /// reports whether the commit succeeded: an overload fail-fast must not
@@ -3004,6 +3009,14 @@ impl DbClient {
     /// no backup was ever written (or it was cleared with the snapshot).
     pub async fn load_dm_backup(&self) -> Option<Option<crate::nips::nip29::GroupsSnapshot>> {
         self.request_read_blocking(|reply| Msg::LoadDmBackup { reply })
+            .await
+    }
+
+    /// Loads the Buzz-specific backup written atomically with the last
+    /// group snapshot. The outer `Option` reports a failed read; the inner
+    /// one reports that no backup was ever written (or it was cleared).
+    pub async fn load_buzz_backup(&self) -> Option<Option<crate::nips::nip29::BuzzBackup>> {
+        self.request_read_blocking(|reply| Msg::LoadBuzzBackup { reply })
             .await
     }
 

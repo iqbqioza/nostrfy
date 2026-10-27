@@ -7114,6 +7114,67 @@ fn group_snapshot_writes_a_dm_backup() {
 }
 
 #[test]
+fn group_snapshot_writes_a_buzz_backup() {
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8)
+        .expect("database must open");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
+        let mut plain = crate::nips::nip29::Group::default();
+        plain
+            .members
+            .insert("aa".repeat(32), std::collections::HashSet::new());
+        snapshot.groups.insert("plain".into(), plain);
+        let mut buzz = crate::nips::nip29::Group {
+            buzz_metadata: true,
+            creator_role_explicit: true,
+            create_id: Some("cc".repeat(32)),
+            ..crate::nips::nip29::Group::default()
+        };
+        buzz.members.insert(
+            "bb".repeat(32),
+            std::iter::once("owner".to_string()).collect(),
+        );
+        buzz.members.insert(
+            "cc".repeat(32),
+            std::iter::once("guest".to_string()).collect(),
+        );
+        buzz.guests.insert("cc".repeat(32));
+        buzz.bots.insert("dd".repeat(32));
+        snapshot.groups.insert("buzz".into(), buzz);
+        snapshot.stamp = 51;
+        snapshot.seq = 9;
+        assert!(db.save_groups(snapshot).await);
+        let backup = db
+            .load_buzz_backup()
+            .await
+            .expect("Buzz backup read must answer")
+            .expect("a Buzz backup must exist");
+        assert_eq!(backup.stamp, 51);
+        assert_eq!(backup.seq, 9);
+        assert!(backup.groups.contains_key("buzz"));
+        assert!(!backup.groups.contains_key("plain"));
+        let entry = &backup.groups["buzz"];
+        assert!(entry.buzz_metadata);
+        assert!(entry.guests.contains("cc".repeat(32).as_str()));
+        assert!(entry.bots.contains("dd".repeat(32).as_str()));
+        assert!(
+            entry.roles["bb".repeat(32).as_str()].contains("owner"),
+            "separate role grants must be carried"
+        );
+        assert!(db.clear_groups_snapshot().await);
+        assert!(
+            db.load_buzz_backup()
+                .await
+                .expect("Buzz backup read must answer")
+                .is_none(),
+            "a fail-closed snapshot clear must clear the Buzz backup too"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
 fn sixteen_max_dbs_still_opens_with_the_word_index() {
     // 23 named tables are created (22 base tables plus the word index); an
     // operator value of 16 must not fail at startup (the clamp raises it to
