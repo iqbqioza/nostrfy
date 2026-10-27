@@ -7,13 +7,29 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/iqbqioza/nostrfy"
 
 [dependencies]
-axum = { version = "0.8", features = ["ws"] }
+# Only the extractors/routes the relay uses: the defaults additionally pull
+# form, matched-path, tower-log and axum's tracing bridge.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "original-uri",
+    "query",
+    "tokio",
+    "ws",
+] }
 tungstenite = { version = "0.29", default-features = false }
 base64 = "0.23"
 bytes = "1"
-clap = { version = "4", features = ["derive"] }
+# No color/suggestions: the relay prints plain logs, and dropping them
+# removes anstream/colorchoice and strsim from the build.
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
 daemonize = "0.5"
-env_logger = "0.11"
 futures-util = "0.3"
 getrandom = "0.4"
 # `read-txn-no-tls` makes heed open LMDB environments with MDB_NOTLS: without
@@ -22,11 +38,13 @@ getrandom = "0.4"
 # FreeBSD CI opens enough environments to exhaust the (small) pthread key
 # table, making `mdb_env_open` fail with EAGAIN. MDB_NOTLS is safe here: every
 # read transaction is created and dropped on the same database thread.
-heed = { version = "0.21", features = ["read-txn-no-tls"] }
+heed = { version = "0.21", default-features = false, features = ["read-txn-no-tls"] }
 hex = "0.4"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "service", "http1", "http2"] }
+# The server is HTTP/1 only (WebSocket-over-h2 is not routed), so the
+# client-side HTTP/2 stack stays out of this crate's feature set.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
 libc = "0.2"
 log = "0.4"
 # 0.33 signs and verifies through the static context, so the relay no longer
@@ -42,11 +60,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tower = { version = "0.5", features = ["util"] }
 # On-the-fly Brotli for Blossom media/JSON responses. Only the Brotli
 # feature is enabled: the layer negotiates `Accept-Encoding` itself.
-tower-http = { version = "0.6", features = ["compression-br"] }
+tower-http = { version = "0.6", default-features = false, features = ["compression-br"] }
 toml = "1.1"
 # `nostrfy upgrade`: fetches the latest release binary (and the latest
-# version tag) over HTTPS with rustls; no other network use.
-ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+# version tag) over HTTPS with rustls; no other network use. The raw binary
+# asset is not gzip-compressed, and without the gzip feature ureq does not
+# advertise it, so GitHub answers identity and flate2 stays out of the build.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 anyhow = "1.0.104"
 
 # Release build tuning: LTO is off on purpose. The hot paths live in C
@@ -104,4 +124,6 @@ opt-level = 1
 
 [dev-dependencies]
 brotli = "9"
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# Match axum's tokio-tungstenite version so the test client does not pull a
+# second copy; the tests only use ws://, so no TLS feature is needed.
+tokio-tungstenite = "0.29"
