@@ -22,6 +22,19 @@ use crate::stats::Stats;
 /// Secondary bound on the number of queued messages (a long tail of small
 /// messages must not outgrow the VecDeque either).
 const OUT_QUEUE_LIMIT: usize = 4096;
+
+/// Release the outgoing frame queue's backing storage once it is empty and
+/// once grew past this many frames. A slow client can temporarily queue
+/// thousands of tiny frames up to the byte cap; keeping that capacity after
+/// the drain would pin it for the rest of the connection's life. Small
+/// queues are left alone so a normal request does not reallocate on every
+/// drain.
+const OUTGOING_SHRINK_THRESHOLD: usize = 1024;
+
+/// Release an empty subscription/pending map that once held more than this
+/// many entries. The maps are small in normal use; this only frees the
+/// capacity a large subscription burst left behind.
+const MAP_SHRINK_THRESHOLD: usize = 8;
 /// Events queued on a connection before they are accepted as one database
 /// batch (the batch shares a single write commit).
 pub(crate) const EVENT_BATCH: usize = 64;
@@ -530,6 +543,10 @@ pub struct Conn {
     /// events). A duplicate delivery of an event that is both in the query
     /// result and live is harmless (clients deduplicate by id).
     pub(crate) live: Option<tokio::sync::mpsc::Receiver<LiveBatch>>,
+    /// The overflow signal shared with the relay's live-queue map. Kept
+    /// even while no live queue exists, so a lazily created/recreated queue
+    /// reuses the same watch receiver held by the connection loop.
+    pub(crate) overflow_tx: tokio::sync::watch::Sender<()>,
     /// The connection's id in the relay's live subscription index and
     /// delivery-queue map.
     pub(crate) conn_id: u64,
@@ -596,6 +613,65 @@ pub struct Conn {
 pub(crate) type LiveBatch = Arc<Vec<(Arc<crate::event::Event>, Arc<String>)>>;
 
 impl Conn {
+    /// Drops oversized backing allocations that an idle connection no
+    /// longer needs. Called after a successful drain: the socket queue is
+    /// empty there, so shrinking cannot move a frame that is still queued.
+    pub(crate) fn shrink_idle_buffers(&mut self) {
+        if self.outgoing.is_empty() && self.outgoing.capacity() > OUTGOING_SHRINK_THRESHOLD {
+            self.outgoing.shrink_to_fit();
+        }
+        if self.pending_reqs.is_empty() && self.pending_reqs.capacity() > MAP_SHRINK_THRESHOLD {
+            self.pending_reqs.shrink_to_fit();
+        }
+        if self.subs.is_empty() && self.subs.capacity() > MAP_SHRINK_THRESHOLD {
+            self.subs.shrink_to_fit();
+        }
+        if self.neg.is_empty() && self.neg.capacity() > MAP_SHRINK_THRESHOLD {
+            self.neg.shrink_to_fit();
+        }
+        if self.authed_pubkeys.is_empty() && self.authed_pubkeys.capacity() > MAP_SHRINK_THRESHOLD {
+            self.authed_pubkeys.shrink_to_fit();
+        }
+    }
+
+    /// Creates the per-connection live queue on the first subscription.
+    /// Every accepted connection used to allocate a 512-slot channel (and a
+    /// `conn_queues` entry) even when it never sent REQ; the channel is now
+    /// created lazily and dropped again when the last subscription closes.
+    pub(crate) fn ensure_live_queue(&mut self) {
+        if self.live.is_some() {
+            return;
+        }
+        let (live_tx, live_rx) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+        self.relay
+            .conn_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                self.conn_id,
+                crate::relay::LiveQueue {
+                    sender: live_tx,
+                    overflow: self.overflow_tx.clone(),
+                },
+            );
+        self.live = Some(live_rx);
+    }
+
+    /// Releases the live queue once the connection has no subscriptions.
+    /// The queue sender is removed from the relay map; a bus delivery that
+    /// already cloned it simply fails to send and is ignored. A later REQ
+    /// creates a fresh queue/channel.
+    fn release_live_queue_if_idle(&mut self) {
+        if self.live.is_some() && self.subs.is_empty() {
+            self.live = None;
+            self.relay
+                .conn_queues
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.conn_id);
+        }
+    }
+
     pub(crate) fn send(&mut self, msg: Message) {
         self.send_tagged(msg, None);
     }
@@ -1336,6 +1412,10 @@ where
             conn.out_bytes = conn.out_bytes.saturating_sub(size);
         }
         let _ = sender.flush().await;
+        // The queue is empty here: a large response that briefly grew the
+        // frame deque (or a subscription burst that grew the maps) must not
+        // pin its capacity for the rest of an idle connection.
+        conn.shrink_idle_buffers();
         true
     };
     let idle = async {
@@ -1656,22 +1736,11 @@ pub async fn handle_connection(
     let idle_sleep: Option<tokio::time::Sleep> =
         idle.map(|d| tokio::time::sleep_until(tokio::time::Instant::now() + d + idle_jitter));
     let mut idle_sleep = idle_sleep.map(Box::pin);
-    let (live_tx, live_rx): (
-        tokio::sync::mpsc::Sender<crate::ws::LiveBatch>,
-        tokio::sync::mpsc::Receiver<crate::ws::LiveBatch>,
-    ) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+    // The live channel is created lazily on the first REQ (see
+    // `ensure_live_queue`): an idle connection that never subscribes must not
+    // allocate a 512-slot queue. The overflow watch exists for the queue's
+    // lifetime, so the loop's receiver is created once here.
     let (overflow_tx, mut overflow_rx) = tokio::sync::watch::channel(());
-    relay
-        .conn_queues
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(
-            conn_id,
-            crate::relay::LiveQueue {
-                sender: live_tx,
-                overflow: overflow_tx,
-            },
-        );
     let mut conn = Conn {
         pending_budget: pending_response_budget(&relay),
         neg_budget: neg_budget(&relay),
@@ -1679,7 +1748,8 @@ pub async fn handle_connection(
         relay,
         conn_id,
         subscriptions_held,
-        live: Some(live_rx),
+        live: None,
+        overflow_tx,
         path,
         outgoing: std::collections::VecDeque::new(),
         control_overflowed: false,
@@ -2414,19 +2484,7 @@ mod tests {
         let conn_id = relay
             .next_conn_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (live_tx, live_rx) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
         let (overflow_tx, _overflow_rx) = tokio::sync::watch::channel(());
-        relay
-            .conn_queues
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(
-                conn_id,
-                crate::relay::LiveQueue {
-                    sender: live_tx,
-                    overflow: overflow_tx,
-                },
-            );
         let (max_sub_id_len, protocol_max_write, idle_timeout_secs) = {
             let cfg = relay.config.read().await;
             (
@@ -2442,7 +2500,8 @@ mod tests {
             relay,
             conn_id,
             subscriptions_held: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            live: Some(live_rx),
+            live: None,
+            overflow_tx,
             path: "/".into(),
             outgoing: std::collections::VecDeque::new(),
             control_overflowed: false,
@@ -2540,6 +2599,76 @@ mod tests {
     }
 
     /// Every queued outgoing text message parsed as JSON.
+    #[tokio::test]
+    async fn live_queue_is_lazy_and_released_after_the_last_close() {
+        // An accepted connection that never subscribes must not allocate a
+        // live queue; the queue is created on the first REQ and released
+        // again when its last subscription closes.
+        let mut conn = build_conn().await;
+        assert!(conn.live.is_none(), "no queue before the first REQ");
+        assert!(
+            conn.relay
+                .conn_queues
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "no queue map entry before the first REQ"
+        );
+        conn.handle_req(&[json!("s"), json!({"kinds": [1]})]).await;
+        assert!(conn.live.is_some(), "the first REQ creates the queue");
+        assert_eq!(
+            conn.relay
+                .conn_queues
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1
+        );
+        conn.handle_close(&[json!("s")]);
+        assert!(
+            conn.live.is_none(),
+            "the last CLOSE releases the live queue"
+        );
+        assert!(
+            conn.relay
+                .conn_queues
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "the queue map entry must be removed"
+        );
+        conn.relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn idle_buffers_release_large_capacities() {
+        // A large response or subscription burst must not pin its backing
+        // allocation for the rest of an idle connection.
+        let mut conn = build_conn().await;
+        while conn.outgoing.len() <= OUTGOING_SHRINK_THRESHOLD {
+            conn.outgoing.push_back(OutFrame {
+                message: Message::Text("x".into()),
+                event_sub: None,
+            });
+        }
+        for i in 0..=MAP_SHRINK_THRESHOLD {
+            conn.subs
+                .insert(format!("s{i}"), (Vec::new(), 0, String::new()));
+        }
+        conn.outgoing.clear();
+        conn.subs.clear();
+        conn.shrink_idle_buffers();
+        assert!(
+            conn.outgoing.capacity() <= OUTGOING_SHRINK_THRESHOLD,
+            "an emptied large outgoing queue must release its capacity"
+        );
+        assert!(
+            conn.subs.capacity() <= MAP_SHRINK_THRESHOLD,
+            "an emptied large subscription map must release its capacity"
+        );
+        conn.relay.db.shutdown();
+    }
+
     fn outgoing_json(conn: &Conn) -> Vec<Value> {
         conn.outgoing
             .iter()
@@ -11295,8 +11424,8 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .len(),
-                1,
-                "only the alive connection may remain"
+                0,
+                "neither connection opened a subscription: live queues are lazy"
             );
             let close_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             loop {
