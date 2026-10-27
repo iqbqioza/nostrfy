@@ -222,9 +222,11 @@ host, because Buzz signs the relay URL it uploads to.
   for every group, so the rosters do not wait for the next metadata or
   membership mutation.
 - A vanish that lands while a NIP-43 rebuild is in flight publishes a
-  remove-user event, but the full `13534` roster is not republished until
-  the next role/membership change; a client that fetches only the stored
-  roster can see the vanished identity until then.
+  remove-user event; a clean rebuild then republishes the full `13534`
+  roster even when the rebuilt store is empty and the old snapshot is
+  preserved, so the current-key roster does not keep the vanished
+  identity. A failed rebuild or failed roster publish still leaves the
+  previous list until the next retry.
 - Vanish is exempt from the publish rate limit. While a role rebuild is
   pending, each vanish force-captures a removal in the bounded replay
   buffer; a burst from fresh keys can overflow it and force another rebuild.

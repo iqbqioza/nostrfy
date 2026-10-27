@@ -1624,9 +1624,14 @@ async fn roles_rebuild_worker(
         if !empty {
             state.preserve_snapshot.store(false, Ordering::SeqCst);
         }
-        if !(empty && preserved) {
-            membership_rebuilt = true;
-        }
+        // A preserved empty rebuild still has an authoritative roster for
+        // the *current* key: the startup preserved path publishes that
+        // synthetic/empty list under the current key. Keeping an older
+        // 13534 as the newest event would leave a vanished identity visible
+        // until the next role/membership change (N43 vanity gap), so refresh
+        // it here as well. The persisted role snapshot remains protected by
+        // `preserve_snapshot`.
+        membership_rebuilt = true;
         // Persist the fresh store under the mutation-serializing lock. A
         // mutation that lands in the meantime is refused persistence (the
         // state is not established yet) and a removal clears the store
@@ -14976,6 +14981,37 @@ mod tests {
                 stored.len()
             );
         }
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_empty_preserved_rebuild_still_refreshes_the_current_roster() {
+        // A keyless/rotated-key rebuild preserves the old persisted role
+        // snapshot, but the *published* current-key roster must still be
+        // refreshed: otherwise a vanish during the rebuild leaves the old
+        // 13534 (possibly naming the vanished identity) as the newest list.
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        relay.preserve_role_snapshot();
+        *relay.roles.write().await = RoleStore::default();
+        relay.mark_roles_stale().await;
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13534]})).unwrap();
+        let mut found = false;
+        for _ in 0..100 {
+            let (lists, _) = relay
+                .db
+                .query(vec![filter.clone()], 10, crate::util::unix_now())
+                .await;
+            if !lists.is_empty() {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            found,
+            "a clean empty preserved rebuild must publish a current-key 13534"
+        );
         relay.db.shutdown();
     }
 
