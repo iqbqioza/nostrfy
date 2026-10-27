@@ -1291,8 +1291,28 @@ impl Store {
     pub(crate) fn save_groups(&self, snap: &crate::nips::nip29::GroupsSnapshot) -> Result<()> {
         self.disk_full_error()?;
         let data = serde_json::to_vec(snap)?;
+        // Keep a same-transaction backup of DM groups. DMs have no stored
+        // 9007/9000, so a lost main snapshot would otherwise rebuild every
+        // other group and permanently lose the DM channels. The backup is
+        // only consulted after the main snapshot is missing and its
+        // stamp/sequence still match the database generation.
+        let dm_snapshot = crate::nips::nip29::GroupsSnapshot {
+            groups: snap
+                .groups
+                .iter()
+                .filter(|(_, group)| group.channel_type == "dm")
+                .map(|(gid, group)| (gid.clone(), group.clone()))
+                .collect(),
+            deleted: std::collections::HashSet::new(),
+            ghost: std::collections::HashSet::new(),
+            stamp: snap.stamp,
+            seq: snap.seq,
+            buzz_enabled: snap.buzz_enabled,
+        };
+        let dm_data = serde_json::to_vec(&dm_snapshot)?;
         let mut wtxn = self.env.write_txn()?;
         self.groups.put(&mut wtxn, b"groups:snapshot", &data)?;
+        self.groups.put(&mut wtxn, b"groups:dm_backup", &dm_data)?;
         self.commit(wtxn)?;
         Ok(())
     }
@@ -1304,6 +1324,10 @@ impl Store {
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         self.groups.delete(&mut wtxn, b"groups:snapshot")?;
+        // The backup mirrors the snapshot's generation. A fail-closed
+        // clear means the live state is stale, so the backup must not be
+        // eligible for a later merge either.
+        self.groups.delete(&mut wtxn, b"groups:dm_backup")?;
         self.commit(wtxn)?;
         Ok(())
     }
@@ -1314,6 +1338,17 @@ impl Store {
     pub(crate) fn load_groups(&self) -> Result<Option<crate::nips::nip29::GroupsSnapshot>> {
         let rtxn = self.env.read_txn()?;
         let Some(raw) = self.groups.get(&rtxn, b"groups:snapshot")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(raw)?))
+    }
+
+    /// Loads the same-transaction DM backup written by [`Self::save_groups`].
+    /// `None` means no backup exists (a pre-backup database or a cleared
+    /// snapshot); the caller must not infer a missing snapshot from it.
+    pub(crate) fn load_dm_backup(&self) -> Result<Option<crate::nips::nip29::GroupsSnapshot>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.groups.get(&rtxn, b"groups:dm_backup")? else {
             return Ok(None);
         };
         Ok(Some(serde_json::from_slice(raw)?))

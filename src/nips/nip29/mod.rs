@@ -696,7 +696,11 @@ impl GroupStore {
             if group.channel_type != "dm" {
                 continue;
             }
-            if self.groups.insert(gid, group).is_none() {
+            // A rebuilt/event-derived group is authoritative for its id.
+            // The carry and the backup only fill DM ids the rebuild could
+            // not recreate, never overwrite a live group.
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.groups.entry(gid) {
+                slot.insert(group);
                 changed = true;
             }
         }

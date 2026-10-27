@@ -734,6 +734,12 @@ enum Msg {
     LoadGroups {
         reply: oneshot::Sender<LoadGroupsOutcome>,
     },
+    /// Loads the same-transaction DM backup written with the group
+    /// snapshot. `None` from the client means the read failed; an inner
+    /// `None` means no backup exists.
+    LoadDmBackup {
+        reply: oneshot::Sender<Option<Option<crate::nips::nip29::GroupsSnapshot>>>,
+    },
     /// Drops the persisted NIP-29 group state snapshot (a post-vanish
     /// rebuild failure must not leave a stale snapshot behind). The reply
     /// reports whether the commit succeeded: an overload fail-fast must not
@@ -2990,6 +2996,14 @@ impl DbClient {
     /// conflated with a first-run [`LoadGroupsOutcome::Missing`].
     pub async fn load_groups(&self) -> LoadGroupsOutcome {
         self.request_read_blocking(|reply| Msg::LoadGroups { reply })
+            .await
+    }
+
+    /// Loads the DM backup written atomically with the last group snapshot.
+    /// The outer `Option` reports a failed read; the inner one reports that
+    /// no backup was ever written (or it was cleared with the snapshot).
+    pub async fn load_dm_backup(&self) -> Option<Option<crate::nips::nip29::GroupsSnapshot>> {
+        self.request_read_blocking(|reply| Msg::LoadDmBackup { reply })
             .await
     }
 

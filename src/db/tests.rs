@@ -7071,6 +7071,49 @@ fn group_and_role_snapshots_survive_restart() {
 }
 
 #[test]
+fn group_snapshot_writes_a_dm_backup() {
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8)
+        .expect("database must open");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
+        let mut regular = crate::nips::nip29::Group::default();
+        regular
+            .members
+            .insert("aa".repeat(32), std::collections::HashSet::new());
+        snapshot.groups.insert("g1".into(), regular);
+        let mut dm = crate::nips::nip29::Group {
+            channel_type: "dm".into(),
+            ..crate::nips::nip29::Group::default()
+        };
+        dm.members
+            .insert("bb".repeat(32), std::collections::HashSet::new());
+        snapshot.groups.insert("dm1".into(), dm);
+        snapshot.stamp = 41;
+        snapshot.seq = 7;
+        assert!(db.save_groups(snapshot).await);
+        let backup = db
+            .load_dm_backup()
+            .await
+            .expect("backup read must answer")
+            .expect("a backup must exist");
+        assert!(backup.groups.contains_key("dm1"));
+        assert!(!backup.groups.contains_key("g1"));
+        assert_eq!(backup.stamp, 41);
+        assert_eq!(backup.seq, 7);
+        assert!(db.clear_groups_snapshot().await);
+        assert!(
+            db.load_dm_backup()
+                .await
+                .expect("backup read must answer")
+                .is_none(),
+            "a fail-closed snapshot clear must clear the DM backup too"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
 fn sixteen_max_dbs_still_opens_with_the_word_index() {
     // 23 named tables are created (22 base tables plus the word index); an
     // operator value of 16 must not fail at startup (the clamp raises it to

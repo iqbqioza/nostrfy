@@ -202,13 +202,19 @@ host, because Buzz signs the relay URL it uploads to.
   same-second group can exceed that cap) and returns `413` when the DB
   reports a truncated frontier instead of silently dropping older replies.
 - DM groups are derived state backed by the group snapshot: the synthetic
-  `9007`/`9000` are not stored, so a snapshot-less full rebuild (new
-  database, migration, or dropped snapshot) cannot recreate a DM channel.
-  Runtime state-removal rebuilds carry live DM groups across the swap.
-  Creation and hide now persist the snapshot synchronously before the ACK
-  (a failed save is retryable), so a crash cannot leave a current pre-DM
-  snapshot that makes the unknown channel public. Hidden-DM sets are
-  snapshot-backed for the same reason.
+  `9007`/`9000` are not stored, so the event rebuild cannot recreate a DM
+  channel. Every main snapshot save now also writes an additive
+  `groups:dm_backup` copy of the DM groups in the same LMDB transaction.
+  If the main snapshot is missing but the database generation still
+  matches, startup merges those DMs after the event rebuild; a backup that
+  predates a state removal/event is rejected. A new database, or a
+  migration with neither the main snapshot nor the backup, still has no DM
+  state; the migration carry handles its own transition. Runtime
+  state-removal rebuilds carry live DM groups across the swap. Creation and
+  hide persist the snapshot synchronously before the ACK (a failed save is
+  retryable), so a crash cannot leave a current pre-DM snapshot that makes
+  the unknown channel public. Hidden-DM sets are snapshot-backed for the
+  same reason.
 - Enabling or disabling `enabled_buzz` on an existing relay upgrades/maps
   the creator role in the restored snapshot and records the mode in the
   group snapshot. The next startup detects a mode change (including an old

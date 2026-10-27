@@ -471,6 +471,17 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(lists);
             false
         }
+        Msg::LoadDmBackup { reply } => {
+            let outcome = match store.load_dm_backup() {
+                Ok(snapshot) => Some(snapshot),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(outcome);
+            false
+        }
         Msg::LoadGroups { reply } => {
             // `Ok(None)` means no snapshot was ever written (pre-persistence
             // database): the caller runs the replay migration. An `Err`
@@ -1354,6 +1365,16 @@ pub(crate) fn spawn(
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
                                             LoadGroupsOutcome::Failed
+                                        }
+                                    };
+                                    let _ = reply.send(outcome);
+                                }
+                                Msg::LoadDmBackup { reply } => {
+                                    let outcome = match store.load_dm_backup() {
+                                        Ok(snapshot) => Some(snapshot),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
                                         }
                                     };
                                     let _ = reply.send(outcome);

@@ -62,6 +62,60 @@ fn an_explicit_creator_demotion_survives_buzz_restore() {
 }
 
 #[test]
+fn dm_snapshot_merge_only_fills_missing_dm_groups() {
+    let mut store = GroupStore::with_cap(100);
+    let mut existing = Group {
+        channel_type: "dm".into(),
+        ..Group::default()
+    };
+    existing
+        .members
+        .insert(USER.into(), std::collections::HashSet::new());
+    store.groups.insert("dm-existing".into(), existing);
+
+    let mut stale = Group {
+        channel_type: "dm".into(),
+        ..Group::default()
+    };
+    stale
+        .members
+        .insert(ADMIN.into(), std::collections::HashSet::new());
+    let mut restored = Group {
+        channel_type: "dm".into(),
+        ..Group::default()
+    };
+    restored
+        .members
+        .insert(USER.into(), std::collections::HashSet::new());
+    let mut ordinary = Group::default();
+    ordinary
+        .members
+        .insert(USER.into(), std::collections::HashSet::new());
+    let mut snapshot = GroupsSnapshot::default();
+    snapshot.groups.insert("dm-existing".into(), stale);
+    snapshot.groups.insert("dm-restored".into(), restored);
+    snapshot.groups.insert("ordinary".into(), ordinary);
+
+    assert!(store.merge_dm_snapshot(snapshot));
+    assert!(
+        store.groups["dm-existing"].is_member(USER),
+        "an authoritative existing DM must not be overwritten by the backup"
+    );
+    assert!(!store.groups["dm-existing"].is_member(ADMIN));
+    assert!(store.groups["dm-restored"].is_member(USER));
+    assert!(!store.groups.contains_key("ordinary"));
+    assert_eq!(
+        store.total_members,
+        store
+            .groups
+            .values()
+            .map(|group| group.members.len())
+            .sum::<usize>(),
+        "the derived member count must follow the merge"
+    );
+}
+
+#[test]
 fn same_second_removal_uses_arrival_sequence() {
     let mut remove = event(
         REMOVE_USER,

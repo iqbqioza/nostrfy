@@ -886,6 +886,10 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
         relay.persist_groups().await;
         return Ok(());
     }
+    // The main snapshot is absent/stale, but the same-transaction DM
+    // backup may still be current. Merge it before this rebuild's snapshot
+    // write replaces the backup with the event-derived (DM-less) state.
+    merge_dm_backup(relay).await?;
     // The rebuilt state has no (or stale) relay-signed metadata: publish the
     // current 39000/39001/39002/39005 for every group so clients can see
     // them (a migrated database never had them).
@@ -976,6 +980,49 @@ async fn restore_dm_carry(relay: &Relay) -> Result<()> {
     }
     if !relay.db.clear_dm_carry().await {
         log::warn!("could not clear the migration DM carry snapshot after persisting it");
+    }
+    Ok(())
+}
+
+/// Restores DM groups from the additive backup written atomically with the
+/// last main group snapshot. This covers a main snapshot that was lost or
+/// found corrupt while the database generation still matches the backup;
+/// DMs have no stored create/join events, so the ordinary rebuild cannot
+/// recreate them. A stale backup (a state removal/event advanced the
+/// generation) is discarded rather than resurrecting a removed member.
+async fn merge_dm_backup(relay: &Relay) -> Result<bool> {
+    if relay.groups.read().await.is_unrestored() {
+        return Ok(false);
+    }
+    let Some(backup) = relay.db.load_dm_backup().await else {
+        log::warn!("could not read the DM backup; continuing with the event-derived group state");
+        return Ok(false);
+    };
+    let Some(backup) = backup else {
+        return Ok(false);
+    };
+    let Some(stamp) = relay.db.state_stamp().await else {
+        log::warn!("could not verify the DM backup generation; skipping it");
+        return Ok(false);
+    };
+    let Some(seq) = relay.db.state_seq_group().await else {
+        log::warn!("could not verify the DM backup sequence; skipping it");
+        return Ok(false);
+    };
+    if !crate::nips::nip29::GroupStore::snapshot_is_current(backup.stamp, stamp)
+        || !crate::nips::nip29::GroupStore::snapshot_is_current(backup.seq, seq)
+    {
+        log::warn!("discarding a stale DM backup: it predates the current group-state generation");
+        return Ok(false);
+    }
+    Ok(relay.groups.write().await.merge_dm_snapshot(backup))
+}
+
+async fn restore_dm_backup(relay: &Relay) -> Result<()> {
+    if merge_dm_backup(relay).await? && !relay.persist_groups().await {
+        log::warn!(
+            "could not persist the restored DM backup; the backup remains for the next startup"
+        );
     }
     Ok(())
 }
@@ -1526,6 +1573,7 @@ pub async fn run_server(
     if groups_enabled {
         relay.finish_startup_group_recovery().await;
         restore_dm_carry(&relay).await?;
+        restore_dm_backup(&relay).await?;
         backfill_group_epochs(&relay).await?;
         purge_expired_group_messages(&relay).await?;
     }
@@ -4453,6 +4501,47 @@ mod tests {
             .expect("carry merge must succeed");
         assert!(relay.groups.read().await.group("dm-carry").is_some());
         assert_eq!(relay.db.load_dm_carry().await, Some(None));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn restore_dm_backup_merges_after_a_lost_main_snapshot() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        relay
+            .groups
+            .write()
+            .await
+            .restore(crate::nips::nip29::GroupsSnapshot::default());
+        let mut group = crate::nips::nip29::Group {
+            channel_type: "dm".into(),
+            created_at: Some(unix_now()),
+            ..crate::nips::nip29::Group::default()
+        };
+        group
+            .members
+            .insert("aa".repeat(32), std::collections::HashSet::new());
+        let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
+        snapshot.groups.insert("dm-backup".into(), group);
+        snapshot.stamp = relay.db.state_stamp().await.expect("stamp");
+        snapshot.seq = relay.db.state_seq_group().await.expect("seq");
+        assert!(relay.db.save_groups(snapshot).await);
+        restore_dm_backup(&relay)
+            .await
+            .expect("DM backup restore must succeed");
+        assert!(
+            relay.groups.read().await.group("dm-backup").is_some(),
+            "a DM must be restored when the event rebuild cannot recreate it"
+        );
+        assert!(
+            relay
+                .db
+                .load_groups()
+                .await
+                .expect_loaded("snapshot")
+                .groups
+                .contains_key("dm-backup"),
+            "the merged DM must be persisted back into the main snapshot"
+        );
         relay.db.shutdown();
     }
 
