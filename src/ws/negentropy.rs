@@ -492,6 +492,15 @@ impl super::Conn {
                                 .any(|pk| groups.visible_kind(gid, item.kind, Some(pk)))
                         };
                         visible
+                            && item.invite_code.as_deref().is_none_or(|code| {
+                                // A JOIN's bearer code is member-only state.
+                                // NEG has no event body to re-check it later,
+                                // so apply the same rule as `visible_to`.
+                                code.is_empty()
+                                    || self.authed_pubkeys.iter().any(|pk| {
+                                        groups.group(gid).is_some_and(|g| g.is_member(pk))
+                                    })
+                            })
                             && !groups.channel_ttl_expired_gid(
                                 gid,
                                 item.kind,
