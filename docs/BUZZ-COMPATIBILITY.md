@@ -163,9 +163,10 @@ host, because Buzz signs the relay URL it uploads to.
   WebSocket REQ/COUNT/live/NEG, the HTTP bridge and the REST API. Messages
   older than the group's TTL are hidden immediately, including after a TTL
   edit. Startup and the periodic database-maintenance tick perform a bounded
-  physical purge for TTL groups; read-time enforcement remains authoritative
-  if a maintenance scan is interrupted. NIP-40 `expiration` remains
-  independent.
+  physical purge for TTL groups; the ascending scan advances past full pages
+  that contain only group state/metadata, so older expired content is still
+  reclaimed. Read-time enforcement remains authoritative if a maintenance
+  scan is interrupted. NIP-40 `expiration` remains independent.
 - NIP-CL's system-channel exclusion is applied to the HTTP bridge and to
   WebSocket REQ, COUNT, live delivery and NEG: a global filter does not
   receive a system channel's relay-signed state unless it names the channel

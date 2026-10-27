@@ -985,7 +985,15 @@ async fn restore_dm_carry(relay: &Relay) -> Result<()> {
 /// not retain them forever. It is bounded per query and best-effort after a
 /// database error (read-time enforcement remains authoritative).
 async fn purge_expired_group_messages(relay: &Relay) -> Result<()> {
-    const PAGE: usize = 50_000;
+    purge_expired_group_messages_paged(relay, 50_000).await
+}
+
+/// The page size is a parameter so the regression test can force a
+/// state-only page without creating 50,000 rows.
+async fn purge_expired_group_messages_paged(relay: &Relay, page: usize) -> Result<()> {
+    if page == 0 {
+        return Ok(());
+    }
     let now = unix_now();
     let groups: Vec<(String, u64)> = relay
         .groups
@@ -1006,14 +1014,21 @@ async fn purge_expired_group_messages(relay: &Relay) -> Result<()> {
         if cutoff == 0 {
             continue;
         }
+        // Ascending pages start at the oldest surviving event. Once a full
+        // page contains nothing removable (only group state/metadata, or ids
+        // that are already gone), advance `since` past its complete boundary
+        // second; otherwise the same state pages would hide newer expired
+        // content forever.
+        let mut since: Option<u64> = None;
         loop {
             let mut filter = crate::filter::Filter::default();
             filter.tags.insert("#h".into(), serde_json::json!([gid]));
+            filter.since = since;
             filter.until = Some(cutoff);
-            filter.limit = Some(PAGE);
+            filter.limit = Some(page);
             let Some((events, _)) = relay
                 .db
-                .query_full_startup(vec![filter], PAGE, now, true)
+                .query_full_startup(vec![filter], page, now, true)
                 .await
             else {
                 log::warn!("could not scan expired TTL messages for {gid}; deferring cleanup");
@@ -1032,7 +1047,19 @@ async fn purge_expired_group_messages(relay: &Relay) -> Result<()> {
                 .filter_map(|event| event.id_bytes())
                 .collect();
             if ids.is_empty() {
-                break;
+                // The page is all state/metadata. Advance past it when it is
+                // full; a short page is the end of the scan.
+                if events.len() < page {
+                    break;
+                }
+                let Some(newest) = events.last().map(|event| event.created_at) else {
+                    break;
+                };
+                if newest >= cutoff {
+                    break;
+                }
+                since = Some(newest.saturating_add(1));
+                continue;
             }
             let Some(removed) = relay.db.remove_events_by_id(&ids).await else {
                 log::warn!("could not remove expired TTL messages for {gid}; deferring cleanup");
@@ -1041,7 +1068,22 @@ async fn purge_expired_group_messages(relay: &Relay) -> Result<()> {
             relay
                 .stats
                 .bump(&relay.stats.events_deleted, removed as u64);
-            if removed == 0 || events.len() < PAGE {
+            if removed == 0 {
+                // All ids on this full page were already gone. Move past
+                // the boundary instead of re-reading the same page.
+                if events.len() < page {
+                    break;
+                }
+                let Some(newest) = events.last().map(|event| event.created_at) else {
+                    break;
+                };
+                if newest >= cutoff {
+                    break;
+                }
+                since = Some(newest.saturating_add(1));
+                continue;
+            }
+            if events.len() < page {
                 break;
             }
         }
@@ -4456,6 +4498,79 @@ mod tests {
             serde_json::from_value(serde_json::json!({"ids": [message.id]})).unwrap();
         let (stored, _) = relay.db.query(vec![filter], 10, unix_now()).await;
         assert!(stored.is_empty(), "expired group content must be removed");
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ttl_purge_advances_past_state_only_pages() {
+        // A page full of group state must not end the ascending scan: the
+        // expired content behind it would otherwise stay stored forever.
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let now = unix_now();
+        let relay_pk = relay.relay_pubkey().unwrap_or_default();
+        {
+            let mut groups = relay.groups.write().await;
+            groups.buzz_enabled = true;
+            let create = Event {
+                id: "51".repeat(32),
+                pubkey: relay_pk.clone(),
+                created_at: now - 100,
+                kind: crate::nips::nip29::CREATE_GROUP,
+                tags: vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["ttl".into(), "10".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            groups.apply(&create, &relay_pk, now - 100, false, false);
+        }
+        let state = |id: &str, created_at: u64| Event {
+            id: id.repeat(32),
+            pubkey: relay_pk.clone(),
+            created_at,
+            kind: crate::nips::nip29::PUT_USER,
+            tags: vec![
+                vec!["h".into(), "g1".into()],
+                vec!["p".into(), "aa".repeat(32)],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let content = |id: &str, created_at: u64| Event {
+            id: id.repeat(32),
+            pubkey: relay_pk.clone(),
+            created_at,
+            kind: 9,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: "expired".into(),
+            sig: String::new(),
+        };
+        let state_one = state("52", now - 100);
+        let state_two = state("53", now - 99);
+        let content_one = content("54", now - 98);
+        let content_two = content("55", now - 97);
+        for event in [&state_one, &state_two, &content_one, &content_two] {
+            assert_eq!(
+                relay.db.put(event.clone(), now).await,
+                crate::db::PutOutcome::Stored
+            );
+        }
+        purge_expired_group_messages_paged(&relay, 2)
+            .await
+            .expect("TTL purge must succeed");
+        let query = |ids: Vec<String>| {
+            let filter: crate::filter::Filter =
+                serde_json::from_value(serde_json::json!({"ids": ids})).unwrap();
+            relay.db.query(vec![filter], 10, unix_now())
+        };
+        let (state_rows, _) = query(vec![state_one.id.clone(), state_two.id.clone()]).await;
+        assert_eq!(state_rows.len(), 2, "group state must survive the purge");
+        let (content_rows, _) = query(vec![content_one.id.clone(), content_two.id.clone()]).await;
+        assert!(
+            content_rows.is_empty(),
+            "expired content behind a full state page must be removed"
+        );
         relay.db.shutdown();
     }
 
