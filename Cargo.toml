@@ -22,7 +22,7 @@ getrandom = "0.4"
 # FreeBSD CI opens enough environments to exhaust the (small) pthread key
 # table, making `mdb_env_open` fail with EAGAIN. MDB_NOTLS is safe here: every
 # read transaction is created and dropped on the same database thread.
-heed = { version = "0.20", features = ["read-txn-no-tls"] }
+heed = { version = "0.21", features = ["read-txn-no-tls"] }
 hex = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
@@ -37,10 +37,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # S3/R2 (Cloudflare R2 is S3-compatible) storage for the Blossom file server;
 # rustls provides the TLS the S3 API requires.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs"] }
 tower = { version = "0.5", features = ["util"] }
-toml = "0.8"
+toml = "1.1"
 # `nostrfy upgrade`: fetches the latest release binary (and the latest
 # version tag) over HTTPS with rustls; no other network use.
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }

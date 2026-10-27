@@ -1395,9 +1395,19 @@ impl Cli {
             drop(out);
             let actual = {
                 use sha2::Digest;
+                use std::io::Read;
                 let mut hasher = sha2::Sha256::new();
                 let mut f = std::fs::File::open(&tmp)?;
-                std::io::copy(&mut f, &mut hasher)?;
+                // sha2 0.11 no longer implements `io::Write`; hash the
+                // downloaded binary in bounded chunks instead.
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    let n = f.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
                 hasher.finalize().to_vec()
             };
             if actual != expected {
