@@ -576,6 +576,8 @@ Keep the corresponding file fields empty so the image/config template carries no
 | `s3_access_key` | string | `""` | S3 / R2 access key |
 | `s3_secret_key` | string | `""` | S3 / R2 secret key |
 | `restrict_uploads` | boolean | `false` | When true, only the pubkeys in the Blossom upload allowlist may upload blobs |
+| `brotli` | boolean | `true` | Compress eligible Blossom responses with Brotli when the client sends `Accept-Encoding: br` (images/text/JSON; ranges and HEAD are never compressed) |
+| `brotli_max_bytes` | integer | `8388608` | Largest blob compressed on the fly (bytes, 1..=67108864). Larger blobs are served identity to bound per-request CPU |
 
 
 ### Key details
@@ -591,6 +593,8 @@ Keep the corresponding file fields empty so the image/config template carries no
 **`min_free_bytes`** — Disk-full guard for uploads. Before writing a blob, the relay checks the free space on the filesystem hosting `local_path` (the same `statvfs` check the LMDB writer uses) and refuses the upload with `507 Insufficient Storage` while the free space is below this margin — a full disk would otherwise fail the LMDB writer's commits. `0` disables the check. With `storage = "s3"` uploads spool through the system temp directory, so the same floor is applied there (a burst of S3 uploads must not fill `/tmp` until writes fail mid-body).
 
 **S3 keys** — With `storage = "s3"`, `s3_endpoint`, `s3_bucket`, `s3_access_key` and `s3_secret_key` are required. The endpoint must be the *path-style* HTTPS form (`https://s3.amazonaws.com` or `https://<account>.r2.cloudflarestorage.com`); the request signing follows AWS Signature Version 4. Plain `http://` is rejected because SigV4 credentials would travel in cleartext — only loopback hosts (`127.0.0.1`, `localhost`, `[::1]`) may use `http://`, so a local MinIO remains usable for testing.
+
+**`brotli` / `brotli_max_bytes`** — On-the-fly Brotli compression for Blossom reads. The compression layer negotiates `Accept-Encoding: br` and adds `Vary: Accept-Encoding`; a full `200` blob of `image/*`, `text/*`, JSON, XML, or JavaScript between 1 KiB and `brotli_max_bytes` is compressed. `206` range responses and `HEAD` stay identity (HEAD keeps the real `Content-Length`), and upload/preflight responses are not compressed. Quality is the tower-http default (Brotli 4), a balance for per-request CPU. Already-compressed formats (JPEG/WebP/AVIF) may see little or no saving; set `brotli = false` if CPU matters more than bandwidth. The setting is captured when the Blossom router is built, so changing it requires a restart.
 
 **`restrict_uploads`** — When `true`, `PUT /upload` accepts only the pubkeys on the Blossom upload allowlist (everyone else gets `403`). The allowlist itself is **not** part of the config file: it lives in the relay database (LMDB), is loaded at startup and managed at runtime with:
 
@@ -664,7 +668,7 @@ Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without
 | Most of `[limits]`: `max_ws_message_bytes`, `max_filters`, `max_subscriptions`, `max_limit`, `max_count`, `max_sub_id_len`, `max_content_bytes`, `max_tags`, `max_tag_value_bytes`, `max_created_at_future_secs`, `max_neg_items`, `max_sub_bytes`, `group_late_publish_secs`, the API bounds (`max_api_concurrent`, `max_api_queue_msgs`, `max_api_limit`, `max_api_offset`, `max_api_fetch`, `max_api_search_bytes`), `max_out_queue_bytes`, `max_req_response_bytes`, `ws_idle_timeout_secs` (existing connections keep their deadline; the new value applies to connections made after the reload) | `limits.live_buffer`, `limits.live_batch_size`, `limits.live_batch_interval_ms`, `limits.socket_recv_buffer_kb`, `limits.socket_send_buffer_kb`, `limits.max_connections`, `limits.max_connections_per_ip`, `limits.http_read_timeout_secs`, `limits.max_connections_per_sec_per_ip` (they shape the accept loop built at startup), `server.trusted_proxies` (it shapes the per-connection accounting) |
 | — | `database.path`, `database.purge_interval_secs`, `database.map_size`, `database.max_map_size`, `database.max_dbs`, `database.max_readers`, `database.search_index`, `database.meta_index`, `database.reader_threads`, `database.disabled_fsync`, `database.db_request_timeout_secs`, `database.max_db_queue_msgs`, `database.max_db_queue_events`, `database.max_db_queue_bytes`, `database.max_indexed_words` |
 | — | `daemon.max_log_size_bytes`, `daemon.max_log_files`, `daemon.stats_interval_secs`, `daemon.log_file` |
-| — | `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
+| — | `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*`, `blossom.brotli`, `blossom.brotli_max_bytes` |
 
 `[access]` kind/IP lists (`blocked_kinds`, `allowed_kinds`, `blocked_ips`) are **not** applied by a reload: they are seeded once at startup and then managed at runtime via NIP-86, and the runtime state wins (a config edit is warned about and ignored). `restrict_relay` is config-owned and does apply on SIGHUP.
 
@@ -802,6 +806,8 @@ s3_bucket = ""
 s3_access_key = ""
 s3_secret_key = ""
 restrict_uploads = false
+brotli = true
+brotli_max_bytes = 8388608
 ```
 
 ---

@@ -668,6 +668,8 @@ host = "media.example.com"          # required — enables the feature
 storage = "local"                   # "local" or "s3"
 local_path = "./data/images"        # local storage root
 max_upload_bytes = 20971520         # 20 MiB
+brotli = true                       # on-the-fly Brotli for blob reads
+brotli_max_bytes = 8388608          # 8 MiB per compressed blob
 min_free_bytes = 33554432         # refuse uploads when the disk has less free space
 restrict_uploads = false            # only allow-listed pubkeys may upload
 
@@ -712,7 +714,7 @@ Uploads, deletes and listings authenticate with a Nostr auth event (kind 24242, 
 
 The descriptor `url` includes the MIME-derived extension (e.g. `https://media.example.com/<sha256>.png`; unknown types get `.bin`), like the Blossom spec's examples. The extension is advisory: the file is served by its hash alone, and `/<sha256>.<ext>` (any extension) resolves to the same blob.
 
-**Performance:** GET/HEAD load the sha→owner mapping once per request (the descriptor and owner list come from the same LMDB read), local bodies stream with zero-copy 64 KiB chunks from a pinned directory fd, and uploads spool to the blob filesystem (a rename on publish) while hashing. The kernel send buffer is left to autotuning by default so a single large download is not capped at `buffer/RTT`; set `limits.socket_send_buffer_kb` to a non-zero value only when per-connection kernel memory must be bounded. For high-bandwidth-delay uploads, raise `limits.socket_recv_buffer_kb` (or set it to `0` for kernel autotuning).
+**Performance:** GET/HEAD load the sha→owner mapping once per request (the descriptor and owner list come from the same LMDB read), local bodies stream with zero-copy 64 KiB chunks from a pinned directory fd, and uploads spool to the blob filesystem (a rename on publish) while hashing. The kernel send buffer is left to autotuning by default so a single large download is not capped at `buffer/RTT`; set `limits.socket_send_buffer_kb` to a non-zero value only when per-connection kernel memory must be bounded. For high-bandwidth-delay uploads, raise `limits.socket_recv_buffer_kb` (or set it to `0` for kernel autotuning). With `blossom.brotli = true` (the default), eligible blob responses are Brotli-compressed on the fly when the client sends `Accept-Encoding: br`; ranges and HEAD are not compressed, and `brotli_max_bytes` bounds the per-request CPU.
 
 ### 11.4 Example
 

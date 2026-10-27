@@ -40,6 +40,11 @@ min_free_bytes = 33554432
 # Only pubkeys listed via `nostrfy blossom allow <pubkey>` may upload.
 restrict_uploads = false
 
+# Compress eligible blob responses with Brotli when the client accepts it.
+# Ranges and HEAD stay identity; larger blobs are skipped for CPU safety.
+brotli = true
+brotli_max_bytes = 8388608
+
 # --- S3-compatible storage (Cloudflare R2, AWS S3, MinIO, ...) -------------
 # To use S3 instead of local files, set:
 #   storage = "s3"
