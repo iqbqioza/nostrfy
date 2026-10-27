@@ -951,6 +951,10 @@ pub struct DbClient {
     /// clone): set by [`Self::shutdown`] so a long chunked removal stops
     /// at the next chunk boundary instead of delaying process exit.
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Separate ownership token for [`Drop`]: dropping one cloned client
+    /// must not shut the shared writer down. The last owner closes the
+    /// environment (heed 0.21 refuses a same-process reopen otherwise).
+    shutdown_owner: Arc<()>,
     /// Set by the writer's startup resume when an interrupted NIP-09
     /// deletion removed a NIP-29/NIP-43 state event, so the startup path
     /// can mark the derived state stale.
@@ -1390,6 +1394,7 @@ impl DbClient {
             map_full,
             expiry: threads.expiry,
             cancel,
+            shutdown_owner: Arc::new(()),
             resumed_deletion_state_removed: threads.resumed_deletion_state_removed,
             timeout_secs: threads.timeout_secs,
             pending_msgs: threads.pending_msgs,
@@ -3411,6 +3416,20 @@ impl DbClient {
         );
         for handle in handles {
             let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for DbClient {
+    fn drop(&mut self) {
+        // heed 0.21 registers an environment per process and refuses to
+        // reopen the same path while an old handle is alive. Join the
+        // threads here so a caller that drops the last client without an
+        // explicit shutdown (tests, short-lived CLI paths) still closes the
+        // LMDB environment before a reopen. Clones share the writer, so only
+        // the final owner may stop it.
+        if Arc::strong_count(&self.shutdown_owner) == 1 {
+            self.shutdown();
         }
     }
 }

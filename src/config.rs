@@ -753,7 +753,7 @@ fn alias_str(v: &toml::Value, key: &str, warnings: &mut Vec<String>) -> String {
 /// conflicts and invalid values.
 fn apply_legacy_aliases(raw: &str, cfg: &mut Config) -> Vec<String> {
     let mut warnings = Vec::new();
-    let Ok(value) = raw.parse::<toml::Value>() else {
+    let Ok(value) = toml::from_str::<toml::Value>(raw) else {
         return warnings;
     };
     let Some(table) = value.as_table() else {
@@ -3253,7 +3253,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
 /// unknown).
 fn warn_unknown_fields(raw: &str) -> Vec<String> {
     let mut warnings = Vec::new();
-    let Ok(value) = raw.parse::<toml::Value>() else {
+    let Ok(value) = toml::from_str::<toml::Value>(raw) else {
         return warnings;
     };
     let known = known_config_keys();
@@ -3311,7 +3311,7 @@ mod tests {
         // cross-check every emitted section and key against the list.
         let cfg = Config::default();
         let raw = toml::to_string(&cfg).unwrap();
-        let value: toml::Value = raw.parse().unwrap();
+        let value: toml::Value = toml::from_str(&raw).unwrap();
         let known = known_config_keys();
         for (section, keys) in known {
             let Some(table) = value.get(*section).and_then(toml::Value::as_table) else {
