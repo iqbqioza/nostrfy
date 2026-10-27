@@ -946,6 +946,75 @@ async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
 /// snapshot (the per-family sequence), and an unreadable generation fails
 /// closed the same way. Both cases fall through to the replay migration,
 /// which rebuilds from the surviving events. A failed rebuild is fatal.
+/// Startup reclamation for channel TTL. Runtime reads hide expired content
+/// immediately; this pass also removes old rows so a long-running relay does
+/// not retain them forever. It is bounded per query and best-effort after a
+/// database error (read-time enforcement remains authoritative).
+async fn purge_expired_group_messages(relay: &Relay) -> Result<()> {
+    const PAGE: usize = 50_000;
+    let now = unix_now();
+    let groups: Vec<(String, u64)> = relay
+        .groups
+        .read()
+        .await
+        .groups
+        .iter()
+        .filter_map(|(gid, group)| {
+            group
+                .settings
+                .ttl
+                .filter(|ttl| *ttl > 0)
+                .map(|ttl| (gid.clone(), ttl))
+        })
+        .collect();
+    for (gid, ttl) in groups {
+        let cutoff = now.saturating_sub(ttl);
+        if cutoff == 0 {
+            continue;
+        }
+        loop {
+            let mut filter = crate::filter::Filter::default();
+            filter.tags.insert("#h".into(), serde_json::json!([gid]));
+            filter.until = Some(cutoff);
+            filter.limit = Some(PAGE);
+            let Some((events, _)) = relay
+                .db
+                .query_full_startup(vec![filter], PAGE, now, true)
+                .await
+            else {
+                log::warn!("could not scan expired TTL messages for {gid}; deferring cleanup");
+                break;
+            };
+            if events.is_empty() {
+                break;
+            }
+            let ids: Vec<[u8; 32]> = events
+                .iter()
+                .filter(|event| {
+                    !crate::nips::nip29::is_group_action_kind(event.kind)
+                        && !(crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
+                            .contains(&event.kind)
+                })
+                .filter_map(|event| event.id_bytes())
+                .collect();
+            if ids.is_empty() {
+                break;
+            }
+            let Some(removed) = relay.db.remove_events_by_id(&ids).await else {
+                log::warn!("could not remove expired TTL messages for {gid}; deferring cleanup");
+                break;
+            };
+            relay
+                .stats
+                .bump(&relay.stats.events_deleted, removed as u64);
+            if removed == 0 || events.len() < PAGE {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One-time migration for databases written before durable group epochs:
 /// bind every currently stored group-state event to its group's current
 /// create id. It cannot reconstruct a past incarnation that was already
@@ -1381,6 +1450,7 @@ pub async fn run_server(
     if groups_enabled {
         relay.finish_startup_group_recovery().await;
         backfill_group_epochs(&relay).await?;
+        purge_expired_group_messages(&relay).await?;
     }
     if groups_enabled && relay.has_relay_key() {
         info!(
@@ -4265,6 +4335,51 @@ mod tests {
             err.to_string().contains("refusing to start"),
             "an unreadable snapshot must stop startup, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_ttl_purge_removes_expired_channel_messages() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let now = unix_now();
+        let relay_pk = relay.relay_pubkey().unwrap_or_default();
+        {
+            let mut groups = relay.groups.write().await;
+            groups.buzz_enabled = true;
+            let create = Event {
+                id: "41".repeat(32),
+                pubkey: relay_pk.clone(),
+                created_at: now - 100,
+                kind: crate::nips::nip29::CREATE_GROUP,
+                tags: vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["ttl".into(), "10".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            groups.apply(&create, &relay_pk, now - 100, false, false);
+        }
+        let message = Event {
+            id: "42".repeat(32),
+            pubkey: relay_pk,
+            created_at: now - 100,
+            kind: 9,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: "expired".into(),
+            sig: String::new(),
+        };
+        assert_eq!(
+            relay.db.put(message.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        );
+        purge_expired_group_messages(&relay)
+            .await
+            .expect("TTL purge must succeed");
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": [message.id]})).unwrap();
+        let (stored, _) = relay.db.query(vec![filter], 10, unix_now()).await;
+        assert!(stored.is_empty(), "expired group content must be removed");
+        relay.db.shutdown();
     }
 
     #[tokio::test]
