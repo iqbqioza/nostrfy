@@ -1814,6 +1814,68 @@ fn rebuild_does_not_fail_when_the_ghost_set_exceeds_the_cap() {
     db.shutdown();
 }
 
+#[test]
+fn rebuild_excludes_events_with_a_pending_apply_marker() {
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrfy-nip29-pending-rebuild")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        let mut create = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+        create.id = nip01::compute_id(&create);
+        assert_eq!(db.put(create, now).await, crate::db::PutOutcome::Stored);
+        let mut grant = event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["p".into(), USER.into(), "mod".into()]],
+        );
+        grant.id = nip01::compute_id(&grant);
+        assert_eq!(
+            db.put(grant.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        );
+        assert_eq!(
+            db.mark_group_apply_pending(grant.id_bytes().unwrap()).await,
+            Some(true)
+        );
+        let mut store = GroupStore::with_cap(0);
+        assert!(
+            store.rebuild(&db, None).await,
+            "the rebuild must complete despite the pending event"
+        );
+        assert!(store.group("g1").is_some());
+        assert!(
+            !store.group("g1").unwrap().is_member(USER),
+            "an unconfirmed grant must not re-enter the rebuilt store"
+        );
+    });
+    db.shutdown();
+}
+
 /// The same-second tie-break the rebuild replay applies when the true
 /// arrival order is unknowable, pinned event pair by event pair.
 ///

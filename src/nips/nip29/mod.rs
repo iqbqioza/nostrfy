@@ -3674,6 +3674,18 @@ impl GroupStore {
                 .iter()
                 .filter_map(|event| event.id_bytes().map(|id| id.to_vec()))
                 .collect();
+            // A user-submitted event remains marked until its live apply is
+            // confirmed. Startup recovery normally removes those events
+            // before this rebuild, but filtering the page is defence in
+            // depth: a marker must never let an unconfirmed/rejected grant
+            // re-enter the rebuilt state.
+            let Some(page_pending) = db.group_apply_pending_startup(page_ids.clone()).await else {
+                log::error!(
+                    "group state rebuild aborted: the pending-apply index did not answer; \
+                     refusing to persist an incomplete group store"
+                );
+                return false;
+            };
             let Some(page_epochs) = db.group_epochs_startup(page_ids.clone()).await else {
                 log::error!(
                     "group state rebuild aborted: the group-epoch index did not answer; \
@@ -3707,8 +3719,26 @@ impl GroupStore {
                     return false;
                 }
             }
-            page.sort_by(|a, b| replay_order(a, b, &page_arrivals));
+            // Keep the page's original upper bound before filtering: an
+            // all-pending page must still advance the cursor when the
+            // collector reported more events.
             let max_created = page.last().map(|event| event.created_at);
+            if !page_pending.is_empty() {
+                page.retain(|event| !page_pending.contains(&event.id));
+                if page.is_empty() {
+                    if !more {
+                        break;
+                    }
+                    match max_created {
+                        Some(ts) if ts < u64::MAX => {
+                            since = Some(ts.saturating_add(1));
+                            continue;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            page.sort_by(|a, b| replay_order(a, b, &page_arrivals));
             // The removals issued in each second of this page. `group_rank`
             // applies a `9001` before a same-second `9021`, so without this
             // the join re-adds the member the removal just removed and a

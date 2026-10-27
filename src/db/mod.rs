@@ -520,6 +520,24 @@ enum Msg {
         event_ids: Vec<Vec<u8>>,
         reply: oneshot::Sender<Option<std::collections::HashMap<String, u64>>>,
     },
+    /// Mark a user-submitted group-state event as pending live apply.
+    /// `Some(true)` means this call created the marker; `Some(false)` means a
+    /// pending marker already existed; `None` is a write failure.
+    MarkGroupApplyPending {
+        event_id: Vec<u8>,
+        reply: oneshot::Sender<Option<bool>>,
+    },
+    ClearGroupApplyPending {
+        event_id: Vec<u8>,
+        reply: oneshot::Sender<bool>,
+    },
+    GroupApplyPending {
+        event_ids: Vec<Vec<u8>>,
+        reply: oneshot::Sender<Option<std::collections::HashSet<String>>>,
+    },
+    RecoverGroupApplyPending {
+        reply: oneshot::Sender<Option<usize>>,
+    },
     /// Persist the NIP-IA archived-identities set.
     SaveIdentityArchive {
         data: Vec<u8>,
@@ -1133,7 +1151,10 @@ fn msg_bytes(msg: &Msg) -> usize {
             .iter()
             .map(|(id, value)| id.len() + value.len())
             .sum(),
-        Msg::ThreadRootTombstone { event_id, .. } => event_id.len(),
+        Msg::ThreadRootTombstone { event_id, .. }
+        | Msg::MarkGroupApplyPending { event_id, .. }
+        | Msg::ClearGroupApplyPending { event_id, .. } => event_id.len(),
+        Msg::GroupApplyPending { event_ids, .. } => event_ids.iter().map(Vec::len).sum(),
         Msg::SaveRoleRebuildPending { data, .. }
         | Msg::SaveIdentityArchive { data, .. }
         | Msg::SaveDmCarry { data, .. } => data.len(),
@@ -2200,6 +2221,47 @@ impl DbClient {
         event_ids: Vec<Vec<u8>>,
     ) -> Option<std::collections::HashMap<String, u64>> {
         self.request_read_startup(|reply| Msg::EventArrivals { event_ids, reply })
+            .await
+            .flatten()
+    }
+
+    /// Marks a user-submitted group-state event as pending live apply.
+    /// `None` is a write failure: the event must not be stored without the
+    /// recovery marker.
+    pub async fn mark_group_apply_pending(&self, event_id: [u8; 32]) -> Option<bool> {
+        self.request_write_checked(|reply| Msg::MarkGroupApplyPending {
+            event_id: event_id.to_vec(),
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
+    /// Clears the pending marker after a successful apply or removal.
+    pub async fn clear_group_apply_pending(&self, event_id: [u8; 32]) -> bool {
+        self.request_write_checked(|reply| Msg::ClearGroupApplyPending {
+            event_id: event_id.to_vec(),
+            reply,
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Batch lookup used by the rebuild to exclude a pending event even if
+    /// startup recovery was skipped (defence in depth).
+    pub async fn group_apply_pending_startup(
+        &self,
+        event_ids: Vec<Vec<u8>>,
+    ) -> Option<std::collections::HashSet<String>> {
+        self.request_read_startup(|reply| Msg::GroupApplyPending { event_ids, reply })
+            .await
+            .flatten()
+    }
+
+    /// Removes every event left with a pending-apply marker before the
+    /// startup rebuild. `None` is a failed write and must abort startup.
+    pub async fn recover_group_apply_pending(&self) -> Option<usize> {
+        self.request_write_checked(|reply| Msg::RecoverGroupApplyPending { reply })
             .await
             .flatten()
     }

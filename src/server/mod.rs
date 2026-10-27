@@ -1086,7 +1086,22 @@ fn dm_tag_values<'a>(
         .map(|tag| tag[1].as_str())
 }
 
-async fn restore_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
+async fn restore_group_state(
+    relay: &Relay,
+    groups_enabled: bool,
+    force_rebuild: bool,
+) -> Result<()> {
+    if force_rebuild {
+        // A pending-apply event was removed above. The snapshot may include
+        // its state (the crash can land after the apply but before the
+        // marker clear), so rebuild from the surviving history instead of
+        // trusting it.
+        warn!(
+            "rebuilding the NIP-29 group state because a previous crash left an unconfirmed \
+             group event"
+        );
+        return rebuild_group_state(relay, groups_enabled).await;
+    }
     let mut snapshot = match relay.db.load_groups().await {
         crate::db::LoadGroupsOutcome::Loaded(snapshot) => snapshot,
         crate::db::LoadGroupsOutcome::Missing => {
@@ -1237,7 +1252,25 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
 /// behind, and publish the remaining pending count on the metrics. A
 /// failed rebuild is fatal (see [`rebuild_group_state`]).
 async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
-    restore_group_state(relay, groups_enabled).await?;
+    // A group event is marked pending before its put and confirmed after the
+    // live apply. Any marker still present at startup means the process
+    // stopped before the apply/removal was confirmed: remove the event
+    // before the restore/rebuild can replay it. A failed recovery must abort
+    // startup; serving the marked event would resurrect a rejected grant.
+    let recovered_pending = match relay.db.recover_group_apply_pending().await {
+        Some(count) => {
+            if count > 0 {
+                warn!("removed {count} unconfirmed NIP-29 group event(s) left by a previous crash");
+            }
+            count
+        }
+        None => {
+            return Err(anyhow::anyhow!(
+                "cannot recover unconfirmed NIP-29 group events; refusing to start"
+            ));
+        }
+    };
+    restore_group_state(relay, groups_enabled, recovered_pending > 0).await?;
     // Crash recovery for kind:9008 group purges: a purge accepted but not
     // finished (the process crashed mid-walk) is re-run here, before the
     // relay serves. Idempotent and a no-op when nothing is pending.
@@ -4870,7 +4903,7 @@ mod tests {
         // withheld) rather than looking like a healthy empty public store.
         let relay = blossom_relay().await;
         relay.db.shutdown();
-        restore_group_state(&relay, false)
+        restore_group_state(&relay, false, false)
             .await
             .expect("an unreadable snapshot must fall back to a fail-closed rebuild");
         assert!(
