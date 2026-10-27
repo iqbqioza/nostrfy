@@ -253,12 +253,16 @@ impl super::Relay {
             || cfg.relay.pubkey.eq_ignore_ascii_case(&event.pubkey);
         // NIP-43: a join carrying a valid invite code is authorized by the
         // code, so `restrict_relay`'s allow list must not reject it before
-        // the claim is considered (the admission below is the gate). A denied
-        // pubkey is still refused: a ban outranks an invite (N43-M02).
+        // the claim is considered (the admission below is the gate). A
+        // leave must also reach its handler: an invite-admitted member is
+        // normally not on the allowlist, and refusing their departure would
+        // trap them in the community. A denied pubkey is still refused: a
+        // ban outranks both.
         let invite_join = cfg.nip_enabled(43) && event.kind == nip43::JOIN;
+        let member_leave = cfg.nip_enabled(43) && event.kind == nip43::LEAVE;
         if !is_operator
             && (access.blocks_pubkey(&event.pubkey)
-                || (!invite_join && !access.allows_pubkey(&event.pubkey)))
+                || (!invite_join && !member_leave && !access.allows_pubkey(&event.pubkey)))
         {
             return Precheck::Reject("blocked: pubkey not allowed".into());
         }
@@ -912,9 +916,17 @@ impl super::Relay {
 
         // NIP-70: "The default behavior of a relay MUST be to reject any
         // event that contains `["-"]`"; the only acceptance path is the
-        // author's own NIP-42 authentication. The rule is unconditional —
-        // the NIP-70 toggle only relaxes the SHOULD-level repost check.
-        if nip70::is_protected(event) && !authed.iter().any(|pk| pk == &event.pubkey) {
+        // author's own NIP-42 authentication. NIP-43 explicitly requires
+        // the `-` tag on JOIN/LEAVE requests; those are signature-bound
+        // ephemeral membership requests, so requiring a second AUTH flow
+        // would make spec-shaped leave requests unusable. The NIP-70 toggle
+        // still relaxes only the SHOULD-level repost check.
+        let nip43_member_request =
+            cfg.nip_enabled(43) && matches!(event.kind, nip43::JOIN | nip43::LEAVE);
+        if nip70::is_protected(event)
+            && !authed.iter().any(|pk| pk == &event.pubkey)
+            && !nip43_member_request
+        {
             bail!("auth-required: protected events may only be published by their author");
         }
 
