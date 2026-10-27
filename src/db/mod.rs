@@ -727,7 +727,12 @@ enum Msg {
     /// group mutation). The reply reports whether the commit succeeded, so
     /// the relay cannot treat an uncommitted save as durable.
     SaveGroups {
-        snapshot: crate::nips::nip29::GroupsSnapshot,
+        /// Encoded main snapshot, DM backup and Buzz backup. The relay
+        /// serializes them under its read guard so the writer never clones
+        /// the group state.
+        data: Vec<u8>,
+        dm: Vec<u8>,
+        buzz: Vec<u8>,
         reply: oneshot::Sender<bool>,
     },
     /// Loads the persisted NIP-29 group state snapshot.
@@ -771,7 +776,8 @@ enum Msg {
     /// Persists the NIP-43 role state snapshot (write-through on every
     /// role mutation). The reply reports whether the commit succeeded.
     SaveRoles {
-        snapshot: crate::nips::nip43::RolesSnapshot,
+        /// Encoded role snapshot (see [`Msg::SaveGroups`]).
+        data: Vec<u8>,
         reply: oneshot::Sender<bool>,
     },
     /// Loads the persisted NIP-43 role state snapshot.
@@ -1027,12 +1033,15 @@ fn msg_bytes(msg: &Msg) -> usize {
             filters.iter().map(filter_heap_bytes).sum()
         }
         Msg::NegQuery { filter, .. } => filter_heap_bytes(filter),
-        // Group/role snapshots are the dominant writer payload after
-        // events: each `persist_groups`/`persist_roles` clones the whole
-        // live state, and without an estimate a queue of them could reach
-        // gigabytes while `max_db_queue_bytes` ignored them entirely.
-        Msg::SaveGroups { snapshot, .. } => groups_snapshot_bytes(snapshot),
-        Msg::SaveRoles { snapshot, .. } => roles_snapshot_bytes(snapshot),
+        // Encoded group/role snapshots are the dominant writer payload after
+        // events. The relay serializes them under its read guard, so the
+        // queue holds the final bytes rather than a cloned state plus its
+        // serialization.
+        Msg::SaveGroups { data, dm, buzz, .. } => data
+            .len()
+            .saturating_add(dm.len())
+            .saturating_add(buzz.len()),
+        Msg::SaveRoles { data, .. } => data.len(),
         Msg::ForeignRelayEvents {
             relay_pubkey,
             kinds,
@@ -1170,85 +1179,6 @@ fn event_heap_bytes(event: &Event) -> usize {
         .saturating_add(event.id.len())
         .saturating_add(event.pubkey.len())
         .saturating_add(event.sig.len())
-}
-
-/// Rough heap estimate of a queued NIP-29 group snapshot: member maps,
-/// role sets, settings strings, pins, invites and the deleted/ghost
-/// markers. Only used for the queue byte cap, so an estimate is enough.
-fn groups_snapshot_bytes(snapshot: &crate::nips::nip29::GroupsSnapshot) -> usize {
-    let groups: usize = snapshot
-        .groups
-        .values()
-        .map(|group| {
-            let members: usize = group
-                .members
-                .iter()
-                .map(|(pubkey, roles)| {
-                    pubkey.len() + roles.iter().map(std::string::String::len).sum::<usize>()
-                })
-                .sum();
-            let settings = group.settings.name.len()
-                + group.settings.about.len()
-                + group.settings.picture.len()
-                + group.settings.banner.len();
-            let pins: usize = group
-                .pins
-                .iter()
-                .map(|(tag, value)| tag.len() + value.len())
-                .sum();
-            let invites: usize = group.invites.iter().map(std::string::String::len).sum();
-            members
-                .saturating_add(settings)
-                .saturating_add(pins)
-                .saturating_add(invites)
-                .saturating_add(group.parent.as_deref().map_or(0, str::len))
-                .saturating_add(
-                    group
-                        .children
-                        .iter()
-                        .map(std::string::String::len)
-                        .sum::<usize>(),
-                )
-        })
-        .sum();
-    groups
-        .saturating_add(
-            snapshot
-                .deleted
-                .iter()
-                .map(std::string::String::len)
-                .sum::<usize>(),
-        )
-        .saturating_add(
-            snapshot
-                .ghost
-                .iter()
-                .map(std::string::String::len)
-                .sum::<usize>(),
-        )
-}
-
-/// Rough heap estimate of a queued NIP-43 role snapshot (role definitions
-/// and the per-pubkey assignment lists).
-fn roles_snapshot_bytes(snapshot: &crate::nips::nip43::RolesSnapshot) -> usize {
-    let roles: usize = snapshot
-        .roles
-        .values()
-        .map(|role| {
-            role.label.len()
-                + role.description.len()
-                + role.color.len()
-                + role.order.map_or(0, |_| 8)
-        })
-        .sum();
-    let assignments: usize = snapshot
-        .assignments
-        .iter()
-        .map(|(pubkey, roles)| {
-            pubkey.len() + roles.iter().map(std::string::String::len).sum::<usize>()
-        })
-        .sum();
-    roles.saturating_add(assignments)
 }
 
 /// The heap bytes a filter owns: the id/author/kind/search strings and the
@@ -2986,15 +2916,47 @@ impl DbClient {
             .await
     }
 
-    /// Persists the NIP-29 group state snapshot. The relay's hot mutation
-    /// path debounces this call through a background worker; the fail-closed
-    /// paths (and tests) save immediately. The returned bool reports whether
-    /// the commit succeeded: on `false` (including an overload fail-fast or a
-    /// lost writer) the caller must keep the state pending and retry instead
-    /// of treating the snapshot as durable.
+    /// Typed test helper: serializes a snapshot and its DM/Buzz backups,
+    /// then writes the bytes. Production persistence uses
+    /// [`Self::save_groups_encoded`] so the relay can encode under its read
+    /// guard without cloning the group state. The returned bool reports
+    /// whether the commit succeeded.
+    #[cfg(test)]
     pub async fn save_groups(&self, snapshot: crate::nips::nip29::GroupsSnapshot) -> bool {
-        self.request_write(|reply| Msg::SaveGroups { snapshot, reply })
-            .await
+        let Ok(data) = serde_json::to_vec(&snapshot) else {
+            return false;
+        };
+        let Ok(dm) = crate::nips::nip29::dm_backup_json(
+            &snapshot.groups,
+            snapshot.stamp,
+            snapshot.seq,
+            snapshot.buzz_enabled,
+        ) else {
+            return false;
+        };
+        let Ok(buzz) =
+            crate::nips::nip29::buzz_backup_json(&snapshot.groups, snapshot.stamp, snapshot.seq)
+        else {
+            return false;
+        };
+        self.save_groups_encoded(data, dm, buzz).await
+    }
+
+    /// Persists already-encoded group snapshot bytes (the hot path: the
+    /// relay encodes under its read guard and the writer only writes).
+    pub(crate) async fn save_groups_encoded(
+        &self,
+        data: Vec<u8>,
+        dm: Vec<u8>,
+        buzz: Vec<u8>,
+    ) -> bool {
+        self.request_write(|reply| Msg::SaveGroups {
+            data,
+            dm,
+            buzz,
+            reply,
+        })
+        .await
     }
 
     /// Loads the persisted NIP-29 group state snapshot at startup.
@@ -3066,11 +3028,19 @@ impl DbClient {
         .await
     }
 
-    /// Persists the NIP-43 role state snapshot (same commit-success
-    /// semantics as [`Self::save_groups`]; the relay debounces the hot
-    /// mutation path).
+    /// Typed test helper (same commit semantics as [`Self::save_groups`]).
+    /// Production persistence uses [`Self::save_roles_encoded`].
+    #[cfg(test)]
     pub async fn save_roles(&self, snapshot: crate::nips::nip43::RolesSnapshot) -> bool {
-        self.request_write(|reply| Msg::SaveRoles { snapshot, reply })
+        let Ok(data) = serde_json::to_vec(&snapshot) else {
+            return false;
+        };
+        self.save_roles_encoded(data).await
+    }
+
+    /// Persists already-encoded role snapshot bytes (the hot path).
+    pub(crate) async fn save_roles_encoded(&self, data: Vec<u8>) -> bool {
+        self.request_write(|reply| Msg::SaveRoles { data, reply })
             .await
     }
 

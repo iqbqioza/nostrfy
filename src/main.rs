@@ -50,7 +50,16 @@ fn main() {
     // Reached in foreground mode or in the daemon child process. The runtime
     // must be created after daemonization because the fork inherits the
     // runtime context of the parent thread.
-    let rt = tokio::runtime::Runtime::new().expect("cannot create tokio runtime");
+    // A bounded blocking pool keeps a burst of file I/O (Blossom uploads and
+    // downloads, fsyncs, landing-page writes) from creating hundreds of
+    // 2 MiB-stack threads. 128 concurrent blocking operations is far above
+    // what the relay's file paths need, while the default 512 only adds
+    // worst-case memory and scheduler pressure.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(128)
+        .build()
+        .expect("cannot create tokio runtime");
     if rt.block_on(cli.serve_logged()).is_err() {
         // `serve_logged` already logged the reason (to the log file after
         // daemonization, to stderr in the foreground); only the exit status

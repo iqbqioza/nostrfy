@@ -122,6 +122,7 @@ impl RoleStore {
     }
 
     /// Persisted snapshot of the role state (see the `ROLE` table).
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> RolesSnapshot {
         RolesSnapshot {
             roles: self.roles.clone(),
@@ -132,6 +133,29 @@ impl RoleStore {
             stamp: 0,
             seq: 0,
         }
+    }
+
+    /// Serializes the persisted role snapshot directly from the live store.
+    /// The hot persistence path holds the read guard across this call, so the
+    /// bytes describe one consistent state; this replaces the previous
+    /// `snapshot()` clone (roles + every assignment vector + claims) that
+    /// doubled the peak memory of a large member list.
+    pub(crate) fn encode_snapshot(&self, stamp: u64, seq: u64) -> serde_json::Result<Vec<u8>> {
+        #[derive(serde::Serialize)]
+        struct SnapshotRef<'a> {
+            roles: &'a HashMap<String, Role>,
+            assignments: &'a HashMap<String, Vec<String>>,
+            claims: &'a std::collections::BTreeSet<String>,
+            stamp: u64,
+            seq: u64,
+        }
+        serde_json::to_vec(&SnapshotRef {
+            roles: &self.roles,
+            assignments: &self.assignments,
+            claims: &self.claims,
+            stamp,
+            seq,
+        })
     }
 
     /// Restores state persisted by [`Self::snapshot`].
@@ -1267,5 +1291,32 @@ mod tests {
             );
             assert!(store.roles.is_empty());
         });
+    }
+}
+
+#[cfg(test)]
+mod snapshot_format_tests {
+    use super::*;
+
+    #[test]
+    fn encoded_snapshot_matches_the_typed_format() {
+        // The persistence hot path serializes the borrowed store directly.
+        // Keep the bytes compatible with the typed reader and with older
+        // binaries that expect the same fields.
+        let mut store = RoleStore::default();
+        store.create("mod", "Moderator", "keeps order", "37", Some(2));
+        store.assign("aa".repeat(32).as_str(), "mod");
+        store.admit("bb".repeat(32).as_str());
+        store.add_claim("welcome-1");
+        let mut expected = store.snapshot();
+        expected.stamp = 42;
+        expected.seq = 7;
+        let data = store.encode_snapshot(42, 7).expect("encode");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&data).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "the role snapshot JSON must not drift"
+        );
+        assert!(serde_json::from_slice::<RolesSnapshot>(&data).is_ok());
     }
 }

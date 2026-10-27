@@ -1929,9 +1929,15 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(ok);
                                 }
-                                Msg::SaveGroups { snapshot, reply } => {
+                                Msg::SaveGroups {
+                                    data,
+                                    dm,
+                                    buzz,
+                                    reply,
+                                } => {
                                     if Some(msg_index) == last_groups {
-                                        let ok = match store.save_groups(&snapshot) {
+                                        let ok = match store.save_groups_encoded(&data, &dm, &buzz)
+                                        {
                                             Ok(()) => true,
                                             Err(e) => {
                                                 db_error(&thread_errors, &e);
@@ -1946,9 +1952,9 @@ pub(crate) fn spawn(
                                         coalesced_group_replies.push(reply);
                                     }
                                 }
-                                Msg::SaveRoles { snapshot, reply } => {
+                                Msg::SaveRoles { data, reply } => {
                                     if Some(msg_index) == last_roles {
-                                        let ok = match store.save_roles(&snapshot) {
+                                        let ok = match store.save_roles_encoded(&data) {
                                             Ok(()) => true,
                                             Err(e) => {
                                                 db_error(&thread_errors, &e);
