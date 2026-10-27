@@ -400,6 +400,118 @@ async fn top_level_window_excludes_replies_and_emits_bounds() {
 }
 
 #[tokio::test]
+async fn summary_counts_visible_descendants_behind_a_missing_reply() {
+    // A deleted immediate parent must not hide its visible descendants from
+    // the root summary: the NIP-10 root marker still associates them with
+    // the thread even though the `#e` reply chain has a hole.
+    let relay = test_relay().await;
+    let app = super::super::build_router(&relay, None).await;
+    let keypair = Keypair::from_secret_bytes([9u8; 32]).unwrap();
+    let channel = "33333333-3333-4333-8333-333333333333";
+    let origin = origin(&relay).await;
+    let create = signed(
+        &keypair,
+        9007,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["name".into(), "stream".into()],
+            vec!["visibility".into(), "open".into()],
+            vec!["channel_type".into(), "stream".into()],
+        ],
+        "",
+        crate::util::unix_now(),
+    );
+    let create_body = serde_json::to_vec(&create).unwrap();
+    let auth = nip98(&keypair, &origin, "/events", "POST", &create_body, 1);
+    app.clone()
+        .oneshot(request(Method::POST, "/events", Some(&auth), create_body))
+        .await
+        .unwrap();
+
+    let now = crate::util::unix_now();
+    let root = signed(
+        &keypair,
+        9,
+        vec![vec!["h".into(), channel.into()]],
+        "root",
+        now,
+    );
+    let root_id = root.id.clone();
+    let missing_parent = "77".repeat(32);
+    let first = signed(
+        &keypair,
+        9,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["e".into(), root_id.clone(), "".into(), "root".into()],
+            vec!["e".into(), missing_parent, "".into(), "reply".into()],
+        ],
+        "orphaned reply",
+        now + 1,
+    );
+    let first_id = first.id.clone();
+    let second = signed(
+        &keypair,
+        9,
+        vec![
+            vec!["h".into(), channel.into()],
+            vec!["e".into(), root_id.clone(), "".into(), "root".into()],
+            vec!["e".into(), first_id, "".into(), "reply".into()],
+        ],
+        "reply below orphan",
+        now + 2,
+    );
+    for (index, event) in [root, first, second].into_iter().enumerate() {
+        let body = serde_json::to_vec(&event).unwrap();
+        let auth = nip98(
+            &keypair,
+            &origin,
+            "/events",
+            "POST",
+            &body,
+            20 + index as u64,
+        );
+        let response = app
+            .clone()
+            .oneshot(request(Method::POST, "/events", Some(&auth), body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let filter = json!([{
+        "kinds": [9],
+        "#h": [channel],
+        "limit": 10,
+        "top_level": true,
+        "include_summaries": true,
+    }]);
+    let filter_body = serde_json::to_vec(&filter).unwrap();
+    let auth = nip98(&keypair, &origin, "/query", "POST", &filter_body, 40);
+    let response = app
+        .oneshot(request(Method::POST, "/query", Some(&auth), filter_body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = body_json(response).await;
+    let summaries: Vec<&Value> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == 39005)
+        .collect();
+    assert_eq!(summaries.len(), 1);
+    let summary: Value = serde_json::from_str(summaries[0]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(summary["reply_count"], 0);
+    assert_eq!(
+        summary["descendant_count"], 2,
+        "both visible descendants must count despite the missing parent"
+    );
+    assert_eq!(summary["last_reply_at"], now + 2);
+    relay.db.shutdown();
+}
+
+#[tokio::test]
 async fn dense_same_second_hidden_prefix_does_not_stall_the_window() {
     // More non-top-level replies at one timestamp than the over-fetch
     // window used to make the next round re-read the same rows, return an

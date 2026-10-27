@@ -184,11 +184,13 @@ host, because Buzz signs the relay URL it uploads to.
   NIP-11 icon immediately, and persists `relay.icon` when a config path is
   available; a failed file write rolls the in-memory change back. The
   command event itself is still stored as an ordinary event.
-- A `kind:39005` summary counts visible direct replies and walks the visible
-  descendant tree (up to 100 levels / 10,000 events) for `descendant_count`,
-  `last_reply_at` and the 10 most recent participants. A larger tree, a
-  hidden intermediate, or a frontier capped at the per-query 1,000-event
-  bound can still undercount the summary.
+- A `kind:39005` summary counts visible direct replies and walks the
+  descendant tree (up to 100 levels / 10,000 events) for
+  `descendant_count`, `last_reply_at` and the 10 most recent participants.
+  Hidden intermediates are traversed without being counted themselves, and
+  the NIP-10 root marker keeps visible descendants behind a deleted/missing
+  parent in the count. A larger tree or a frontier capped at the
+  per-query 1,000-event bound can still undercount the summary.
 - `thread_window:true` / `kind:39007` thread mode walks descendants to the
   requested depth, bounded at 8,192 events and 1,000 rows per frontier query.
   Its bounds binding names the request `Host` authority, so a reverse proxy
@@ -279,9 +281,11 @@ host, because Buzz signs the relay URL it uploads to.
   reject them. The history replay applies their privacy floor; the live
   path cannot undo that legacy marker.
 - A stored `9002` that turns LiveKit off is replayed with `emit=false`, so
-  its empty `kind:39004` is not republished by a snapshot-less rebuild. The
-  old participant list can remain until the room is reconfigured; the
-  LiveKit poll skips the now-inactive group.
+  its empty `kind:39004` is not republished by the rebuild itself. The next
+  LiveKit poll clears it: the startup cache is seeded from the stored
+  participant list and an empty replacement is published for a
+  still-existing non-LiveKit group; a deleted group's cache entry is simply
+  dropped.
 - New group-state events receive a durable arrival sequence in the additive
   `arrival:` index, and the rebuild orders ordinary state operations by that
   sequence within one second. A remove followed by a rejoin therefore
@@ -373,8 +377,9 @@ host, because Buzz signs the relay URL it uploads to.
   A role rebuild that is aborted or overflows retains captured mutations for
   the next scan; on shutdown the bounded mutation journal is persisted under
   an additive `index_meta` key and replayed after the next startup rebuild,
-  then cleared once the role snapshot is saved. If that journal save fails,
-  the captured leaves are still only in memory and can be lost. A removal
+  then cleared once the role snapshot is saved. The shutdown save is retried
+  a few times; if every attempt fails, the captured leaves are still only in
+  memory and can be lost. A removal
   generation now blocks a full `13534` publish before it is stored and
   deletes one that raced the pre-check; a write that starts after that
   post-store check can still be transiently visible until the rebuild

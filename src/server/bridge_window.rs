@@ -114,6 +114,22 @@ fn reply_parent(event: &Event) -> Option<&str> {
         .map(|t| t[1].as_str())
 }
 
+/// The NIP-10 root marker. A reply whose immediate parent was deleted or is
+/// otherwise absent can still be associated with the summary root through
+/// this tag.
+fn reply_root(event: &Event) -> Option<&str> {
+    event
+        .tags
+        .iter()
+        .find(|t| {
+            t.len() >= 4
+                && t[0] == "e"
+                && t[3] == "root"
+                && is_hex_64(t.get(1).map_or("", String::as_str))
+        })
+        .map(|t| t[1].as_str())
+}
+
 fn is_broadcast(event: &Event) -> bool {
     event
         .tags
@@ -567,30 +583,46 @@ async fn thread_summaries(
     let mut root_for: HashMap<String, String> = HashMap::new();
     let mut frontier: Vec<String> = Vec::new();
     for event in events {
-        if !bridge_visible(
+        let visible = bridge_visible(
             &event,
             authed,
             Some(&groups),
             nip78_restricted,
             relay.relay_pubkey_ref(),
-        ) {
-            continue;
-        }
-        // Count only the marked reply parent. A nested reply also carries
-        // the root in an `e` tag, so taking the first `e` that names a row
-        // would count the whole subtree as direct replies.
-        let parent = reply_parent(&event).filter(|id| row_set.contains(id));
-        let Some(parent) = parent else {
+        );
+        let parent = reply_parent(&event);
+        // Count only the marked reply parent as a direct reply. A nested
+        // reply also carries the root in an `e` tag, so taking the first
+        // `e` that names a row would count the whole subtree as direct.
+        let direct = parent.filter(|id| row_set.contains(id));
+        let root = direct.map(str::to_string).or_else(|| {
+            parent?;
+            reply_root(&event)
+                .filter(|id| row_set.contains(id))
+                .map(str::to_string)
+        });
+        let Some(root) = root else {
             continue;
         };
-        let entry =
-            per_row
-                .entry(parent.to_string())
+        if visible {
+            let entry = per_row
+                .entry(root.clone())
                 .or_insert((0, 0, event.created_at, Vec::new()));
-        entry.0 += 1;
-        entry.2 = entry.2.max(event.created_at);
-        record_summary_participant(&mut entry.3, event.created_at, &event.pubkey);
-        root_for.insert(event.id.clone(), parent.to_string());
+            if direct.is_some() {
+                entry.0 += 1;
+            } else {
+                // The immediate parent is absent (deleted or otherwise not
+                // returned). The root marker still proves this visible row
+                // belongs to the thread, so count it as a descendant rather
+                // than dropping it.
+                entry.1 += 1;
+            }
+            entry.2 = entry.2.max(event.created_at);
+            record_summary_participant(&mut entry.3, event.created_at, &event.pubkey);
+        }
+        // Keep hidden rows in the traversal map: a visible child below a
+        // hidden/deleted intermediate must still reach the root summary.
+        root_for.insert(event.id.clone(), root);
         frontier.push(event.id.clone());
     }
 
@@ -621,12 +653,31 @@ async fn thread_summaries(
                     .into_response());
             };
             for event in events {
+                if seen.contains(&event.id) {
+                    continue;
+                }
+                let Some(parent) = reply_parent(&event) else {
+                    continue;
+                };
+                let root = root_for.get(parent).cloned().or_else(|| {
+                    reply_root(&event)
+                        .filter(|id| row_set.contains(id))
+                        .map(str::to_string)
+                });
+                let Some(root) = root else {
+                    continue;
+                };
                 if !seen.insert(event.id.clone()) {
                     continue;
                 }
                 if seen.len() > SUMMARY_TREE_MAX {
                     break;
                 }
+                // Traverse hidden intermediates too. Counting stays guarded
+                // by visibility, but their visible children must not be lost
+                // from `descendant_count`.
+                root_for.insert(event.id.clone(), root.clone());
+                next.push(event.id.clone());
                 if !bridge_visible(
                     &event,
                     authed,
@@ -636,14 +687,6 @@ async fn thread_summaries(
                 ) {
                     continue;
                 }
-                let Some(parent) = reply_parent(&event) else {
-                    continue;
-                };
-                let Some(root) = root_for.get(parent).cloned() else {
-                    continue;
-                };
-                root_for.insert(event.id.clone(), root.clone());
-                next.push(event.id.clone());
                 if let Some(entry) = per_row.get_mut(&root) {
                     entry.1 += 1;
                     entry.2 = entry.2.max(event.created_at);

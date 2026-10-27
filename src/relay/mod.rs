@@ -1254,9 +1254,23 @@ impl RolesRebuild {
         if !buffer.mutations.is_empty() {
             match serde_json::to_vec(&buffer.mutations) {
                 Ok(data) => {
-                    if !db.save_role_rebuild_pending(data).await {
+                    // A transient writer backlog must not drop the captured
+                    // leaves on shutdown. Retry a few times before falling
+                    // back to the (already warned) in-memory-only state.
+                    let mut saved = false;
+                    for attempt in 0..3 {
+                        if db.save_role_rebuild_pending(data.clone()).await {
+                            saved = true;
+                            break;
+                        }
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                    if !saved {
                         log::warn!(
-                            "could not persist the role rebuild mutation journal;                              captured mutations may be lost on shutdown"
+                            "could not persist the role rebuild mutation journal after retries; \
+                             captured mutations may be lost on shutdown"
                         );
                     }
                 }
