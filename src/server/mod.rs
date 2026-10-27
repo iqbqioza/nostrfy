@@ -2646,7 +2646,11 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                         // same periodic maintenance tick. Read-time TTL
                         // enforcement remains authoritative if this scan is
                         // interrupted or fails.
-                        if let Err(error) = purge_expired_group_messages(&relay).await {
+                        let cleanup = tokio::select! {
+                            result = purge_expired_group_messages(&relay) => result,
+                            _ = shutdown.changed() => break,
+                        };
+                        if let Err(error) = cleanup {
                             log::warn!(
                                 "periodic channel-TTL cleanup failed; read-time TTL enforcement \
                                  remains active: {error}"
