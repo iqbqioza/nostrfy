@@ -2887,6 +2887,42 @@ impl GroupStore {
         self.ghost.contains(gid)
     }
 
+    /// Re-checks the authorization of a live moderation event immediately
+    /// before it is applied under the group write lock. The intake precheck
+    /// is advisory by the time the database write completes: another admin
+    /// may have demoted/removed the author in between, and the apply path
+    /// must not let the queued event through on the old grant.
+    ///
+    /// This deliberately checks only authorization (plus the NIP-CL member
+    /// topic/purpose exception), not capacity, last-admin or fidelity: those
+    /// are re-checked by the apply arms themselves and must remain able to
+    /// run for a still-authorized event.
+    pub(crate) fn authorize_live_state_event(
+        &self,
+        event: &Event,
+        relay_pubkey: &str,
+    ) -> std::result::Result<(), String> {
+        if !(MOD_MIN..=MOD_MAX).contains(&event.kind) {
+            return Ok(());
+        }
+        let Some(gid) = group_id(event) else {
+            return Ok(());
+        };
+        let Some(group) = self.groups.get(gid) else {
+            return Ok(());
+        };
+        if !relay_pubkey.is_empty() && event.pubkey.eq_ignore_ascii_case(relay_pubkey) {
+            return Ok(());
+        }
+        if group.is_admin(&event.pubkey) {
+            return Ok(());
+        }
+        if event.kind == 9002 && self.buzz_enabled && is_member_topic_edit(group, event, false) {
+            return Ok(());
+        }
+        Err("restricted: you are not an admin of this group".into())
+    }
+
     /// Whether `gid` is a confirmed delete tombstone. A rebuild must not
     /// buffer pre-create state for such an id: the old incarnation is gone
     /// and a later create starts a new one.
