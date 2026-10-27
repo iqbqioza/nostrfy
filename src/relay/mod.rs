@@ -47,7 +47,7 @@ use crate::util::unix_now;
 /// connection that stops reading is closed when its queue fills so it can
 /// reconnect and resynchronize instead of missing events silently.
 // A REQ/COUNT/NEG database await can keep the connection task from reading
-// its live channel. 512 batches cover ~10 s of maximum-rate traffic at the
+// its live queue. 512 batches cover ~10 s of maximum-rate traffic at the
 // default 20 ms / 32-event batch, which is far beyond a normal query while
 // keeping the per-connection queue pointers bounded. A longer stall still
 // resynchronizes instead of pinning an unbounded backlog.
@@ -2418,14 +2418,12 @@ pub struct LiveBusConfig {
 }
 
 pub(crate) struct LiveQueue {
-    pub(crate) sender: mpsc::Sender<crate::ws::LiveBatch>,
+    pub(crate) state: std::sync::Arc<crate::ws::LiveQueueState>,
     pub(crate) overflow: tokio::sync::watch::Sender<()>,
 }
 
 fn enqueue_live_batch(queue: &LiveQueue, batch: crate::ws::LiveBatch) {
-    if let Err(error) = queue.sender.try_send(batch)
-        && matches!(error, mpsc::error::TrySendError::Full(_))
-    {
+    if !queue.state.push(batch) {
         let _ = queue.overflow.send(());
     }
 }
@@ -2885,7 +2883,7 @@ impl Relay {
                         .iter()
                         .filter_map(|conn| {
                             queues.get(conn).map(|queue| LiveQueue {
-                                sender: queue.sender.clone(),
+                                state: std::sync::Arc::clone(&queue.state),
                                 overflow: queue.overflow.clone(),
                             })
                         })
@@ -7369,10 +7367,8 @@ mod tests {
             };
             group
                 .members
-                .insert(a_pk.clone(), ["admin".to_string()].into());
-            group
-                .members
-                .insert(b_pk.clone(), std::collections::HashSet::new());
+                .insert(a_pk.clone(), ["admin".to_string()].into_iter().collect());
+            group.members.insert(b_pk.clone(), Default::default());
             group.settings.private = true;
             group.settings.restricted = true;
             group.settings.closed = true;
@@ -7505,9 +7501,12 @@ mod tests {
 
     #[tokio::test]
     async fn full_live_queue_signals_connection_overflow() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+        let state = std::sync::Arc::new(crate::ws::LiveQueueState::new());
         let (overflow, overflow_rx) = tokio::sync::watch::channel(());
-        let queue = LiveQueue { sender, overflow };
+        let queue = LiveQueue {
+            state: std::sync::Arc::clone(&state),
+            overflow,
+        };
         let batch = std::sync::Arc::new(Vec::new());
 
         for _ in 0..crate::relay::LIVE_QUEUE_CAPACITY {
@@ -7523,7 +7522,7 @@ mod tests {
             overflow_rx.has_changed().unwrap(),
             "a full queue must signal the connection to close"
         );
-        assert_eq!(receiver.len(), crate::relay::LIVE_QUEUE_CAPACITY);
+        assert_eq!(state.len(), crate::relay::LIVE_QUEUE_CAPACITY);
     }
 
     #[tokio::test]
@@ -7531,12 +7530,14 @@ mod tests {
         let queues = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let mut receivers = Vec::new();
         for id in 0..2 {
-            let (sender, _receiver) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
             let (overflow, overflow_rx) = tokio::sync::watch::channel(());
-            queues
-                .lock()
-                .unwrap()
-                .insert(id, LiveQueue { sender, overflow });
+            queues.lock().unwrap().insert(
+                id,
+                LiveQueue {
+                    state: std::sync::Arc::new(crate::ws::LiveQueueState::new()),
+                    overflow,
+                },
+            );
             receivers.push(overflow_rx);
         }
 

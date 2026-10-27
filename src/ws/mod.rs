@@ -35,6 +35,11 @@ const OUTGOING_SHRINK_THRESHOLD: usize = 1024;
 /// many entries. The maps are small in normal use; this only frees the
 /// capacity a large subscription burst left behind.
 const MAP_SHRINK_THRESHOLD: usize = 8;
+
+/// Release an empty live-batch deque that once grew past this many batches.
+/// The queue is sized by actual pending batches instead of preallocating
+/// `LIVE_QUEUE_CAPACITY` slots in every subscriber.
+const LIVE_QUEUE_SHRINK_THRESHOLD: usize = 128;
 /// Events queued on a connection before they are accepted as one database
 /// batch (the batch shares a single write commit).
 pub(crate) const EVENT_BATCH: usize = 64;
@@ -542,7 +547,7 @@ pub struct Conn {
     /// subscription closes (so idle connections are never woken by live
     /// events). A duplicate delivery of an event that is both in the query
     /// result and live is harmless (clients deduplicate by id).
-    pub(crate) live: Option<tokio::sync::mpsc::Receiver<LiveBatch>>,
+    pub(crate) live: Option<Arc<LiveQueueState>>,
     /// The overflow signal shared with the relay's live-queue map. Kept
     /// even while no live queue exists, so a lazily created/recreated queue
     /// reuses the same watch receiver held by the connection loop.
@@ -612,6 +617,122 @@ pub struct Conn {
 /// the live bus task).
 pub(crate) type LiveBatch = Arc<Vec<(Arc<crate::event::Event>, Arc<String>)>>;
 
+/// The per-connection live-delivery backlog.
+///
+/// A bounded `tokio::sync::mpsc` channel allocates all
+/// `LIVE_QUEUE_CAPACITY` slots when the first subscription is created, even
+/// though most subscribers keep at most a handful of batches queued. This
+/// deque starts empty and grows only with actual pending batches; the
+/// `Notify` wakes the connection loop in place of the channel receiver.
+/// The capacity/overflow behavior is unchanged: past
+/// `LIVE_QUEUE_CAPACITY` the batch is not enqueued and the overflow watch
+/// closes the connection so it can resynchronize.
+struct LiveQueueInner {
+    batches: std::collections::VecDeque<LiveBatch>,
+    /// Set when the last subscription closes. A bus delivery that already
+    /// cloned this queue must then be ignored: the old mpsc sender reported
+    /// `Closed` instead of `Full`, so a drained-away receiver never turned a
+    /// stale clone into an overflow close.
+    closed: bool,
+}
+
+pub(crate) struct LiveQueueState {
+    inner: std::sync::Mutex<LiveQueueInner>,
+    notify: tokio::sync::Notify,
+}
+
+impl LiveQueueState {
+    pub(crate) fn new() -> Self {
+        LiveQueueState {
+            inner: std::sync::Mutex::new(LiveQueueInner {
+                batches: std::collections::VecDeque::new(),
+                closed: false,
+            }),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Queues one batch, returning `false` when the backlog is full. A
+    /// closed queue accepts (and discards) the batch instead of signalling
+    /// an overflow to a connection that no longer has subscriptions.
+    pub(crate) fn push(&self, batch: LiveBatch) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.closed {
+            return true;
+        }
+        if inner.batches.len() >= crate::relay::LIVE_QUEUE_CAPACITY {
+            return false;
+        }
+        inner.batches.push_back(batch);
+        drop(inner);
+        self.notify.notify_one();
+        true
+    }
+
+    /// Waits for (and returns) the next queued batch. `None` means the
+    /// queue was closed (the connection has no subscriptions left).
+    pub(crate) async fn recv(&self) -> Option<LiveBatch> {
+        loop {
+            // Create the wait future before checking the deque: a push
+            // between the check and the await must leave a permit, or the
+            // connection could sleep forever with a queued batch.
+            let notified = self.notify.notified();
+            let next = {
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match inner.batches.pop_front() {
+                    Some(batch) => Some(batch),
+                    None if inner.closed => return None,
+                    None => None,
+                }
+            };
+            if let Some(batch) = next {
+                return Some(batch);
+            }
+            notified.await;
+        }
+    }
+
+    /// Stops deliveries and drops any queued batches when the last
+    /// subscription closes.
+    pub(crate) fn close(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.closed = true;
+        inner.batches.clear();
+        inner.batches.shrink_to_fit();
+        drop(inner);
+        self.notify.notify_waiters();
+    }
+
+    /// Releases the backlog's allocation once a burst has drained.
+    pub(crate) fn shrink_idle(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.batches.is_empty() && inner.batches.capacity() > LIVE_QUEUE_SHRINK_THRESHOLD {
+            inner.batches.shrink_to_fit();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .batches
+            .len()
+    }
+}
+
 impl Conn {
     /// Drops oversized backing allocations that an idle connection no
     /// longer needs. Called after a successful drain: the socket queue is
@@ -632,6 +753,9 @@ impl Conn {
         if self.authed_pubkeys.is_empty() && self.authed_pubkeys.capacity() > MAP_SHRINK_THRESHOLD {
             self.authed_pubkeys.shrink_to_fit();
         }
+        if let Some(live) = &self.live {
+            live.shrink_idle();
+        }
     }
 
     /// Creates the per-connection live queue on the first subscription.
@@ -642,7 +766,7 @@ impl Conn {
         if self.live.is_some() {
             return;
         }
-        let (live_tx, live_rx) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+        let state = Arc::new(LiveQueueState::new());
         self.relay
             .conn_queues
             .lock()
@@ -650,11 +774,11 @@ impl Conn {
             .insert(
                 self.conn_id,
                 crate::relay::LiveQueue {
-                    sender: live_tx,
+                    state: Arc::clone(&state),
                     overflow: self.overflow_tx.clone(),
                 },
             );
-        self.live = Some(live_rx);
+        self.live = Some(state);
     }
 
     /// Releases the live queue once the connection has no subscriptions.
@@ -663,7 +787,9 @@ impl Conn {
     /// creates a fresh queue/channel.
     fn release_live_queue_if_idle(&mut self) {
         if self.live.is_some() && self.subs.is_empty() {
-            self.live = None;
+            if let Some(state) = self.live.take() {
+                state.close();
+            }
             self.relay
                 .conn_queues
                 .lock()
@@ -1889,8 +2015,8 @@ pub async fn handle_connection(
         // emptiness is what decides whether the socket is the bottleneck.)
         drain_stalled = !conn.outgoing.is_empty();
         let live_fut = async {
-            match conn.live.as_mut() {
-                Some(rx) => rx.recv().await,
+            match conn.live.as_ref() {
+                Some(state) => state.recv().await,
                 None => std::future::pending().await,
             }
         };
@@ -2638,6 +2764,47 @@ mod tests {
             "the queue map entry must be removed"
         );
         conn.relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn live_queue_wakes_a_waiting_receiver() {
+        let state = Arc::new(LiveQueueState::new());
+        let waiter = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { state.recv().await })
+        };
+        tokio::task::yield_now().await;
+        let batch: LiveBatch = Arc::new(Vec::new());
+        assert!(state.push(Arc::clone(&batch)), "the empty queue accepts");
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("the notifier must wake the receiver")
+            .expect("the waiter must not panic")
+            .expect("the queue is open");
+        assert!(
+            Arc::ptr_eq(&received, &batch),
+            "the receiver must get the queued batch, not a copy"
+        );
+        state.close();
+    }
+
+    #[tokio::test]
+    async fn closed_live_queue_discards_stale_batches() {
+        // A bus delivery that cloned the queue before the last CLOSE must
+        // not enqueue into a receiver that is gone (the old mpsc sender
+        // reported Closed, not Full, so it must not trigger an overflow
+        // close on a connection with no subscriptions).
+        let state = LiveQueueState::new();
+        let batch: LiveBatch = Arc::new(Vec::new());
+        assert!(state.push(Arc::clone(&batch)));
+        assert_eq!(state.len(), 1);
+        state.close();
+        assert_eq!(state.len(), 0, "close must drop queued batches");
+        assert!(
+            state.push(batch),
+            "a stale clone must be accepted-and-discarded, not reported as overflow"
+        );
+        assert_eq!(state.len(), 0);
     }
 
     #[tokio::test]
@@ -4198,7 +4365,7 @@ mod tests {
             assert!(relay.broadcast(ev.clone()).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                conn.live.as_mut().unwrap().recv(),
+                conn.live.as_ref().unwrap().recv(),
             )
             .await;
             match received {
@@ -4230,7 +4397,7 @@ mod tests {
             assert!(relay.broadcast(ev.clone()).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                owner.live.as_mut().unwrap().recv(),
+                owner.live.as_ref().unwrap().recv(),
             )
             .await;
             match received {
@@ -5325,7 +5492,7 @@ mod tests {
             assert!(conn_a.relay.broadcast(ev.clone()).await.is_ok());
             let received_a = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                conn_a.live.as_mut().unwrap().recv(),
+                conn_a.live.as_ref().unwrap().recv(),
             )
             .await
             .expect("the matching connection receives the batch")
@@ -5423,7 +5590,7 @@ mod tests {
             assert!(conn.relay.broadcast(ev.clone()).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                conn.live.as_mut().unwrap().recv(),
+                conn.live.as_ref().unwrap().recv(),
             )
             .await;
             match received {
@@ -9598,7 +9765,7 @@ mod tests {
             assert!(conn.relay.broadcast(ev).await.is_ok());
             let received = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                conn.live.as_mut().unwrap().recv(),
+                conn.live.as_ref().unwrap().recv(),
             )
             .await
             .expect("live delivery resumes after CLOSE + REQ")

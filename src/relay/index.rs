@@ -138,6 +138,31 @@ impl SubscriptionIndex {
             }
         }
         self.registered.insert(conn, components);
+        self.shrink_idle_capacity();
+    }
+
+    /// Releases index tables that a subscription burst grew but that are
+    /// now empty. The per-key entries are pruned as connections close; the
+    /// hash tables themselves would otherwise retain the peak capacity for
+    /// the process lifetime (a churn of unique authors/tags can grow them
+    /// into tens of megabytes). Only empty tables are shrunk, so a live
+    /// index and the common re-registration path keep their capacity.
+    fn shrink_idle_capacity(&mut self) {
+        if self.kinds.is_empty() {
+            self.kinds.shrink_to_fit();
+        }
+        if self.authors.is_empty() {
+            self.authors.shrink_to_fit();
+        }
+        if self.tags.is_empty() {
+            self.tags.shrink_to_fit();
+        }
+        if self.all.is_empty() {
+            self.all.shrink_to_fit();
+        }
+        if self.registered.is_empty() {
+            self.registered.shrink_to_fit();
+        }
     }
 
     /// Removes a connection from every entry it registered. Idempotent:
@@ -149,6 +174,7 @@ impl SubscriptionIndex {
         if let Some(components) = self.registered.remove(&conn) {
             self.remove_components(conn, &components);
         }
+        self.shrink_idle_capacity();
     }
 
     /// Removes exactly the given components for `conn`, pruning entries

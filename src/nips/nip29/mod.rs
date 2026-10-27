@@ -295,10 +295,82 @@ pub struct GroupSettings {
     pub join_role: Option<String>,
 }
 
+/// One member's NIP-29 roles.
+///
+/// Group members overwhelmingly carry zero roles (plain members) or one
+/// privileged role. A `HashSet` stores a 48-byte table header in every
+/// member entry and allocates a hash table as soon as the first role is
+/// added; the `Vec`-backed set keeps the empty case at 24 bytes and a
+/// single role in one small allocation. Role sets are only queried with
+/// `contains`, and NIP-29 role lists are tiny, so the linear scan is
+/// cheaper than hashing and does not change the persisted JSON shape
+/// (serde still emits/accepts an array of role strings).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct RoleSet(Vec<String>);
+
+impl PartialEq for RoleSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().all(|role| other.contains(role))
+    }
+}
+
+impl Eq for RoleSet {}
+
+impl RoleSet {
+    pub fn contains(&self, role: &str) -> bool {
+        self.0.iter().any(|stored| stored == role)
+    }
+
+    pub fn insert(&mut self, role: String) -> bool {
+        if self.contains(&role) {
+            return false;
+        }
+        self.0.push(role);
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl std::ops::Deref for RoleSet {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl FromIterator<String> for RoleSet {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        let mut set = RoleSet::default();
+        for role in iter {
+            set.insert(role);
+        }
+        set
+    }
+}
+
+impl From<std::collections::HashSet<String>> for RoleSet {
+    fn from(roles: std::collections::HashSet<String>) -> Self {
+        roles.into_iter().collect()
+    }
+}
+
+impl Extend<String> for RoleSet {
+    fn extend<T: IntoIterator<Item = String>>(&mut self, iter: T) {
+        for role in iter {
+            self.insert(role);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Group {
     /// pubkey -> set of roles.
-    pub members: HashMap<String, HashSet<String>>,
+    pub members: HashMap<String, RoleSet>,
     pub settings: GroupSettings,
     pub parent: Option<String>,
     pub children: Vec<String>,
@@ -669,7 +741,7 @@ pub(crate) struct BuzzGroupBackup {
     #[serde(default)]
     pub bots: HashSet<String>,
     #[serde(default)]
-    pub roles: HashMap<String, HashSet<String>>,
+    pub roles: HashMap<String, RoleSet>,
 }
 
 /// Borrowed form of [`GroupsSnapshot`] used to write the DM backup without
@@ -725,7 +797,7 @@ struct BuzzGroupBackupRef<'a> {
     creator_role_explicit: bool,
     guests: &'a HashSet<String>,
     bots: &'a HashSet<String>,
-    roles: &'a HashMap<String, HashSet<String>>,
+    roles: &'a HashMap<String, RoleSet>,
 }
 
 /// Serializes the Buzz-specific backup directly from the snapshot. Groups
@@ -2093,7 +2165,7 @@ impl GroupStore {
                             group.guests.remove(&pk);
                             group.bots.remove(&pk);
                         }
-                        group.members.insert(pk, roles);
+                        group.members.insert(pk, RoleSet::from(roles));
                     }
                     if event.tags.iter().any(|tag| {
                         tag.len() >= 2

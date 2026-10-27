@@ -68,29 +68,21 @@ fn dm_snapshot_merge_only_fills_missing_dm_groups() {
         channel_type: "dm".into(),
         ..Group::default()
     };
-    existing
-        .members
-        .insert(USER.into(), std::collections::HashSet::new());
+    existing.members.insert(USER.into(), Default::default());
     store.groups.insert("dm-existing".into(), existing);
 
     let mut stale = Group {
         channel_type: "dm".into(),
         ..Group::default()
     };
-    stale
-        .members
-        .insert(ADMIN.into(), std::collections::HashSet::new());
+    stale.members.insert(ADMIN.into(), Default::default());
     let mut restored = Group {
         channel_type: "dm".into(),
         ..Group::default()
     };
-    restored
-        .members
-        .insert(USER.into(), std::collections::HashSet::new());
+    restored.members.insert(USER.into(), Default::default());
     let mut ordinary = Group::default();
-    ordinary
-        .members
-        .insert(USER.into(), std::collections::HashSet::new());
+    ordinary.members.insert(USER.into(), Default::default());
     let mut snapshot = GroupsSnapshot::default();
     snapshot.groups.insert("dm-existing".into(), stale);
     snapshot.groups.insert("dm-restored".into(), restored);
@@ -131,9 +123,7 @@ fn buzz_backup_restores_metadata_without_adding_members() {
         create_id: Some("bb".repeat(32)),
         ..Group::default()
     };
-    recreated
-        .members
-        .insert(USER.into(), std::collections::HashSet::new());
+    recreated.members.insert(USER.into(), Default::default());
     store.groups.insert("recreated".into(), recreated);
 
     let backup = BuzzBackup {
@@ -150,7 +140,7 @@ fn buzz_backup_restores_metadata_without_adding_members() {
                     bots: std::collections::HashSet::from([ADMIN.to_string()]),
                     roles: std::collections::HashMap::from([(
                         USER.to_string(),
-                        std::collections::HashSet::from(["owner".to_string()]),
+                        ["owner".to_string()].into_iter().collect(),
                     )]),
                 },
             ),
@@ -1681,7 +1671,7 @@ fn throttled_member_lists_are_republished_later() {
         for i in 0..1001 {
             group
                 .members
-                .insert(format!("{i:064x}"), std::collections::HashSet::new());
+                .insert(format!("{i:064x}"), Default::default());
         }
     }
     store.members_published_at.insert("g1".into(), now);
@@ -6727,6 +6717,37 @@ fn privileged_put_user_wins_over_a_guest_tier() {
     assert!(
         !group.is_guest(USER),
         "a privileged role must not leave a contradictory guest tier"
+    );
+}
+
+#[test]
+fn role_sets_keep_the_legacy_json_array_shape() {
+    // Snapshots written before the compact role set stored the same JSON
+    // arrays; the new representation must deserialize those bytes and
+    // re-emit the identical shape, not a map or an object.
+    let pubkey = "aa".repeat(32);
+    let mut group = Group::default();
+    group.members.insert(
+        pubkey.clone(),
+        ["admin".to_string(), "mod".to_string()]
+            .into_iter()
+            .collect(),
+    );
+    let json = serde_json::to_value(&group).expect("group JSON");
+    assert_eq!(
+        json["members"].get(&pubkey),
+        Some(&serde_json::json!(["admin", "mod"])),
+        "a member's roles must stay a JSON array in insertion order"
+    );
+    let loaded: Group = serde_json::from_value(json).expect("legacy group JSON");
+    let roles = loaded.members.get(&pubkey).expect("member");
+    assert!(roles.contains("admin"));
+    assert!(roles.contains("mod"));
+    assert_eq!(roles.len(), 2);
+    assert!(
+        std::mem::size_of::<super::RoleSet>()
+            < std::mem::size_of::<std::collections::HashSet<String>>(),
+        "the compact role set must not be larger than the empty HashSet it replaced"
     );
 }
 
