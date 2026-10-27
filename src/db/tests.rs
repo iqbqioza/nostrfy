@@ -3874,6 +3874,42 @@ fn role_rebuild_journal_round_trips_additively() {
 }
 
 #[test]
+fn event_arrival_sequence_round_trips() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cfg = config();
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .expect("database must open");
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+        let first_seq = db
+            .assign_event_arrival(first)
+            .await
+            .expect("first sequence");
+        let second_seq = db
+            .assign_event_arrival(second)
+            .await
+            .expect("second sequence");
+        assert!(second_seq > first_seq);
+        let arrivals = db
+            .event_arrivals(vec![first.to_vec(), second.to_vec()])
+            .await
+            .expect("arrival read");
+        assert_eq!(arrivals.get(&hex::encode(first)), Some(&first_seq));
+        assert_eq!(arrivals.get(&hex::encode(second)), Some(&second_seq));
+        db.shutdown();
+    });
+}
+
+#[test]
 fn group_epoch_index_round_trips_additively() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

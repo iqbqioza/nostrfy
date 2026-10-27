@@ -236,6 +236,21 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(false);
             false
         }
+        Msg::EventArrivals { event_ids, reply } => {
+            let out = match store.event_arrivals(&event_ids) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::AssignArrival { reply, .. } => {
+            let _ = reply.send(None);
+            false
+        }
         Msg::LoadDmCarry { reply } => {
             let out = match store.load_dm_carry() {
                 Ok(data) => Some(data),
@@ -1448,6 +1463,26 @@ pub(crate) fn spawn(
                                 Msg::ThreadRootTombstone { event_id, reply } => {
                                     let out = match store.thread_root_tombstone(&event_id) {
                                         Ok(meta) => Some(meta),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::AssignArrival { event_id, reply } => {
+                                    let seq = match store.assign_event_arrival(&event_id) {
+                                        Ok(seq) => Some(seq),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(seq);
+                                }
+                                Msg::EventArrivals { event_ids, reply } => {
+                                    let out = match store.event_arrivals(&event_ids) {
+                                        Ok(map) => Some(map),
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
                                             None

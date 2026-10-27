@@ -62,6 +62,36 @@ fn an_explicit_creator_demotion_survives_buzz_restore() {
 }
 
 #[test]
+fn same_second_removal_uses_arrival_sequence() {
+    let mut remove = event(
+        REMOVE_USER,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["p".into(), USER.into()]],
+    );
+    remove.id = "71".repeat(32);
+    let mut join = event(JOIN, USER, Some("g1"), vec![]);
+    join.id = "72".repeat(32);
+    let mut arrivals = HashMap::new();
+    arrivals.insert(remove.id.clone(), 10);
+    arrivals.insert(join.id.clone(), 20);
+    let removals = SameSecondRemovals::collect_with_arrivals(&[remove.clone(), join], &arrivals);
+    assert!(
+        !removals.removes_before(USER, remove.created_at, "g1", Some(20)),
+        "arrival-ordered state must not use conservative remove-wins"
+    );
+    assert!(
+        !removals.removes_before(USER, remove.created_at, "g1", Some(5)),
+        "the page sort decides the final state when both arrivals are known"
+    );
+    let legacy = SameSecondRemovals::collect(&[remove]);
+    assert!(
+        legacy.removes_before(USER, 1_600_000_000, "g1", Some(99)),
+        "events without arrival metadata keep the conservative remove-wins rule"
+    );
+}
+
+#[test]
 fn channel_ttl_expires_only_content_events() {
     let mut store = GroupStore {
         buzz_enabled: true,

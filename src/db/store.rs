@@ -3059,6 +3059,57 @@ impl Store {
         Ok(())
     }
 
+    /// Assigns the next ingest sequence to a group-state event. The counter
+    /// and the per-event key commit together, so a restart cannot assign a
+    /// sequence twice or lose an already-assigned event.
+    pub(crate) fn assign_event_arrival(&self, event_id: &[u8]) -> Result<u64> {
+        if event_id.len() != ID_LEN {
+            return Err(anyhow::anyhow!("invalid arrival event id"));
+        }
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        let next = self
+            .index_meta
+            .get(&wtxn, b"arrival_seq")?
+            .and_then(|raw| raw.get(..8))
+            .map(|raw| u64::from_be_bytes(raw.try_into().expect("checked length")))
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.index_meta
+            .put(&mut wtxn, b"arrival_seq", &next.to_be_bytes())?;
+        let mut key = Vec::with_capacity(8 + event_id.len());
+        key.extend_from_slice(b"arrival:");
+        key.extend_from_slice(event_id);
+        self.index_meta.put(&mut wtxn, &key, &next.to_be_bytes())?;
+        wtxn.commit()?;
+        Ok(next)
+    }
+
+    pub(crate) fn event_arrivals(
+        &self,
+        event_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<String, u64>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = std::collections::HashMap::with_capacity(event_ids.len());
+        for id in event_ids {
+            if id.len() != ID_LEN {
+                continue;
+            }
+            let mut key = Vec::with_capacity(8 + id.len());
+            key.extend_from_slice(b"arrival:");
+            key.extend_from_slice(id);
+            if let Some(raw) = self.index_meta.get(&rtxn, &key)?
+                && raw.len() >= 8
+            {
+                out.insert(
+                    hex::encode(id),
+                    u64::from_be_bytes(raw[..8].try_into().expect("checked length")),
+                );
+            }
+        }
+        Ok(out)
+    }
+
     /// Batch form used by the one-time startup backfill. One transaction
     /// keeps a large legacy group history from paying one fsync per event.
     pub(crate) fn record_group_epochs_batch(&self, entries: &[(Vec<u8>, String)]) -> Result<()> {
@@ -4160,6 +4211,10 @@ impl Store {
         epoch_key.extend_from_slice(b"group_epoch:");
         epoch_key.extend_from_slice(id);
         self.index_meta.delete(wtxn, &epoch_key)?;
+        let mut arrival_key = Vec::with_capacity(8 + id.len());
+        arrival_key.extend_from_slice(b"arrival:");
+        arrival_key.extend_from_slice(id);
+        self.index_meta.delete(wtxn, &arrival_key)?;
         self.remember_thread_root_tombstone(wtxn, &event, id)?;
         self.events.delete(wtxn, id)?;
         self.by_created
@@ -4284,6 +4339,10 @@ impl Store {
         epoch_key.extend_from_slice(b"group_epoch:");
         epoch_key.extend_from_slice(id);
         self.index_meta.delete(wtxn, &epoch_key)?;
+        let mut arrival_key = Vec::with_capacity(8 + id.len());
+        arrival_key.extend_from_slice(b"arrival:");
+        arrival_key.extend_from_slice(id);
+        self.index_meta.delete(wtxn, &arrival_key)?;
         self.events.delete(wtxn, id)?;
         if !capped.is_empty() {
             log::warn!(

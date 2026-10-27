@@ -512,6 +512,14 @@ enum Msg {
     ClearDmCarry {
         reply: oneshot::Sender<bool>,
     },
+    AssignArrival {
+        event_id: Vec<u8>,
+        reply: oneshot::Sender<Option<u64>>,
+    },
+    EventArrivals {
+        event_ids: Vec<Vec<u8>>,
+        reply: oneshot::Sender<Option<std::collections::HashMap<String, u64>>>,
+    },
     /// Persist the NIP-IA archived-identities set.
     SaveIdentityArchive {
         data: Vec<u8>,
@@ -2230,6 +2238,24 @@ impl DbClient {
         })
         .await
         .flatten()
+    }
+
+    pub async fn assign_event_arrival(&self, event_id: [u8; 32]) -> Option<u64> {
+        self.request_write_checked(|reply| Msg::AssignArrival {
+            event_id: event_id.to_vec(),
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
+    pub async fn event_arrivals(
+        &self,
+        event_ids: Vec<Vec<u8>>,
+    ) -> Option<std::collections::HashMap<String, u64>> {
+        self.request_read_startup(|reply| Msg::EventArrivals { event_ids, reply })
+            .await
+            .flatten()
     }
 
     pub async fn record_group_epochs_batch(&self, entries: Vec<(Vec<u8>, String)>) -> bool {

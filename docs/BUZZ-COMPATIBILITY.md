@@ -269,10 +269,12 @@ host, because Buzz signs the relay URL it uploads to.
   its empty `kind:39004` is not republished by a snapshot-less rebuild. The
   old participant list can remain until the room is reconfigured; the
   LiveKit poll skips the now-inactive group.
-- The rebuild's same-second tie-break cannot recover arrival order between
-  a `9001` remove and a `9000` re-add, or a `9022` leave and a `9021`
-  rejoin. The remove/leave wins on replay until the next edit; store an
-  explicit later role/join event if that state must survive a restart.
+- New group-state events receive a durable arrival sequence in the additive
+  `arrival:` index, and the rebuild orders ordinary state operations by that
+  sequence within one second. A remove followed by a rejoin therefore
+  survives, and a rejoin followed by a remove stays removed. `9007`/`9008`
+  retain structural precedence. Legacy/imported events without an arrival
+  entry fall back to the conservative remove-wins rule.
 - A JOIN accepted with a `created_at` far in the future (up to
   `max_created_at_future_secs`) could sort after a later removal on replay
   and re-add an open-group member. Group/join/leave events reject a future

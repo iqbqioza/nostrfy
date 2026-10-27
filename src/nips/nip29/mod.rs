@@ -3233,6 +3233,7 @@ impl GroupStore {
         const PENDING_STATE_MAX: usize = 50_000;
         let mut pending_state: HashMap<String, Vec<Event>> = HashMap::new();
         let mut pending_epochs: HashMap<String, String> = HashMap::new();
+        let mut pending_arrivals: HashMap<String, u64> = HashMap::new();
         let mut pending_state_count = 0usize;
         let mut since: Option<u64> = None;
         loop {
@@ -3256,19 +3257,23 @@ impl GroupStore {
             if page.is_empty() {
                 break;
             }
-            let page_epochs = {
-                let ids: Vec<Vec<u8>> = page
-                    .iter()
-                    .filter_map(|event| event.id_bytes().map(|id| id.to_vec()))
-                    .collect();
-                let Some(epochs) = db.group_epochs_startup(ids).await else {
-                    log::error!(
-                        "group state rebuild aborted: the group-epoch index did not answer; \
-                         refusing to persist an incomplete group store"
-                    );
-                    return false;
-                };
-                epochs
+            let page_ids: Vec<Vec<u8>> = page
+                .iter()
+                .filter_map(|event| event.id_bytes().map(|id| id.to_vec()))
+                .collect();
+            let Some(page_epochs) = db.group_epochs_startup(page_ids.clone()).await else {
+                log::error!(
+                    "group state rebuild aborted: the group-epoch index did not answer; \
+                     refusing to persist an incomplete group store"
+                );
+                return false;
+            };
+            let Some(page_arrivals) = db.event_arrivals(page_ids).await else {
+                log::error!(
+                    "group state rebuild aborted: the arrival index did not answer; \
+                     refusing to persist an incomplete group store"
+                );
+                return false;
             };
             if more {
                 // The collector stopped early. It can stop on the count cap
@@ -3289,30 +3294,25 @@ impl GroupStore {
                     return false;
                 }
             }
-            page.sort_by(|a, b| {
-                (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
-                    b.created_at,
-                    group_rank(b.kind),
-                    b.kind,
-                    &b.id,
-                ))
-            });
+            page.sort_by(|a, b| replay_order(a, b, &page_arrivals));
             let max_created = page.last().map(|event| event.created_at);
             // The removals issued in each second of this page. `group_rank`
             // applies a `9001` before a same-second `9021`, so without this
             // the join re-adds the member the removal just removed and a
             // removed member comes back on the next restart. Every other
             // pair keeps the order `group_rank` gives it.
-            let same_second_removals = SameSecondRemovals::collect(&page);
+            let same_second_removals =
+                SameSecondRemovals::collect_with_arrivals(&page, &page_arrivals);
             for mut event in page {
                 if event.kind == JOIN && vanished.contains(&event.pubkey) {
                     continue;
                 }
                 if event.kind == JOIN
-                    && same_second_removals.removes(
+                    && same_second_removals.removes_before(
                         &event.pubkey,
                         event.created_at,
                         group_id(&event).unwrap_or_default(),
+                        page_arrivals.get(&event.id).copied(),
                     )
                 {
                     continue;
@@ -3353,6 +3353,9 @@ impl GroupStore {
                         if let (Some(key), Some(expected)) = (&event_epoch, expected_epoch) {
                             pending_epochs.insert(key.clone(), expected.to_string());
                         }
+                        if let Some(seq) = page_arrivals.get(&event.id) {
+                            pending_arrivals.insert(event.id.clone(), *seq);
+                        }
                         pending_state.entry(gid).or_default().push(event);
                         pending_state_count += 1;
                         continue;
@@ -3383,14 +3386,7 @@ impl GroupStore {
                 if event.kind == CREATE_GROUP
                     && let Some(mut buffered) = pending_state.remove(&gid)
                 {
-                    buffered.sort_by(|a, b| {
-                        (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
-                            b.created_at,
-                            group_rank(b.kind),
-                            b.kind,
-                            &b.id,
-                        ))
-                    });
+                    buffered.sort_by(|a, b| replay_order(a, b, &pending_arrivals));
                     pending_state_count = pending_state_count.saturating_sub(buffered.len());
                     for buffered_event in buffered {
                         let expected = buffered_event
@@ -3608,9 +3604,41 @@ pub(crate) fn group_rank(kind: u64) -> u8 {
 /// is the restrictive reading of an unknowable order: when a removal and a
 /// re-join share a second, the member ends up removed. A join in any later
 /// second is unaffected and is honoured.
+/// Total replay order for one timestamp second. Create/delete retain their
+/// structural precedence; ordinary state events prefer the durable ingest
+/// sequence over the kind/rank/id fallback.
+fn replay_order(a: &Event, b: &Event, arrivals: &HashMap<String, u64>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let class = |kind: u64| match kind {
+        CREATE_GROUP => 0u8,
+        DELETE_GROUP => 1,
+        _ => 2,
+    };
+    let base = |a: &Event, b: &Event| {
+        (group_rank(a.kind), a.kind, &a.id).cmp(&(group_rank(b.kind), b.kind, &b.id))
+    };
+    match a.created_at.cmp(&b.created_at) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    let (ca, cb) = (class(a.kind), class(b.kind));
+    match ca.cmp(&cb) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    if ca == 2
+        && let (Some(sa), Some(sb)) = (arrivals.get(&a.id), arrivals.get(&b.id))
+    {
+        return sa.cmp(sb).then_with(|| base(a, b));
+    }
+    base(a, b)
+}
+
+type SecondRemovals = HashMap<(u64, String), HashMap<String, Vec<Option<u64>>>>;
+
 #[derive(Default)]
 pub(crate) struct SameSecondRemovals {
-    by_second: HashMap<(u64, String), HashSet<String>>,
+    by_second: SecondRemovals,
 }
 
 impl SameSecondRemovals {
@@ -3620,25 +3648,62 @@ impl SameSecondRemovals {
     /// (`boundary_second_complete`), so no removal can be hiding in the next
     /// page while its join is applied in this one.
     pub(crate) fn collect(events: &[Event]) -> Self {
-        let mut by_second: HashMap<(u64, String), HashSet<String>> = HashMap::new();
-        for event in events.iter().filter(|e| e.kind == REMOVE_USER) {
+        Self::collect_with_arrivals(events, &HashMap::new())
+    }
+
+    /// Like [`Self::collect`], but records the durable arrival sequence of
+    /// each removal when available.
+    pub(crate) fn collect_with_arrivals(events: &[Event], arrivals: &HashMap<String, u64>) -> Self {
+        let mut by_second: SecondRemovals = HashMap::new();
+        for event in events.iter().filter(|event| event.kind == REMOVE_USER) {
             let Some(gid) = group_id(event) else {
                 continue;
             };
-            by_second
+            let seq = arrivals.get(&event.id).copied();
+            let entry = by_second
                 .entry((event.created_at, gid.to_string()))
-                .or_default()
-                .extend(tag_values(event, P).map(str::to_string));
+                .or_default();
+            for pubkey in tag_values(event, P) {
+                entry.entry(pubkey.to_string()).or_default().push(seq);
+            }
         }
         Self { by_second }
     }
 
-    /// Whether a `kind:9001` in the second `at` removed `pubkey` from `gid`.
-    /// A removal in an unrelated group must not cancel a JOIN there.
+    /// Whether any `kind:9001` in the second `at` removed `pubkey` from
+    /// `gid`. Legacy callers without arrival metadata conservatively let a
+    /// removal win.
     pub(crate) fn removes(&self, pubkey: &str, at: u64, gid: &str) -> bool {
         self.by_second
             .get(&(at, gid.to_string()))
-            .is_some_and(|removed| removed.contains(pubkey))
+            .is_some_and(|removed| removed.contains_key(pubkey))
+    }
+
+    /// Arrival-aware form used by the rebuild: a JOIN that arrived after the
+    /// removal survives; a removal without a durable arrival value remains
+    /// conservative (remove wins).
+    pub(crate) fn removes_before(
+        &self,
+        pubkey: &str,
+        at: u64,
+        gid: &str,
+        join_seq: Option<u64>,
+    ) -> bool {
+        let Some(removals) = self
+            .by_second
+            .get(&(at, gid.to_string()))
+            .and_then(|removed| removed.get(pubkey))
+        else {
+            return false;
+        };
+        let Some(_join_seq) = join_seq else {
+            return true;
+        };
+        // When both the JOIN and every removal in the second have durable
+        // arrival order, the page sort itself produces the correct final
+        // state: no conservative suppression is needed. A removal without
+        // sequence metadata falls back to the legacy remove-wins rule.
+        removals.iter().any(Option::is_none)
     }
 }
 

@@ -3652,6 +3652,13 @@ impl Relay {
             (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
         drop(cfg);
         drop(access);
+        if nip29::is_group_action(&event)
+            && let Some(event_id) = event.id_bytes()
+        {
+            // Best-effort durable arrival sequence; a missing value falls
+            // back to the legacy rank/id order on replay.
+            let _ = self.db.assign_event_arrival(event_id).await;
+        }
         if let Some(icon) = workspace_icon.as_deref()
             && !self.apply_workspace_icon(icon).await
         {
