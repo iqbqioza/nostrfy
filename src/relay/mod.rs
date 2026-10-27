@@ -3672,6 +3672,17 @@ impl Relay {
             (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
         drop(cfg);
         drop(access);
+        // Validate member commands before storing them. The mutation itself
+        // runs after the put (to make an already-stored command a no-op on
+        // replay), but an unauthorized or malformed command must still be
+        // rejected rather than stored as an inert event.
+        if matches!(event.kind, 9030..=9032)
+            && let Err(reason) = self.validate_relay_member_command(&event).await
+        {
+            self.publish_rate_rollback(&event.pubkey, now);
+            self.stats.bump(&self.stats.events_rejected, 1);
+            return PutOutcome::Invalid(reason);
+        }
         if nip29::is_group_action(&event)
             && let Some(event_id) = event.id_bytes()
         {
@@ -3687,13 +3698,6 @@ impl Relay {
             return PutOutcome::Invalid(
                 "error: cannot persist the workspace icon; the command was not accepted".into(),
             );
-        }
-        if matches!(event.kind, 9030..=9032)
-            && let Err(reason) = self.apply_relay_member_command(&event).await
-        {
-            self.publish_rate_rollback(&event.pubkey, now);
-            self.stats.bump(&self.stats.events_rejected, 1);
-            return PutOutcome::Invalid(reason);
         }
         if matches!(event.kind, 9035 | 9036)
             && let Err(reason) = self.apply_identity_archive(&event).await
@@ -4471,6 +4475,8 @@ impl Relay {
                     }
                 }
                 if touch.roles || state_removed.role || unknown {
+                    // `mark_roles_stale` re-persists the group snapshot and
+                    // its DM/Buzz backups under the advanced shared stamp.
                     self.mark_roles_stale().await;
                 }
             }
@@ -4486,6 +4492,20 @@ impl Relay {
             // NIP-43: leave requests (ephemeral kinds) update the member
             // list without being stored.
             self.apply_leave_request(&event).await;
+        }
+        if nip43 && matches!(event.kind, 9030..=9032) {
+            // Apply the role mutation only after the command event stored
+            // (or was accepted as an ephemeral event). Applying before the
+            // put let a captured, already-stored command be replayed after a
+            // later demotion/removal and mutate the roster again. The command
+            // is idempotent; a failed publish/persist is logged rather than
+            // pretending the stored command never happened.
+            if let Err(reason) = self.apply_relay_member_command(&event).await {
+                log::warn!(
+                    "stored relay member command {} but could not apply it: {reason}",
+                    event.id
+                );
+            }
         }
         if nip29_enabled && nip29::is_group_action(&event) {
             let (applied, group_unapplied) = self
@@ -5742,6 +5762,10 @@ impl Relay {
             // Leave the persisted snapshot and its claims untouched; the
             // advanced DB generation makes the next enabled startup reject
             // it, carry its claims, and rebuild from the surviving events.
+            // The group snapshot shares that stamp; re-persist it so a
+            // disabled NIP-43 window does not invalidate DM/Buzz backups.
+            let _ = self.persist_groups().await;
+            self.schedule_groups_persist();
             return;
         }
         // Publish the mutation-visible dirty flag immediately, before
@@ -5775,6 +5799,16 @@ impl Relay {
             ..Default::default()
         };
         drop(buffer);
+        // Re-persist the unchanged group state before spawning the worker:
+        // the removal advanced the shared group/role stamp, and a restart
+        // would otherwise reject the DM/Buzz backups as stale. Keeping this
+        // await before `schedule_roles_rebuild` also means a caller that
+        // immediately signals drain still observes the same worker start
+        // ordering as before. If this call is Deferred because a derived
+        // mutation is in flight, the debounced worker retries after the
+        // claim drops.
+        let _ = self.persist_groups().await;
+        self.schedule_groups_persist();
         schedule_roles_rebuild(
             self.db.clone(),
             Arc::clone(&self.roles),
@@ -5786,7 +5820,64 @@ impl Relay {
         );
     }
 
-    /// The handles the role rebuild worker needs to republish the membership
+    /// Journals role mutations captured during a failed/aborted rebuild
+    /// before the database stops. The worker normally writes this journal
+    /// from `leave_buffering`, but a failed scan only calls
+    /// `retain_buffering`; without this shutdown hook those ACKed leaves
+    /// and assignments would exist only in memory.
+    pub(crate) async fn flush_role_rebuild_journal(&self) {
+        // Give a detached worker that observed the drain a bounded chance to
+        // finish its own journal write and clear the buffer.
+        for _ in 0..50 {
+            if !self
+                .roles_rebuild
+                .running
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if self
+            .roles_rebuild
+            .running
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            log::warn!(
+                "role rebuild worker is still running at shutdown; leaving its journal to the \
+                 worker"
+            );
+            return;
+        }
+        let mut buffer = self.roles_rebuild.buffer.lock().await;
+        if buffer.mutations.is_empty() {
+            return;
+        }
+        let Ok(data) = serde_json::to_vec(&buffer.mutations) else {
+            log::warn!("could not serialize the role rebuild mutation journal at shutdown");
+            return;
+        };
+        let mut saved = false;
+        for attempt in 0..3 {
+            if self.db.save_role_rebuild_pending(data.clone()).await {
+                saved = true;
+                break;
+            }
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        if saved {
+            buffer.mutations.clear();
+        } else {
+            log::warn!(
+                "could not persist the role rebuild mutation journal after retries; \
+                 captured mutations may be lost on shutdown"
+            );
+        }
+    }
+
+    /// The handles a role rebuild worker needs to republish the membership
     /// list after a clean rebuild (see [`RoleStatePublisher`]).
     async fn role_state_publisher(&self) -> RoleStatePublisher {
         RoleStatePublisher {
@@ -7008,6 +7099,7 @@ mod tests {
     use super::roles::RoleChange;
     use super::signal_live_resync;
     use super::validate::contains_secret_key;
+    use crate::db::PutOutcome;
     use crate::nips::nip43::RoleStore;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -7735,6 +7827,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_flushes_buffered_role_mutations() {
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        let member = "aa".repeat(32);
+        {
+            let mut buffer = relay.roles_rebuild.buffer.lock().await;
+            buffer.mutations.push(BufferedRoleMutation::RemovePubkey {
+                pubkey: member.clone(),
+            });
+        }
+        relay.flush_role_rebuild_journal().await;
+        let data = relay
+            .db
+            .load_role_rebuild_pending()
+            .await
+            .expect("journal read")
+            .expect("journal must be persisted");
+        let journal: Vec<BufferedRoleMutation> = serde_json::from_slice(&data).unwrap();
+        assert!(journal.iter().any(|mutation| matches!(
+            mutation,
+            BufferedRoleMutation::RemovePubkey { pubkey } if pubkey == &member
+        )));
+        assert!(
+            relay.roles_rebuild.buffer.lock().await.mutations.is_empty(),
+            "a successfully journaled buffer must be cleared"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn relay_member_commands_update_the_roster() {
         let key = "01".repeat(32);
         let relay = build_role_relay(Some(&key)).await;
@@ -7810,6 +7931,71 @@ mod tests {
             .await
             .expect("owner may remove a member");
         assert!(!relay.roles.read().await.is_member_of(&target));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_stored_relay_member_command_cannot_be_replayed_after_revocation() {
+        let key = "01".repeat(32);
+        let relay = build_role_relay(Some(&key)).await;
+        let owner = secp256k1::Keypair::from_secret_bytes([9u8; 32]).unwrap();
+        let owner_pk = secp256k1::XOnlyPublicKey::from_keypair(&owner)
+            .0
+            .to_string();
+        let target = "bb".repeat(32);
+        relay.config.write().await.relay.pubkey = owner_pk.clone();
+        let sign = |kind: u64, tags: Vec<Vec<String>>| {
+            let mut event = crate::event::Event {
+                id: String::new(),
+                pubkey: owner_pk.clone(),
+                created_at: crate::util::unix_now(),
+                kind,
+                tags,
+                content: String::new(),
+                sig: String::new(),
+            };
+            event.id = crate::nips::nip01::compute_id(&event);
+            let id = event.id_bytes().unwrap();
+            event.sig = secp256k1::schnorr::sign_no_aux_rand(&id, &owner).to_string();
+            event
+        };
+        let add = sign(
+            9030,
+            vec![
+                vec!["p".into(), target.clone()],
+                vec!["role".into(), "admin".into()],
+            ],
+        );
+        assert!(matches!(
+            relay.accept_event(add.clone(), &[], None).await,
+            PutOutcome::Stored
+        ));
+        assert!(
+            relay
+                .roles
+                .read()
+                .await
+                .assignments
+                .get(&target)
+                .is_some_and(|roles| roles.iter().any(|role| role == "admin"))
+        );
+        let remove = sign(9031, vec![vec!["p".into(), target.clone()]]);
+        assert!(matches!(
+            relay.accept_event(remove, &[], None).await,
+            PutOutcome::Stored
+        ));
+        assert!(!relay.roles.read().await.is_member_of(&target));
+
+        // The old command is already stored. Replaying it must be a
+        // duplicate with no role mutation, not a pre-store command apply.
+        assert!(matches!(
+            relay.accept_event(add, &[], None).await,
+            PutOutcome::Duplicate(_)
+        ));
+        assert!(
+            !relay.roles.read().await.is_member_of(&target),
+            "a replayed historical 9030 must not re-grant the revoked member"
+        );
         relay.db.shutdown();
     }
 

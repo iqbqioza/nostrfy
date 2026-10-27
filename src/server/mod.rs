@@ -811,7 +811,7 @@ async fn restore_dm_metadata(relay: &Relay) -> Result<usize> {
     {
         let groups = relay.groups.read().await;
         for (gid, meta) in meta {
-            if groups.group(&gid).is_some() || groups.is_deleted(&gid) || groups.is_ghosted(&gid) {
+            if groups.group(&gid).is_some() || groups.is_deleted(&gid) {
                 continue;
             }
             let Some(group) = dm_group_from_metadata(
@@ -1282,6 +1282,13 @@ async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
 /// snapshot. Ordinary groups are rebuilt from imported events; DM groups
 /// have no stored create and must be carried separately.
 async fn restore_dm_carry(relay: &Relay) -> Result<()> {
+    if relay.groups.read().await.is_unrestored() {
+        // The carry is the only durable copy of a migration DM. Do not merge
+        // it into a fail-closed/unrestored store and then let a snapshot
+        // clear report success; a later successful rebuild must still find
+        // the carry.
+        return Ok(());
+    }
     let Some(data) = relay.db.load_dm_carry().await else {
         return Err(anyhow::anyhow!(
             "cannot read the migration DM carry snapshot; refusing to start"
@@ -1290,8 +1297,10 @@ async fn restore_dm_carry(relay: &Relay) -> Result<()> {
     let Some(data) = data else {
         return Ok(());
     };
-    let carry: crate::nips::nip29::GroupsSnapshot = serde_json::from_slice(&data)
+    let mut carry: crate::nips::nip29::GroupsSnapshot = serde_json::from_slice(&data)
         .map_err(|error| anyhow::anyhow!("invalid migration DM carry snapshot: {error}"))?;
+    filter_vanished_group_snapshot(relay, &mut carry).await?;
+    carry.groups.retain(|_, group| !group.members.is_empty());
     let changed = relay.groups.write().await.merge_dm_snapshot(carry);
     if !changed {
         if !relay.db.clear_dm_carry().await {
@@ -1299,9 +1308,9 @@ async fn restore_dm_carry(relay: &Relay) -> Result<()> {
         }
         return Ok(());
     }
-    if !relay.persist_groups().await {
+    if !relay.persist_groups_durable().await {
         log::warn!(
-            "could not persist the merged DM carry snapshot; keeping the carry for the \
+            "could not durably persist the merged DM carry snapshot; keeping the carry for the \
              next startup"
         );
         return Ok(());
@@ -1326,7 +1335,7 @@ async fn merge_dm_backup(relay: &Relay) -> Result<bool> {
         log::warn!("could not read the DM backup; continuing with the event-derived group state");
         return Ok(false);
     };
-    let Some(backup) = backup else {
+    let Some(mut backup) = backup else {
         return Ok(false);
     };
     let Some(stamp) = relay.db.state_stamp().await else {
@@ -1343,13 +1352,15 @@ async fn merge_dm_backup(relay: &Relay) -> Result<bool> {
         log::warn!("discarding a stale DM backup: it predates the current group-state generation");
         return Ok(false);
     }
+    filter_vanished_group_snapshot(relay, &mut backup).await?;
+    backup.groups.retain(|_, group| !group.members.is_empty());
     Ok(relay.groups.write().await.merge_dm_snapshot(backup))
 }
 
 async fn restore_dm_backup(relay: &Relay) -> Result<()> {
-    if merge_dm_backup(relay).await? && !relay.persist_groups().await {
+    if merge_dm_backup(relay).await? && !relay.persist_groups_durable().await {
         log::warn!(
-            "could not persist the restored DM backup; the backup remains for the next startup"
+            "could not durably persist the restored DM backup; the backup remains for the next startup"
         );
     }
     Ok(())
@@ -2210,6 +2221,7 @@ pub async fn run_server(
             "some unapplied deletions could not be recorded at shutdown;              the startup resume will not see them"
         );
     }
+    relay.flush_role_rebuild_journal().await;
     // The debounced snapshot persists must commit before the database
     // stops: the drain worker's final pass runs concurrently with this
     // teardown, and a mutation arriving after the drain leaves its store
@@ -4947,6 +4959,58 @@ mod tests {
         assert!(group.is_member(&a_pk));
         assert!(group.is_member(&b_pk));
         assert!(group.settings.private && group.settings.hidden);
+        drop(groups);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dm_metadata_survives_the_rebuild_ghost_pass() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        relay.config.write().await.relay.enabled_buzz = true;
+        relay.groups.write().await.buzz_enabled = true;
+        let a = secp256k1::Keypair::from_secret_bytes([7u8; 32]).unwrap();
+        let b = secp256k1::Keypair::from_secret_bytes([8u8; 32]).unwrap();
+        let a_pk = secp256k1::XOnlyPublicKey::from_keypair(&a).0.to_string();
+        let b_pk = secp256k1::XOnlyPublicKey::from_keypair(&b).0.to_string();
+        let open = Event {
+            id: String::new(),
+            pubkey: a_pk.clone(),
+            created_at: unix_now(),
+            kind: crate::nips::nip29::DM_OPEN,
+            tags: vec![vec!["p".into(), b_pk.clone()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let channel = match relay.handle_dm_open(&open, &[]).await {
+            crate::db::PutOutcome::Duplicate(message) => {
+                let json = message.strip_prefix("response:").expect("DM response");
+                serde_json::from_str::<serde_json::Value>(json).unwrap()["channel_id"]
+                    .as_str()
+                    .expect("channel id")
+                    .to_string()
+            }
+            other => panic!("DM open failed: {other:?}"),
+        };
+        // Start from the exact state a missing/stale snapshot produces:
+        // an empty store, then the real event rebuild (including its ghost
+        // pass) followed by metadata recovery.
+        relay
+            .groups
+            .write()
+            .await
+            .restore(crate::nips::nip29::GroupsSnapshot::default());
+        rebuild_group_state(&relay, true)
+            .await
+            .expect("DM metadata rebuild must succeed");
+        let groups = relay.groups.read().await;
+        assert!(
+            groups.group(&channel).is_some(),
+            "DM metadata must not be ghosted by the event rebuild"
+        );
+        assert!(
+            !groups.is_ghosted(&channel),
+            "the DM id must be released from the false ghost"
+        );
         drop(groups);
         relay.db.shutdown();
     }
