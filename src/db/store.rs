@@ -2993,6 +2993,29 @@ impl Store {
         Ok(out)
     }
 
+    /// Persist the DM-only carry snapshot used when migration rebuilds a
+    /// destination group store from imported events. DM groups are
+    /// snapshot-only, so they are saved separately and merged after rebuild.
+    pub(crate) fn save_dm_carry(&self, data: &[u8]) -> Result<()> {
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.put(&mut wtxn, b"dm_carry", data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn load_dm_carry(&self) -> Result<Option<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.index_meta.get(&rtxn, b"dm_carry")?.map(<[u8]>::to_vec))
+    }
+
+    pub(crate) fn clear_dm_carry(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.index_meta.delete(&mut wtxn, b"dm_carry")?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
     /// Persist the NIP-IA archived-identities set (JSON array).
     pub(crate) fn save_identity_archive(&self, data: &[u8]) -> Result<()> {
         self.disk_full_error()?;

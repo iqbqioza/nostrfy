@@ -946,6 +946,40 @@ async fn startup_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
 /// snapshot (the per-family sequence), and an unreadable generation fails
 /// closed the same way. Both cases fall through to the replay migration,
 /// which rebuilds from the surviving events. A failed rebuild is fatal.
+/// Merges DM groups saved by the migration before it invalidated the main
+/// snapshot. Ordinary groups are rebuilt from imported events; DM groups
+/// have no stored create and must be carried separately.
+async fn restore_dm_carry(relay: &Relay) -> Result<()> {
+    let Some(data) = relay.db.load_dm_carry().await else {
+        return Err(anyhow::anyhow!(
+            "cannot read the migration DM carry snapshot; refusing to start"
+        ));
+    };
+    let Some(data) = data else {
+        return Ok(());
+    };
+    let carry: crate::nips::nip29::GroupsSnapshot = serde_json::from_slice(&data)
+        .map_err(|error| anyhow::anyhow!("invalid migration DM carry snapshot: {error}"))?;
+    let changed = relay.groups.write().await.merge_dm_snapshot(carry);
+    if !changed {
+        if !relay.db.clear_dm_carry().await {
+            log::warn!("could not clear an empty migration DM carry snapshot");
+        }
+        return Ok(());
+    }
+    if !relay.persist_groups().await {
+        log::warn!(
+            "could not persist the merged DM carry snapshot; keeping the carry for the \
+             next startup"
+        );
+        return Ok(());
+    }
+    if !relay.db.clear_dm_carry().await {
+        log::warn!("could not clear the migration DM carry snapshot after persisting it");
+    }
+    Ok(())
+}
+
 /// Startup reclamation for channel TTL. Runtime reads hide expired content
 /// immediately; this pass also removes old rows so a long-running relay does
 /// not retain them forever. It is bounded per query and best-effort after a
@@ -1449,6 +1483,7 @@ pub async fn run_server(
     startup_group_state(&relay, groups_enabled).await?;
     if groups_enabled {
         relay.finish_startup_group_recovery().await;
+        restore_dm_carry(&relay).await?;
         backfill_group_epochs(&relay).await?;
         purge_expired_group_messages(&relay).await?;
     }
@@ -4346,6 +4381,33 @@ mod tests {
             err.to_string().contains("refusing to start"),
             "an unreadable snapshot must stop startup, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_dm_carry_is_merged_after_rebuild() {
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let mut group = crate::nips::nip29::Group {
+            channel_type: "dm".into(),
+            created_at: Some(unix_now()),
+            ..crate::nips::nip29::Group::default()
+        };
+        group
+            .members
+            .insert("aa".repeat(32), std::collections::HashSet::new());
+        let mut carry = crate::nips::nip29::GroupsSnapshot::default();
+        carry.groups.insert("dm-carry".into(), group);
+        assert!(
+            relay
+                .db
+                .save_dm_carry(serde_json::to_vec(&carry).unwrap())
+                .await
+        );
+        restore_dm_carry(&relay)
+            .await
+            .expect("carry merge must succeed");
+        assert!(relay.groups.read().await.group("dm-carry").is_some());
+        assert_eq!(relay.db.load_dm_carry().await, Some(None));
+        relay.db.shutdown();
     }
 
     #[tokio::test]

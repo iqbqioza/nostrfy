@@ -236,6 +236,21 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(false);
             false
         }
+        Msg::LoadDmCarry { reply } => {
+            let out = match store.load_dm_carry() {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::SaveDmCarry { reply, .. } | Msg::ClearDmCarry { reply } => {
+            let _ = reply.send(false);
+            false
+        }
         Msg::GroupEpochsBackfilled { reply } => {
             let out = match store.group_epochs_backfilled() {
                 Ok(done) => Some(done),
@@ -1439,6 +1454,36 @@ pub(crate) fn spawn(
                                         }
                                     };
                                     let _ = reply.send(out);
+                                }
+                                Msg::SaveDmCarry { data, reply } => {
+                                    let saved = match store.save_dm_carry(&data) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(saved);
+                                }
+                                Msg::LoadDmCarry { reply } => {
+                                    let out = match store.load_dm_carry() {
+                                        Ok(data) => Some(data),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::ClearDmCarry { reply } => {
+                                    let cleared = match store.clear_dm_carry() {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(cleared);
                                 }
                                 Msg::RecordGroupEpochsBatch { entries, reply } => {
                                     let stored = match store.record_group_epochs_batch(&entries) {

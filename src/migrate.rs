@@ -445,19 +445,29 @@ async fn invalidate_group_snapshot_after_import(db: &DbClient, stats: &Stats) ->
              refusing to leave it as authoritative (re-run the migration)"
         ),
         crate::db::LoadGroupsOutcome::Loaded(snapshot) => {
-            if snapshot
-                .groups
-                .values()
-                .any(|group| group.channel_type == "dm")
-            {
-                log::warn!(
-                    "migration imported group events into a database with DM groups; \
-                     keeping the snapshot because DMs are snapshot-only. Imported private \
-                     group history may need an explicit rebuild before serving."
+            let mut carry = crate::nips::nip29::GroupsSnapshot::default();
+            for (gid, group) in &snapshot.groups {
+                if group.channel_type == "dm" {
+                    carry.groups.insert(gid.clone(), group.clone());
+                }
+            }
+            if !carry.groups.is_empty() {
+                let data = serde_json::to_vec(&carry)?;
+                if !db.save_dm_carry(data).await {
+                    bail!(
+                        "could not preserve the destination DM groups before the \
+                         migration rebuild; the migration did not complete (re-run it)"
+                    );
+                }
+                log::info!(
+                    "migration saved {} DM group(s) for merge after the event rebuild",
+                    carry.groups.len()
                 );
-                return Ok(());
             }
             if !db.clear_groups_snapshot().await {
+                if !carry.groups.is_empty() {
+                    let _ = db.clear_dm_carry().await;
+                }
                 bail!(
                     "could not invalidate the destination group snapshot after the \
                      migration; refusing to leave imported private history unverified"

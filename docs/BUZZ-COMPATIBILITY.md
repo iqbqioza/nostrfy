@@ -297,10 +297,11 @@ host, because Buzz signs the relay URL it uploads to.
   Migration buffers pre-create state until the create, re-adjudicates it
   against the real group, and then applies it; a pre-create `9008` is kept
   but has no effect, matching the rebuild.
-- Migration now invalidates the destination group snapshot after importing
-  events (forcing the first start to rebuild/ghost-check), except when the
-  snapshot contains DM groups; keeping DM snapshots preserves their
-  membership at the cost of not auto-verifying imported private history.
+- Migration saves DM-only groups to an additive `index_meta` carry, then
+  invalidates the main group snapshot. The first start rebuilds/ghost-checks
+  all event-derived groups from the imported history and finally merges the
+  DM carry into the fresh store, so DM membership survives without skipping
+  verification of imported private history.
 - Migration records NIP-09 deletions and NIP-62 vanish markers while
   streaming, then runs their removal walks after the 9005/9008 fixpoint. The
   NIP-62 marker still blocks later rows in the same export immediately, but

@@ -502,6 +502,16 @@ enum Msg {
     MarkGroupEpochsBackfilled {
         reply: oneshot::Sender<bool>,
     },
+    SaveDmCarry {
+        data: Vec<u8>,
+        reply: oneshot::Sender<bool>,
+    },
+    LoadDmCarry {
+        reply: oneshot::Sender<Option<Option<Vec<u8>>>>,
+    },
+    ClearDmCarry {
+        reply: oneshot::Sender<bool>,
+    },
     /// Persist the NIP-IA archived-identities set.
     SaveIdentityArchive {
         data: Vec<u8>,
@@ -1092,9 +1102,9 @@ fn msg_bytes(msg: &Msg) -> usize {
             .map(|(id, value)| id.len() + value.len())
             .sum(),
         Msg::ThreadRootTombstone { event_id, .. } => event_id.len(),
-        Msg::SaveRoleRebuildPending { data, .. } | Msg::SaveIdentityArchive { data, .. } => {
-            data.len()
-        }
+        Msg::SaveRoleRebuildPending { data, .. }
+        | Msg::SaveIdentityArchive { data, .. }
+        | Msg::SaveDmCarry { data, .. } => data.len(),
         Msg::Vanish { pubkey, .. }
         | Msg::RecordPendingVanish { pubkey, .. }
         | Msg::GiftWrapPurge { pubkey, .. } => pubkey.len(),
@@ -2236,6 +2246,24 @@ impl DbClient {
 
     pub async fn mark_group_epochs_backfilled(&self) -> bool {
         self.request_write_checked(|reply| Msg::MarkGroupEpochsBackfilled { reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn save_dm_carry(&self, data: Vec<u8>) -> bool {
+        self.request_write_checked(|reply| Msg::SaveDmCarry { data, reply })
+            .await
+            .unwrap_or(false)
+    }
+
+    pub async fn load_dm_carry(&self) -> Option<Option<Vec<u8>>> {
+        self.request_read_startup(|reply| Msg::LoadDmCarry { reply })
+            .await
+            .flatten()
+    }
+
+    pub async fn clear_dm_carry(&self) -> bool {
+        self.request_write_checked(|reply| Msg::ClearDmCarry { reply })
             .await
             .unwrap_or(false)
     }

@@ -686,6 +686,26 @@ impl GroupStore {
         }
     }
 
+    /// Merges DM groups carried across a migration rebuild. The rebuilt
+    /// event state is authoritative for ordinary groups; DM groups are
+    /// snapshot-only and are adopted only when the rebuilt store has no
+    /// group under that id.
+    pub(crate) fn merge_dm_snapshot(&mut self, snapshot: GroupsSnapshot) -> bool {
+        let mut changed = false;
+        for (gid, group) in snapshot.groups {
+            if group.channel_type != "dm" {
+                continue;
+            }
+            if self.groups.insert(gid, group).is_none() {
+                changed = true;
+            }
+        }
+        if changed {
+            self.recompute_derived();
+        }
+        changed
+    }
+
     /// Restores state persisted by [`Self::snapshot`], keeping the current
     /// capacity cap. The derived counters (`total_members`,
     /// `declared_children`) start from the restored groups.
