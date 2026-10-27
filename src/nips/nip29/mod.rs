@@ -91,6 +91,13 @@ pub(crate) const MAX_PINS: usize = 100;
 /// bound repeated `9009` events would grow the set without limit.
 pub(crate) const MAX_INVITES: usize = 100;
 
+/// Per-code and aggregate byte bounds for metadata that is mirrored into
+/// relay-signed 39000/39003 events. The count caps alone still allow very
+/// large generated events if each value is attacker-sized.
+const MAX_INVITE_CODE_BYTES: usize = 256;
+const MAX_CHILD_ID_BYTES: usize = 128;
+const MAX_CHILD_BYTES: usize = 64 * 1024;
+
 /// Maximum members per group. Without a bound an admin could spam `9000`
 /// events with fresh pubkeys, growing the member map (and every mirrored
 /// `39001`/`39002`) without limit.
@@ -1399,7 +1406,7 @@ impl GroupStore {
                 // NIP-29: the rejection message SHOULD explain whether the
                 // decision is final or pending — this relay has no pending
                 // flow, so every rejection is marked final.
-                if let Some(code) = event_code(event) {
+                if let Some(code) = event_code(event).filter(|code| !code.is_empty()) {
                     if !group.has_invite(code) {
                         bail!("restricted: invalid invite code (final decision)");
                     }
@@ -1474,6 +1481,14 @@ impl GroupStore {
             // side inserts into a set, so counting occurrences would
             // reject an event the apply would allow.
             if event.kind == 9009 {
+                for code in tag_values(event, CODE) {
+                    if code.is_empty() {
+                        bail!("invalid: invite code must not be empty");
+                    }
+                    if code.len() > MAX_INVITE_CODE_BYTES {
+                        bail!("restricted: invite code is too long");
+                    }
+                }
                 let fresh = tag_values(event, CODE)
                     .filter(|c| !group.has_invite(c))
                     .collect::<std::collections::HashSet<_>>()
@@ -2320,6 +2335,7 @@ impl GroupStore {
                             let mut seen = HashSet::new();
                             let declared: Vec<String> = tag_values(event, "child")
                                 .filter(|child| !child.is_empty())
+                                .filter(|child| child.len() <= MAX_CHILD_ID_BYTES)
                                 .filter(|child| !denials.children.contains(*child))
                                 .map(str::to_string)
                                 .filter(|c| seen.insert(c.clone()))
@@ -2445,6 +2461,7 @@ impl GroupStore {
                 // their back-pointer set, keeping the two directions
                 // consistent.
                 let child_added: Vec<String> = tag_values(event, "child")
+                    .filter(|child| child.len() <= MAX_CHILD_ID_BYTES)
                     .filter(|child| !denials.children.contains(*child))
                     .map(str::to_string)
                     .collect();
@@ -2895,8 +2912,11 @@ impl GroupStore {
                     for code in tag_values(event, CODE) {
                         // Bounded like validation (history replay bypasses
                         // the check above, so stop inserting at the cap).
-                        if group.invites.len() >= MAX_INVITES {
-                            break;
+                        if code.is_empty()
+                            || code.len() > MAX_INVITE_CODE_BYTES
+                            || group.invites.len() >= MAX_INVITES
+                        {
+                            continue;
                         }
                         group.invites.insert(code.to_string());
                     }
@@ -4112,8 +4132,24 @@ fn validate_edit_metadata(
     }
     // An empty child id is not a group id: accepting it would leave a junk
     // entry in 39000 that no group can ever occupy or remove.
-    if tag_values(event, "child").any(str::is_empty) {
-        bail!("restricted: child id must not be empty");
+    let mut child_bytes = 0usize;
+    for child in tag_values(event, "child") {
+        if child.is_empty() {
+            bail!("restricted: child id must not be empty");
+        }
+        if child.len() > MAX_CHILD_ID_BYTES {
+            bail!("restricted: child id is too long");
+        }
+        child_bytes = child_bytes.saturating_add(child.len());
+        if child_bytes > MAX_CHILD_BYTES {
+            bail!("restricted: too many child bytes");
+        }
+    }
+    if let Some(parent) = tag_value(event, "parent")
+        && !parent.is_empty()
+        && parent.len() > MAX_CHILD_ID_BYTES
+    {
+        bail!("restricted: parent id is too long");
     }
     // A group cannot be its own child, and one 9002 must not make a
     // group both the parent and the child of this one (that would create
