@@ -594,6 +594,15 @@ async fn flush(
         {
             first_seen.push((pubkey, event.created_at));
         }
+        if crate::nips::nip29::is_group_action(event.as_ref())
+            && let Some(event_id) = event.id_bytes()
+            && db.assign_event_arrival(event_id).await.is_none()
+        {
+            bail!(
+                "could not record the imported group-state arrival order; the migration \
+                 did not complete (re-run it)"
+            );
+        }
         // NIP-62's marker must be written before later events of the same
         // author are imported (the permanent-upload ban is order-sensitive).
         // The removal walk is deferred with NIP-09, so an admin's earlier
@@ -1243,6 +1252,8 @@ async fn replay_stored_moderation(
     const PENDING_STATE_MAX: usize = 50_000;
     let mut pending_state: std::collections::HashMap<String, Vec<Event>> =
         std::collections::HashMap::new();
+    let mut pending_arrivals: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     let mut pending_state_count = 0usize;
     let mut since: Option<u64> = None;
     let mut page_refused = Vec::new();
@@ -1263,20 +1274,17 @@ async fn replay_stored_moderation(
         if page.is_empty() {
             break;
         }
-        page.sort_by(|a, b| {
-            (
-                a.created_at,
-                crate::nips::nip29::group_rank(a.kind),
-                a.kind,
-                &a.id,
-            )
-                .cmp(&(
-                    b.created_at,
-                    crate::nips::nip29::group_rank(b.kind),
-                    b.kind,
-                    &b.id,
-                ))
-        });
+        let page_ids: Vec<Vec<u8>> = page
+            .iter()
+            .filter_map(|event| event.id_bytes().map(|id| id.to_vec()))
+            .collect();
+        let Some(page_arrivals) = db.event_arrivals(page_ids).await else {
+            bail!(
+                "could not read imported group-state arrival order; the migration did not \
+                 complete (re-run it)"
+            );
+        };
+        page.sort_by(|a, b| crate::nips::nip29::replay_order(a, b, &page_arrivals));
         let max_created = page.last().map(|event| event.created_at);
         let boundary_count = page
             .iter()
@@ -1291,7 +1299,8 @@ async fn replay_stored_moderation(
         // same stored events — they share `group_rank` for exactly that
         // reason — and so the `total_members` budget is not inflated by a
         // member the restart will not have.
-        let same_second_removals = crate::nips::nip29::SameSecondRemovals::collect(&page);
+        let same_second_removals =
+            crate::nips::nip29::SameSecondRemovals::collect_with_arrivals(&page, &page_arrivals);
         for mut event in page {
             if event.kind == crate::nips::nip29::JOIN && vanished.contains(&event.pubkey) {
                 continue;
@@ -1331,6 +1340,9 @@ async fn replay_stored_moderation(
                     continue;
                 }
                 if pending_state_count < PENDING_STATE_MAX {
+                    if let Some(seq) = page_arrivals.get(&event.id) {
+                        pending_arrivals.insert(event.id.clone(), *seq);
+                    }
                     pending_state.entry(gid.clone()).or_default().push(event);
                     pending_state_count += 1;
                     continue;
@@ -1389,20 +1401,7 @@ async fn replay_stored_moderation(
                 && let Some(mut buffered) = pending_state.remove(gid)
             {
                 pending_state_count = pending_state_count.saturating_sub(buffered.len());
-                buffered.sort_by(|a, b| {
-                    (
-                        a.created_at,
-                        crate::nips::nip29::group_rank(a.kind),
-                        a.kind,
-                        &a.id,
-                    )
-                        .cmp(&(
-                            b.created_at,
-                            crate::nips::nip29::group_rank(b.kind),
-                            b.kind,
-                            &b.id,
-                        ))
-                });
+                buffered.sort_by(|a, b| crate::nips::nip29::replay_order(a, b, &pending_arrivals));
                 for buffered_event in buffered {
                     let authorized = replay_moderation(groups, &buffered_event, relay_pubkey);
                     if authorized

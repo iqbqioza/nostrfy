@@ -273,8 +273,9 @@ host, because Buzz signs the relay URL it uploads to.
   `arrival:` index, and the rebuild orders ordinary state operations by that
   sequence within one second. A remove followed by a rejoin therefore
   survives, and a rejoin followed by a remove stays removed. `9007`/`9008`
-  retain structural precedence. Legacy/imported events without an arrival
-  entry fall back to the conservative remove-wins rule.
+  retain structural precedence. New migrations assign the export order to
+  imported group state; events imported before this index, and other legacy
+  rows, fall back to the conservative remove-wins rule.
 - A JOIN accepted with a `created_at` far in the future (up to
   `max_created_at_future_secs`) could sort after a later removal on replay
   and re-add an open-group member. Group/join/leave events reject a future

@@ -3607,7 +3607,11 @@ pub(crate) fn group_rank(kind: u64) -> u8 {
 /// Total replay order for one timestamp second. Create/delete retain their
 /// structural precedence; ordinary state events prefer the durable ingest
 /// sequence over the kind/rank/id fallback.
-fn replay_order(a: &Event, b: &Event, arrivals: &HashMap<String, u64>) -> std::cmp::Ordering {
+pub(crate) fn replay_order(
+    a: &Event,
+    b: &Event,
+    arrivals: &HashMap<String, u64>,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let class = |kind: u64| match kind {
         CREATE_GROUP => 0u8,
@@ -3647,6 +3651,7 @@ impl SameSecondRemovals {
     /// already guarantee: each refuses to persist a page cut mid-second
     /// (`boundary_second_complete`), so no removal can be hiding in the next
     /// page while its join is applied in this one.
+    #[cfg(test)]
     pub(crate) fn collect(events: &[Event]) -> Self {
         Self::collect_with_arrivals(events, &HashMap::new())
     }
