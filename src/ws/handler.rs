@@ -554,7 +554,9 @@ impl super::Conn {
         // the query, so no event stored between the query and the
         // subscription is missed (a duplicate delivery of an event that
         // is both in the query result and live is harmless: clients
-        // deduplicate by id).
+        // deduplicate by id). The live queue itself is created lazily
+        // here, so a connection that never subscribes never allocates it.
+        self.ensure_live_queue();
         self.sync_live_index();
         if replacing.is_none() {
             self.relay
@@ -889,6 +891,9 @@ impl super::Conn {
             // frames and block live delivery with no subscription state
             // to justify it.
             self.sync_live_index();
+            // The last REQ closed: release the 512-slot live queue until
+            // the next subscription creates it again.
+            self.release_live_queue_if_idle();
         }
     }
 
