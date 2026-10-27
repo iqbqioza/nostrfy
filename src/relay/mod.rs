@@ -3290,8 +3290,12 @@ impl Relay {
     }
 
     /// Whether `pubkey` may issue Buzz relay-admin commands: a configured
-    /// owner/NIP-86 admin, or a NIP-43 assignment with the `owner`/`admin`
-    /// role.
+    /// owner/NIP-86 admin, or a NIP-43 assignment with the `admin` role.
+    ///
+    /// `owner` in kind:13534 is synthetic display metadata for the configured
+    /// operator identities, not a NIP-43 role assignment. A stale roster row
+    /// for a former owner must never keep relay-admin authority, so the
+    /// assignment branch deliberately checks only `admin`.
     pub(crate) async fn is_relay_owner_or_admin(&self, pubkey: &str) -> bool {
         if self
             .relay_owner_members()
@@ -3306,11 +3310,7 @@ impl Relay {
             .await
             .assignments
             .get(pubkey)
-            .is_some_and(|roles| {
-                roles.iter().any(|role| {
-                    role.eq_ignore_ascii_case("owner") || role.eq_ignore_ascii_case("admin")
-                })
-            })
+            .is_some_and(|roles| roles.iter().any(|role| role.eq_ignore_ascii_case("admin")))
     }
 
     /// Applies a Buzz `kind:9033` workspace icon. The value is already
@@ -4458,12 +4458,19 @@ impl Relay {
             // post-removal generation while the in-memory effect is
             // pending.
             let _groups_in_flight = nip29_enabled.then(|| self.groups_rebuild.derived.begin());
-            let _roles_in_flight = nip43.then(|| self.roles_rebuild.derived.begin());
             let touch = if nip29_enabled || nip43 {
                 self.deletion_touches_group_state(&event).await
             } else {
                 StateTouch::default()
             };
+            // Only a deletion that actually targets a role-state event may
+            // invalidate the role store. Taking this claim for every kind:5
+            // (including ordinary post deletions) made a concurrent roster
+            // publish remove the replacement 13534/33534 it had just stored,
+            // leaving no roster behind. The group claim above stays broad
+            // because a failed lookup fails closed for both families.
+            let _roles_in_flight =
+                (nip43 && touch.roles).then(|| self.roles_rebuild.derived.begin());
             let (removed, state_removed) = self
                 .db
                 .apply_deletion_checked(
@@ -5219,20 +5226,26 @@ impl Relay {
                         if tag.len() < 2 || tag[0] != "member" {
                             continue;
                         }
+                        let pubkey = tag[1].to_ascii_lowercase();
+                        let is_current_owner = owners.contains(&pubkey);
+                        // `membership_event` injects `owner` for the current
+                        // configuration but also preserves explicit ordinary
+                        // roles (e.g. `owner` + `mod`). Ignore the synthetic
+                        // token when checking coverage, otherwise the check
+                        // can never certify a current owner with an assigned
+                        // role and keeps a former key's events forever.
                         let roles_in_tag: Vec<&str> = tag[2..]
                             .iter()
                             .map(String::as_str)
                             .filter(|role| !role.is_empty())
+                            .filter(|role| {
+                                !(is_current_owner && role.eq_ignore_ascii_case("owner"))
+                            })
                             .collect();
-                        let pubkey = tag[1].to_ascii_lowercase();
-                        let synthetic_owner =
-                            roles_in_tag.as_slice() == ["owner"] && owners.contains(&pubkey);
-                        if synthetic_owner {
-                            // `membership_event` overwrites an owner entry
-                            // to exactly `owner`, even if the same pubkey
-                            // also has a role assignment. Check this before
-                            // the assignment branch so that configuration
-                            // does not keep the former key's events forever.
+                        if is_current_owner && roles_in_tag.is_empty() {
+                            // The current key's synthetic owner row is fully
+                            // covered by configuration (there is no ordinary
+                            // assignment to verify).
                             continue;
                         }
                         if let Some(assigned) = roles.assignments.get(&tag[1]) {
@@ -7901,6 +7914,11 @@ mod tests {
             );
         }
         assert!(relay.persist_access().await);
+        // Materialize the allowlist row in the roster. The old leave path
+        // did not republish because the target had no role entry, so this
+        // bare member survived in kind:13534 and the next rebuild turned it
+        // into a real membership once the allowlist removal was persisted.
+        assert!(relay.publish_membership(None).await);
         let mut leave = crate::event::Event {
             id: String::new(),
             pubkey: target.clone(),
@@ -7942,6 +7960,70 @@ mod tests {
         assert!(
             !persisted.method_grants.contains_key(&target),
             "the leave must persist the method-grant revocation"
+        );
+        // The refreshed roster must not keep the now-unallowlisted target as
+        // a bare member. A restart rebuild then has nothing to resurrect.
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13534]})).unwrap();
+        let (lists, _) = relay
+            .db
+            .query(vec![filter], 10, crate::util::unix_now())
+            .await;
+        assert!(
+            lists.iter().all(|list| list.tags.iter().all(|tag| {
+                tag.len() < 2 || tag[0] != "member" || !tag[1].eq_ignore_ascii_case(&target)
+            })),
+            "the post-leave roster must not contain the leaver: {:?}",
+            lists.iter().map(|list| &list.tags).collect::<Vec<_>>()
+        );
+        let relay_pubkey = relay.relay_pubkey().expect("role relay has a key");
+        let mut rebuilt = RoleStore::default();
+        assert!(
+            rebuilt.rebuild(&relay.db, &relay_pubkey).await,
+            "the roster must be rebuildable"
+        );
+        assert!(
+            !rebuilt.is_member_of(&target),
+            "an allowlisted-only leaver must not reappear after a rebuild"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn leave_revokes_a_legacy_uppercase_allowlist_row() {
+        // Access matching is case-insensitive. Queueing an exact-case
+        // UnallowPubkey left a legacy uppercase row persisted, restoring the
+        // leaver's publishing rights on the next reload/restart.
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        let target = "cc".repeat(32);
+        {
+            let mut access = relay.access.write().await;
+            access.restrict_relay = true;
+            access
+                .allowed_pubkeys
+                .push((target.to_ascii_uppercase(), "legacy".into()));
+        }
+        assert!(relay.persist_access().await);
+        let mut leave = crate::event::Event {
+            id: String::new(),
+            pubkey: target.clone(),
+            created_at: crate::util::unix_now(),
+            kind: crate::nips::nip43::LEAVE,
+            tags: vec![vec!["-".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        leave.id = crate::nips::nip01::compute_id(&leave);
+        relay.apply_leave_request(&leave).await;
+        let crate::db::LoadAccessOutcome::Loaded(persisted) = relay.db.load_access().await else {
+            panic!("access state must load");
+        };
+        assert!(
+            persisted
+                .allowed_pubkeys
+                .iter()
+                .all(|(pubkey, _)| !pubkey.eq_ignore_ascii_case(&target)),
+            "the uppercase allowlist row must be revoked case-insensitively"
         );
         relay.db.shutdown();
     }
@@ -8376,6 +8458,41 @@ mod tests {
                 .tags
                 .iter()
                 .any(|tag| { tag.len() >= 3 && tag[0] == "consent" && tag[1] == "owner" })
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn owner_role_assignment_is_display_only() {
+        // `owner` is the synthetic Buzz roster token, not a relay-admin
+        // assignment. A stale or manually assigned owner row must not retain
+        // the authority of a removed configured owner.
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        let owner = "aa".repeat(32);
+        let other = "bb".repeat(32);
+        relay.config.write().await.relay.pubkey = owner.clone();
+        relay
+            .roles
+            .write()
+            .await
+            .create("owner", "Owner", "", "", None);
+        assert_eq!(
+            relay.assign_role(&other, "owner").await,
+            RoleChange::Unknown,
+            "the synthetic owner token must not be assignable"
+        );
+        // Simulate a stale snapshot/roster assignment from an older build:
+        // it must still be display-only, never relay admin.
+        relay
+            .roles
+            .write()
+            .await
+            .assignments
+            .insert(other.clone(), vec!["owner".to_string()]);
+        assert!(relay.is_relay_owner_or_admin(&owner).await);
+        assert!(
+            !relay.is_relay_owner_or_admin(&other).await,
+            "an owner role assignment must not authorize relay commands"
         );
         relay.db.shutdown();
     }
@@ -14267,6 +14384,26 @@ mod tests {
         assert!(
             touch.groups && touch.roles,
             "a deletion touching both families must mark both, got {touch:?}"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ordinary_post_deletion_does_not_touch_role_state() {
+        // A kind:5 that only deletes an ordinary post must not take the
+        // role-derived mutation claim. That broad claim let a concurrent
+        // roster publish delete the replacement 13534/33534 it had just
+        // stored, even though the deletion never touched role state.
+        let relay = build_relay().await;
+        let author = secp256k1::Keypair::from_secret_bytes([12u8; 32]).unwrap();
+        let now = crate::util::unix_now();
+        let post = signed_group_event(&author, 1, "g1", vec![], now.saturating_sub(10));
+        assert_eq!(relay.db.put(post.clone(), now).await, PutOutcome::Stored);
+        let deletion = signed_group_event(&author, 5, "g1", vec![vec!["e".into(), post.id]], now);
+        let touch = relay.deletion_touches_group_state(&deletion).await;
+        assert!(
+            !touch.groups && !touch.roles && !touch.groups_all,
+            "an ordinary post deletion must not invalidate either derived store: {touch:?}"
         );
         relay.db.shutdown();
     }
