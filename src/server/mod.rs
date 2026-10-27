@@ -989,34 +989,33 @@ fn dm_group_from_metadata(
     }
     let mut guest_set = std::collections::HashSet::new();
     let mut bot_set = std::collections::HashSet::new();
-    let add_tag =
-        |tag: &[String],
-         members: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
-         guests: &mut std::collections::HashSet<String>,
-         bots: &mut std::collections::HashSet<String>| {
-            if tag.len() < 2 || tag[0] != "p" || !crate::nips::nip29::is_pubkey_hex(&tag[1]) {
-                return;
-            }
-            let pubkey = tag[1].to_ascii_lowercase();
-            members.entry(pubkey.clone()).or_default();
-            for role in tag.iter().skip(2).filter(|role| !role.is_empty()) {
-                match role.as_str() {
-                    "member" => {}
-                    "guest" => {
-                        guests.insert(pubkey.clone());
-                    }
-                    "bot" => {
-                        bots.insert(pubkey.clone());
-                    }
-                    other => {
-                        members
-                            .get_mut(&pubkey)
-                            .expect("member inserted above")
-                            .insert(other.to_string());
-                    }
+    let add_tag = |tag: &[String],
+                   members: &mut std::collections::HashMap<String, crate::nips::nip29::RoleSet>,
+                   guests: &mut std::collections::HashSet<String>,
+                   bots: &mut std::collections::HashSet<String>| {
+        if tag.len() < 2 || tag[0] != "p" || !crate::nips::nip29::is_pubkey_hex(&tag[1]) {
+            return;
+        }
+        let pubkey = tag[1].to_ascii_lowercase();
+        members.entry(pubkey.clone()).or_default();
+        for role in tag.iter().skip(2).filter(|role| !role.is_empty()) {
+            match role.as_str() {
+                "member" => {}
+                "guest" => {
+                    guests.insert(pubkey.clone());
+                }
+                "bot" => {
+                    bots.insert(pubkey.clone());
+                }
+                other => {
+                    members
+                        .get_mut(&pubkey)
+                        .expect("member inserted above")
+                        .insert(other.to_string());
                 }
             }
-        };
+        }
+    };
     if let Some(members) = members {
         for tag in &members.tags {
             add_tag(tag, &mut group.members, &mut guest_set, &mut bot_set);
@@ -4902,9 +4901,7 @@ mod tests {
             created_at: Some(unix_now()),
             ..crate::nips::nip29::Group::default()
         };
-        group
-            .members
-            .insert("aa".repeat(32), std::collections::HashSet::new());
+        group.members.insert("aa".repeat(32), Default::default());
         let mut carry = crate::nips::nip29::GroupsSnapshot::default();
         carry.groups.insert("dm-carry".into(), group);
         assert!(
@@ -5035,9 +5032,7 @@ mod tests {
             created_at: Some(unix_now()),
             ..crate::nips::nip29::Group::default()
         };
-        group
-            .members
-            .insert("aa".repeat(32), std::collections::HashSet::new());
+        group.members.insert("aa".repeat(32), Default::default());
         let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
         snapshot.groups.insert("dm-backup".into(), group);
         snapshot.stamp = relay.db.state_stamp().await.expect("stamp");

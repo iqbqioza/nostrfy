@@ -7078,16 +7078,13 @@ fn group_snapshot_writes_a_dm_backup() {
     rt.block_on(async {
         let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
         let mut regular = crate::nips::nip29::Group::default();
-        regular
-            .members
-            .insert("aa".repeat(32), std::collections::HashSet::new());
+        regular.members.insert("aa".repeat(32), Default::default());
         snapshot.groups.insert("g1".into(), regular);
         let mut dm = crate::nips::nip29::Group {
             channel_type: "dm".into(),
             ..crate::nips::nip29::Group::default()
         };
-        dm.members
-            .insert("bb".repeat(32), std::collections::HashSet::new());
+        dm.members.insert("bb".repeat(32), Default::default());
         snapshot.groups.insert("dm1".into(), dm);
         snapshot.stamp = 41;
         snapshot.seq = 7;
@@ -7121,9 +7118,7 @@ fn group_snapshot_writes_a_buzz_backup() {
     rt.block_on(async {
         let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
         let mut plain = crate::nips::nip29::Group::default();
-        plain
-            .members
-            .insert("aa".repeat(32), std::collections::HashSet::new());
+        plain.members.insert("aa".repeat(32), Default::default());
         snapshot.groups.insert("plain".into(), plain);
         let mut buzz = crate::nips::nip29::Group {
             buzz_metadata: true,
