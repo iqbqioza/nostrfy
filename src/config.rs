@@ -86,6 +86,17 @@ pub struct BlossomConfig {
     /// upload blobs. The allowlist itself lives in the relay database
     /// (LMDB), managed with `nostrfy blossom allow/deny`.
     pub restrict_uploads: bool,
+    /// Compress eligible Blossom responses on the fly with Brotli when the
+    /// client advertises `Accept-Encoding: br`. Images and text/JSON are
+    /// eligible; ranges and HEAD are never compressed. On-the-fly Brotli
+    /// spends CPU per request (quality 4); disable it on a relay whose
+    /// media is mostly already-compressed JPEG/WebP if CPU matters more
+    /// than a small transfer saving.
+    pub brotli: bool,
+    /// Upper bound on a blob compressed with Brotli (bytes). Larger blobs
+    /// are served identity to bound the per-request CPU cost. The lower
+    /// bound is a fixed 1 KiB.
+    pub brotli_max_bytes: usize,
 }
 
 impl Default for BlossomConfig {
@@ -102,6 +113,8 @@ impl Default for BlossomConfig {
             s3_access_key: String::new(),
             s3_secret_key: String::new(),
             restrict_uploads: false,
+            brotli: true,
+            brotli_max_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -1988,6 +2001,14 @@ impl Config {
         if b.max_upload_bytes == 0 {
             return Err(config_err("blossom.max_upload_bytes must be at least 1"));
         }
+        if b.brotli && b.brotli_max_bytes == 0 {
+            return Err(config_err("blossom.brotli_max_bytes must be at least 1"));
+        }
+        if b.brotli_max_bytes > 64 * 1024 * 1024 {
+            return Err(config_err(
+                "blossom.brotli_max_bytes must be at most 67108864 (64 MiB)",
+            ));
+        }
         // The upload budget semaphore grants one permit per byte and a
         // request takes `max_upload_bytes` of them: above `u32::MAX` the
         // per-request acquisition is clamped, so the configured
@@ -3257,6 +3278,8 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "s3_access_key",
                 "s3_secret_key",
                 "restrict_uploads",
+                "brotli",
+                "brotli_max_bytes",
             ],
         ),
     ]
@@ -4663,6 +4686,21 @@ max_log_files = 2
             !Config::default().relay.enabled_buzz,
             "the Buzz compatibility layer must be opt-in"
         );
+    }
+
+    #[test]
+    fn blossom_brotli_defaults_and_bounds_are_validated() {
+        let cfg = Config::default();
+        assert!(cfg.blossom.brotli, "Brotli is enabled by default");
+        assert_eq!(cfg.blossom.brotli_max_bytes, 8 * 1024 * 1024);
+
+        let mut cfg = Config::default();
+        cfg.blossom.brotli_max_bytes = 0;
+        assert!(cfg.validate().is_err(), "a zero cap is invalid");
+        cfg.blossom.brotli_max_bytes = 64 * 1024 * 1024;
+        assert!(cfg.validate().is_ok(), "the 64 MiB bound is accepted");
+        cfg.blossom.brotli_max_bytes = 64 * 1024 * 1024 + 1;
+        assert!(cfg.validate().is_err(), "an oversized cap is rejected");
     }
 
     #[test]

@@ -537,3 +537,12 @@ s3_secret_key = ""
 # When true, only allowlisted pubkeys may upload (the list is managed via
 # `nostrfy blossom allow/deny`, persisted in LMDB).
 restrict_uploads = false
+
+# Compress eligible blob responses on the fly with Brotli when the client
+# advertises `Accept-Encoding: br`. Images, text and JSON are eligible;
+# range responses and HEAD stay identity. Quality 4 is used; already
+# compressed formats (JPEG/WebP/AVIF) may gain little. Requires a restart.
+brotli = true
+# Upper bound for on-the-fly compression (1 byte .. 64 MiB). Larger blobs
+# are served identity so one request cannot spend unbounded CPU.
+brotli_max_bytes = 8388608

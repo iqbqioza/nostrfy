@@ -23,11 +23,13 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxPath, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{Extensions, HeaderMap, StatusCode, Version, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use base64::Engine;
 use serde_json::{Value, json};
+use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::Predicate;
 
 use crate::config::Config;
 use crate::relay::Relay;
@@ -201,11 +203,84 @@ impl Drop for UploadSlot {
     }
 }
 
+/// Smallest blob worth compressing: below this the Brotli framing overhead
+/// can exceed the saving, and tiny JSON/error responses are already cheap.
+const BROTLI_MIN_BYTES: u64 = 1024;
+
+/// Marks a response that must not be compressed even when the client accepts
+/// Brotli (the HEAD response: it has no body and must keep the real
+/// `Content-Length`, which the compression layer removes).
+#[derive(Clone, Copy)]
+struct SkipCompression;
+
+/// The Blossom compression policy. Only a full `200` blob is eligible: range
+/// responses carry `Content-Range` and are skipped by the layer, HEAD is
+/// marked with [`SkipCompression`], and images/text are the types that can
+/// benefit. The upper bound keeps a large (already-compressed) photo from
+/// spending CPU per request; set `blossom.brotli_max_bytes` to widen it.
+fn compression_layer(max_bytes: usize) -> CompressionLayer<impl Predicate> {
+    let max_bytes = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    CompressionLayer::new()
+        .br(true)
+        .no_gzip()
+        .no_deflate()
+        .compress_when(
+            move |status: StatusCode,
+                  _version: Version,
+                  headers: &HeaderMap,
+                  extensions: &Extensions| {
+                if status != StatusCode::OK
+                    || extensions.get::<SkipCompression>().is_some()
+                    || headers.contains_key(header::CONTENT_RANGE)
+                    || headers.contains_key(header::CONTENT_ENCODING)
+                {
+                    return false;
+                }
+                let Some(len) = headers
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                else {
+                    return false;
+                };
+                if !(BROTLI_MIN_BYTES..=max_bytes).contains(&len) {
+                    return false;
+                }
+                let Some(content_type) = headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                else {
+                    return false;
+                };
+                let content_type = content_type
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                content_type.starts_with("image/")
+                    || content_type.starts_with("text/")
+                    || matches!(
+                        content_type.as_str(),
+                        "application/json"
+                            | "application/xml"
+                            | "application/xhtml+xml"
+                            | "application/javascript"
+                            | "application/x-javascript"
+                    )
+            },
+        )
+}
+
 /// The routes, mounted by `build_router` only when `blossom.host` is set.
 pub(crate) async fn routes(relay: &Arc<Relay>, max_upload: usize) -> axum::Router<Arc<Relay>> {
+    let (brotli, brotli_max_bytes) = {
+        let cfg = relay.config.read().await;
+        (cfg.blossom.brotli, cfg.blossom.brotli_max_bytes)
+    };
     // The root `/` route belongs to the relay: the WS handler answers it
     // with the Blossom server info when the Host names the Blossom host.
-    axum::Router::new()
+    let router = axum::Router::new()
         .route(
             "/upload",
             put(upload)
@@ -230,7 +305,12 @@ pub(crate) async fn routes(relay: &Arc<Relay>, max_upload: usize) -> axum::Route
         .route("/media/{blob}", get(get_blob).head(head_blob))
         .route("/list/{pubkey}", get(list))
         .route("/{blob}", get(get_blob).head(head_blob).delete(delete_blob))
-        .with_state(relay.clone())
+        .with_state(relay.clone());
+    if brotli {
+        router.layer(compression_layer(brotli_max_bytes))
+    } else {
+        router
+    }
 }
 
 /// The configured Blossom state, when the feature is enabled and the
@@ -1165,6 +1245,10 @@ async fn head_blob(
     )
         .into_response();
     harden_blob_response(&mut response, &desc.mime);
+    // HEAD has no body to compress, and the compression layer would remove
+    // the Content-Length the client uses to size the blob. Keep the identity
+    // metadata; GET negotiates Brotli independently.
+    response.extensions_mut().insert(SkipCompression);
     response
 }
 
@@ -2417,6 +2501,152 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn brotli_negotiates_images_and_skips_head_ranges_and_small_blobs() {
+        use std::io::Read as _;
+        use tower::ServiceExt as _;
+
+        let relay = build_blossom_relay(0).await;
+        let state = relay.blossom.read().await.clone().unwrap();
+        let owner = "aa".repeat(32);
+        // Highly compressible SVG, above the 1 KiB floor.
+        let svg = format!("<svg>{}</svg>", "x".repeat(4096)).into_bytes();
+        let sha = sha256_hex(&svg);
+        state
+            .store
+            .put(&owner, &sha, &svg, "image/svg+xml")
+            .await
+            .unwrap();
+        let app: axum::Router = routes(&relay, 1024 * 1024).await.with_state(relay.clone());
+
+        let get = |uri: String, extra: &[(&str, &str)]| {
+            let mut builder = axum::http::Request::builder().uri(uri);
+            for (name, value) in extra {
+                builder = builder.header(*name, *value);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        let br = axum::http::header::ACCEPT_ENCODING.as_str();
+        let resp = app
+            .clone()
+            .oneshot(get(format!("/{sha}"), &[(br, "br")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[axum::http::header::CONTENT_ENCODING], "br");
+        assert!(
+            resp.headers()
+                .get_all(axum::http::header::VARY)
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .is_ok_and(|value| value.eq_ignore_ascii_case("accept-encoding"))),
+            "a compressed response must vary on Accept-Encoding"
+        );
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .is_none(),
+            "the compressed length is unknown (chunked)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.len() < svg.len(), "Brotli must shrink the SVG");
+        let mut decoded = Vec::new();
+        brotli::Decompressor::new(&body[..], 4096)
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, svg, "the compressed body must round-trip");
+
+        // A range is an identity representation: the layer must not compress
+        // the 206 (the handler's Content-Range also makes the layer skip it).
+        let resp = app
+            .clone()
+            .oneshot(get(
+                format!("/{sha}"),
+                &[
+                    (br, "br"),
+                    (axum::http::header::RANGE.as_str(), "bytes=0-99"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_ENCODING)
+                .is_none()
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &svg[..100]);
+
+        // HEAD keeps the real Content-Length and is never compressed.
+        let head = axum::http::Request::builder()
+            .method(axum::http::Method::HEAD)
+            .uri(format!("/{sha}"))
+            .header(br, "br")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(head).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_ENCODING)
+                .is_none()
+        );
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_LENGTH]
+                .to_str()
+                .unwrap(),
+            svg.len().to_string()
+        );
+
+        // Small images, videos and opaque binary blobs stay identity.
+        for (mime, len) in [
+            ("image/png", 512usize),
+            ("video/mp4", 4096),
+            ("application/octet-stream", 4096),
+        ] {
+            let data = vec![b'a'; len];
+            let data_sha = sha256_hex(&data);
+            state
+                .store
+                .put(&owner, &data_sha, &data, mime)
+                .await
+                .unwrap();
+            let resp = app
+                .clone()
+                .oneshot(get(format!("/{data_sha}"), &[(br, "br")]))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(
+                resp.headers()
+                    .get(axum::http::header::CONTENT_ENCODING)
+                    .is_none(),
+                "{mime} ({len} bytes) must not be compressed"
+            );
+        }
+
+        // The configuration switch disables the layer for new routers.
+        relay.config.write().await.blossom.brotli = false;
+        let plain: axum::Router = routes(&relay, 1024 * 1024).await.with_state(relay.clone());
+        let resp = plain
+            .oneshot(get(format!("/{sha}"), &[(br, "br")]))
+            .await
+            .unwrap();
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_ENCODING)
+                .is_none(),
+            "blossom.brotli = false must serve identity"
+        );
         relay.db.shutdown();
     }
 

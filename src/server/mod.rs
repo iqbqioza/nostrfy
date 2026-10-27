@@ -4063,6 +4063,14 @@ async fn apply_reloaded_config(
             old.blossom.max_upload_bytes != new_config.blossom.max_upload_bytes,
         ),
         (
+            "blossom.brotli",
+            old.blossom.brotli != new_config.blossom.brotli,
+        ),
+        (
+            "blossom.brotli_max_bytes",
+            old.blossom.brotli_max_bytes != new_config.blossom.brotli_max_bytes,
+        ),
+        (
             "blossom.s3_*",
             old.blossom.s3_endpoint != new_config.blossom.s3_endpoint
                 || old.blossom.s3_region != new_config.blossom.s3_region
@@ -4257,6 +4265,8 @@ async fn apply_reloaded_config(
     new_config.blossom.min_free_bytes = old.blossom.min_free_bytes;
     new_config.blossom.local_path = old.blossom.local_path.clone();
     new_config.blossom.max_upload_bytes = old.blossom.max_upload_bytes;
+    new_config.blossom.brotli = old.blossom.brotli;
+    new_config.blossom.brotli_max_bytes = old.blossom.brotli_max_bytes;
     new_config.blossom.s3_endpoint = old.blossom.s3_endpoint.clone();
     new_config.blossom.s3_region = old.blossom.s3_region.clone();
     new_config.blossom.s3_bucket = old.blossom.s3_bucket.clone();
