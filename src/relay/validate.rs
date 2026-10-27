@@ -377,6 +377,21 @@ impl super::Relay {
         if !cfg.nip_enabled(29) && nip29::is_group_action(event) {
             return Precheck::Reject("blocked: NIP-29 is disabled".into());
         }
+        // Ordinary group content (kind:1 and friends with an `h` tag) has
+        // no equivalent of the group-action namespace check above. While
+        // NIP-29 is disabled the derived store is still restored for read
+        // visibility, so accepting such an event would bypass membership,
+        // guest, restricted, supported-kind and deleted/ghost checks and
+        // make the content visible after the NIP is re-enabled. Relay-signed
+        // notices/metadata are the only exception; they have a dedicated
+        // signature gate below.
+        if !cfg.nip_enabled(29)
+            && event.kind != nip09::DELETION_KIND
+            && nip29::group_id(event).is_some()
+            && Some(event.pubkey.as_str()) != self.relay_pubkey_ref()
+        {
+            return Precheck::Reject("blocked: NIP-29 is disabled".into());
+        }
         // Group metadata events MUST be signed by the relay's own key in
         // every configuration. While NIP-29 is disabled these kinds are not
         // group actions, so the disabled-window gate below does not catch
@@ -2100,6 +2115,20 @@ mod tests {
             .precheck(&cfg, &access, &normal, now, &[], None, None)
             .await;
         assert!(!matches!(out, super::Precheck::Reject(_)));
+
+        // Ordinary channel content must not slip through the disabled
+        // window: the restored group store still gates reads, and accepting
+        // an `h`-tagged post here would make it visible after NIP-29 is
+        // re-enabled.
+        let channel_content =
+            signed_with_seed(7, 1, vec![vec!["h".into(), "private-group".into()]]);
+        let out = relay
+            .precheck(&cfg, &access, &channel_content, now, &[], None, None)
+            .await;
+        assert!(
+            matches!(out, super::Precheck::Reject(msg) if msg.contains("NIP-29 is disabled")),
+            "ordinary h-tagged content must be refused while NIP-29 is disabled"
+        );
 
         // M29: a multi-h event stored in the disabled window would be
         // indexed under every h but visible under only the first.

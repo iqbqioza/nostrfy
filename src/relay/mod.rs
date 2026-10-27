@@ -3377,6 +3377,19 @@ impl Relay {
                 return PutOutcome::Invalid("rate-limited: too many join attempts".into());
             }
         }
+        // Capture the incarnation before validation, not after it. If a
+        // delete/recreate interleaves with the precheck, the apply check
+        // fails closed (the event is stored but ignored) instead of binding
+        // the event to an incarnation that validation never saw.
+        let expected_group_create: Option<String> =
+            if nip29::is_group_action(&event) && event.kind != nip29::CREATE_GROUP {
+                let groups = self.groups.read().await;
+                nip29::group_id(&event)
+                    .and_then(|gid| groups.group(gid))
+                    .and_then(|group| group.create_id.clone())
+            } else {
+                None
+            };
         let verdict = self
             .precheck(&cfg, &access, &event, now, authed, known_prefixes, verified)
             .await;
@@ -3595,18 +3608,6 @@ impl Relay {
             self.stats.bump(&self.stats.events_rejected, 1);
             return PutOutcome::Invalid("rate-limited: too many events".into());
         }
-        // Bind a state event to the incarnation that validation saw. A
-        // delete/recreate between the read-side check and after_put must not
-        // let the old admin's event mutate the new group.
-        let expected_group_create =
-            if nip29::is_group_action(&event) && event.kind != nip29::CREATE_GROUP {
-                let groups = self.groups.read().await;
-                nip29::group_id(&event)
-                    .and_then(|gid| groups.group(gid))
-                    .and_then(|group| group.create_id.clone())
-            } else {
-                None
-            };
         // Buzz kind:9033 is an admin command that changes the NIP-11 icon.
         // Authorize and validate it before the event write; the config write
         // happens after the read guards are dropped below.
@@ -4442,19 +4443,34 @@ impl Relay {
                 // group on the relay would turn that into a NIP-29 outage
                 // an attacker can sustain by repeating it, for a grant it
                 // could have revoked in its own group anyway.
-                let unknown = !touch.groups && !touch.roles;
-                if touch.groups || unknown {
-                    if touch.groups_all || unknown {
-                        // An unclassified removal (including the empty id
-                        // list produced when both NIPs are disabled) cannot
-                        // be scoped: fail closed for the whole store rather
-                        // than marking no group at all.
+                let unknown =
+                    !touch.groups && !touch.roles && !state_removed.group && !state_removed.role;
+                let group_touched = touch.groups || state_removed.group || unknown;
+                if group_touched {
+                    // Prefer the groups the removal walk actually resolved.
+                    // The pre-check can be narrower (or, for a NIP-09 with a
+                    // misleading `h`, narrower in the wrong direction), so a
+                    // removed state event with a known scope must not fall
+                    // back to a relay-wide fail-closed mark.
+                    let ids: Vec<String> = if touch.groups {
+                        touch.group_ids.clone()
+                    } else {
+                        state_removed.group_ids.clone().unwrap_or_default()
+                    };
+                    let whole_store = unknown
+                        || touch.groups_all
+                        || (state_removed.group && state_removed.group_ids.is_none())
+                        || ids.is_empty();
+                    if whole_store {
+                        // An unclassified removal cannot be scoped: fail
+                        // closed for the whole store rather than marking no
+                        // group at all.
                         self.mark_group_state_stale().await;
                     } else {
-                        self.mark_group_state_stale_for(&touch.group_ids).await;
+                        self.mark_group_state_stale_for(&ids).await;
                     }
                 }
-                if touch.roles || unknown {
+                if touch.roles || state_removed.role || unknown {
                     self.mark_roles_stale().await;
                 }
             }
@@ -5545,7 +5561,16 @@ impl Relay {
         // but only inside this group. Without this filter, 1024 foreign
         // group-state ids in the e-tags promoted one deletion to a global
         // NIP-29 fail-closed mark.
-        let scoped_group = nip29::group_id(event).map(str::to_string);
+        // Only the group-scoped 9005 may use the event's `h` to narrow the
+        // target lookup. A NIP-09 kind:5 is author-scoped: its `h` tag has
+        // no authority over which stored event it can delete, and allowing
+        // a mismatched tag to suppress the pre-check would route the
+        // removal into the global fail-closed branch after the DB walk.
+        let scoped_group = if event.kind == 9005 {
+            nip29::group_id(event).map(str::to_string)
+        } else {
+            None
+        };
         // The lookup is only a per-family existence check, so one event per
         // family is enough: a single capped page over both families could
         // fill up on one side (a deletion naming 64 group-state ids plus a
@@ -6360,7 +6385,7 @@ impl Relay {
         event: &Event,
         now: u64,
         expected_group_create: Option<&str>,
-    ) -> Vec<Event> {
+    ) -> (Vec<Event>, bool) {
         let relay_pubkey = self.relay_pubkey().unwrap_or_default();
         // Relay-generated events are stamped with the strictly monotonic
         // clock (not plain `now`): two events applied in the same second
@@ -6382,7 +6407,29 @@ impl Relay {
                 .and_then(|gid| groups.group(gid))
                 .and_then(|group| group.create_id.as_deref());
             if current != Some(expected) {
-                return Vec::new();
+                return (Vec::new(), false);
+            }
+        }
+        // Re-check authorization and the incarnation timestamp while the
+        // write lock is held. Intake validation happened before the
+        // database commit; an admin removal or delete/recreate may have
+        // landed in between. A rejected event is stored (its id is fixed)
+        // but must have no side effects.
+        if let Some(gid) = nip29::group_id(event) {
+            if event.kind != nip29::CREATE_GROUP
+                && groups
+                    .group(gid)
+                    .and_then(|group| group.created_at)
+                    .is_some_and(|created| event.created_at < created)
+            {
+                return (Vec::new(), false);
+            }
+            if let Err(reason) = groups.authorize_live_state_event(event, &relay_pubkey) {
+                log::warn!(
+                    "dropping group state event {} after apply-time authorization: {reason}",
+                    event.id
+                );
+                return (Vec::new(), false);
             }
         }
         if buffer.scanning {
@@ -6397,7 +6444,8 @@ impl Relay {
                 });
             }
         }
-        groups.apply(event, &relay_pubkey, stamp, self.has_relay_key(), false)
+        let generated = groups.apply(event, &relay_pubkey, stamp, self.has_relay_key(), false);
+        (generated, true)
     }
 
     /// Marks a `9008` id as a ghost on the live store, before the delete is
@@ -6440,6 +6488,49 @@ impl Relay {
         self.groups.write().await.mark_ghost(gid);
     }
 
+    /// Marks the pre-delete ghost only if the group is still the incarnation
+    /// the event was validated against. Returns `Some(was_ghosted)` when the
+    /// mark was applied and `None` when the event is stale for this id.
+    ///
+    /// Checking and marking under one `groups.write()` is important: a
+    /// recreate between a separate check and `mark_ghost` would leave the
+    /// new group ghosted even though its incarnation was never validated.
+    async fn ghost_deleted_group_if_current(
+        &self,
+        event: &Event,
+        expected_group_create: Option<&str>,
+    ) -> Option<bool> {
+        let gid = nip29::group_id(event)?;
+        let mut buffer = self.groups_rebuild.buffer.lock().await;
+        if buffer.scanning {
+            buffer.retry = true;
+        }
+        // Keep the same lock order as `ghost_deleted_group`: buffer ->
+        // LiveKit cache -> group write.
+        // AUD-25: a re-created group with the same id must republish its
+        // 39004 even when LiveKit returns the same participant list.
+        self.livekit_participants.lock().await.remove(gid);
+        let mut groups = self.groups.write().await;
+        if let Some(expected) = expected_group_create
+            && groups
+                .group(gid)
+                .and_then(|group| group.create_id.as_deref())
+                != Some(expected)
+        {
+            return None;
+        }
+        let relay_pubkey = self.relay_pubkey().unwrap_or_default();
+        if groups
+            .authorize_live_state_event(event, &relay_pubkey)
+            .is_err()
+        {
+            return None;
+        }
+        let was_ghosted = groups.is_ghosted(gid);
+        groups.mark_ghost(gid);
+        Some(was_ghosted)
+    }
+
     /// Clears a `9008` ghost after its purge was confirmed. An in-flight
     /// rebuild scan is discarded: it captured the pre-purge state and would
     /// re-ghost the id from its seed.
@@ -6479,6 +6570,36 @@ impl Relay {
         };
         let mut removal_failed = false;
         let mut unapplied = None;
+        // A `kind:9008` purge may fail (or the process may crash before it
+        // commits). The delete tombstone alone would let a later create
+        // clear it and expose the un-purged history, so the id is ghosted
+        // *before* the delete is applied and persisted: the persisted
+        // snapshot stays fail-closed even if the purge never completes. The
+        // ghost is downgraded to the ordinary tombstone only after the purge
+        // is confirmed (below). The mark is conditional on the same
+        // incarnation the event was validated against; a stale delete must
+        // not ghost a newly re-created group.
+        let delete_ghost = if event.kind == nip29::DELETE_GROUP {
+            let Some(was_ghosted) = self
+                .ghost_deleted_group_if_current(event, expected_group_create)
+                .await
+            else {
+                // Stale incarnation: the event remains stored but must not
+                // purge or tombstone the current group.
+                return (true, None);
+            };
+            if self.persist_groups_outcome().await == PersistOutcome::Failed
+                && let Some(gid) = nip29::group_id(event)
+            {
+                log::error!(
+                    "could not persist the pre-delete group ghost for {gid}; the in-memory \
+                     state stays fail-closed"
+                );
+            }
+            Some(was_ghosted)
+        } else {
+            None
+        };
         // A DM's 30622 snapshots carry this group in an `h` tag and are
         // removed by the purge. Capture the live `hidden_for` set before the
         // delete removes the group, so a failed/interrupted purge can still
@@ -6491,31 +6612,28 @@ impl Relay {
         } else {
             Vec::new()
         };
-        // A `kind:9008` purge may fail (or the process may crash before it
-        // commits). The delete tombstone alone would let a later create
-        // clear it and expose the un-purged history, so the id is ghosted
-        // *before* the delete is applied and persisted: the persisted
-        // snapshot stays fail-closed even if the purge never completes. The
-        // ghost is downgraded to the ordinary tombstone only after the purge
-        // is confirmed (below).
-        if event.kind == nip29::DELETE_GROUP
-            && let Some(gid) = nip29::group_id(event)
-        {
-            self.ghost_deleted_group(gid).await;
-            if self.persist_groups_outcome().await == PersistOutcome::Failed {
-                log::error!(
-                    "could not persist the pre-delete group ghost for {gid}; the in-memory \
-                     state stays fail-closed"
-                );
-            }
-        }
-        let generated = self
+        let (generated, state_applied) = self
             .apply_group_state(event, now, expected_group_create)
             .await;
         // Debounced persistence: restarts restore from the snapshot instead
         // of replaying history, and a skipped save is detected at startup
         // through the group-state sequence (`DbClient::state_seq_group`).
         self.schedule_groups_persist();
+        if !state_applied {
+            // The event is stored, but its apply-time authorization or
+            // incarnation check rejected it. In particular, a revoked
+            // admin's queued 9008 must not leave a ghost behind on a live
+            // group (and a queued 9005 must not delete anything).
+            if let Some(false) = delete_ghost
+                && let Some(gid) = nip29::group_id(event)
+            {
+                let mut groups = self.groups.write().await;
+                if groups.group(gid).is_some() && !groups.is_deleted(gid) {
+                    groups.clear_ghost(gid);
+                }
+            }
+            return (true, None);
+        }
 
         if event.kind == 9005 {
             // Group moderation delete-event: admins may delete events, but
@@ -8618,8 +8736,11 @@ mod tests {
             relay.accept_event(bystander_grant, &[], None).await,
             crate::db::PutOutcome::Stored
         ));
-        // Delete that grant by NIP-09 (only its author may).
-        let deletion = sign(&a, 5, now - 100, vec![vec!["e".into(), put_user.id]]);
+        // Delete that grant by NIP-09 (only its author may). The `h` tag
+        // deliberately names the *bystander* group: kind:5 is author-scoped,
+        // so this tag must not be used to narrow the target lookup or to
+        // promote the removal to a relay-wide fail-closed mark.
+        let deletion = sign(&a, 5, now - 100, g2(vec![vec!["e".into(), put_user.id]]));
         assert!(matches!(
             relay.accept_event(deletion, &[], None).await,
             crate::db::PutOutcome::Stored
@@ -15059,6 +15180,118 @@ mod tests {
         relay.db.shutdown();
     }
     #[tokio::test]
+    async fn stale_delete_does_not_ghost_the_current_incarnation() {
+        let relay = build_relay().await;
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let now = crate::util::unix_now();
+        let create =
+            signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, "", now, false, false);
+        let delete = signed_group_event(&admin, 9008, "g1", vec![], now + 1);
+        let (applied, unapplied) = relay
+            .apply_group_event(&delete, now + 1, Some("old-create-id"))
+            .await;
+        assert!(
+            applied,
+            "a stale delete is stored without a removal failure"
+        );
+        assert!(unapplied.is_none());
+        let groups = relay.groups.read().await;
+        assert!(
+            groups.group("g1").is_some(),
+            "the current incarnation must survive a stale 9008"
+        );
+        assert!(
+            !groups.is_ghosted("g1"),
+            "a stale 9008 must not leave a fail-closed ghost"
+        );
+        drop(groups);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stale_9005_does_not_delete_targets_in_the_new_incarnation() {
+        let relay = build_relay().await;
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let now = crate::util::unix_now();
+        let create =
+            signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, "", now, false, false);
+        let target = signed_group_event(&admin, 1, "g1", vec![], now + 1);
+        assert_eq!(
+            relay.db.put(target.clone(), now + 1).await,
+            crate::db::PutOutcome::Stored
+        );
+        let delete = signed_group_event(
+            &admin,
+            9005,
+            "g1",
+            vec![vec!["e".into(), target.id.clone()]],
+            now + 2,
+        );
+        let (applied, _) = relay
+            .apply_group_event(&delete, now + 2, Some("old-create-id"))
+            .await;
+        assert!(applied);
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": [target.id]})).unwrap();
+        let (events, _) = relay.db.query(vec![filter], 10, now + 3).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "a stale 9005 must not delete new-incarnation targets"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn apply_time_authorization_rejects_a_demoted_admin_grant() {
+        let relay = build_relay().await;
+        let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
+        let attacker = secp256k1::Keypair::from_secret_bytes([5u8; 32]).unwrap();
+        let target = "cc".repeat(32);
+        let now = crate::util::unix_now();
+        let create =
+            signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, "", now, false, false);
+        let grant = signed_group_event(
+            &attacker,
+            9000,
+            "g1",
+            vec![vec!["p".into(), target.clone()]],
+            now + 1,
+        );
+        let (applied, _) = relay.apply_group_event(&grant, now + 1, None).await;
+        assert!(
+            applied,
+            "the queued event is stored; only its state mutation is ignored"
+        );
+        assert!(
+            !relay
+                .groups
+                .read()
+                .await
+                .group("g1")
+                .unwrap()
+                .is_member(&target),
+            "a non-admin must not apply a queued grant"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn a_stale_create_id_cannot_mutate_the_new_incarnation() {
         let relay = build_relay().await;
         let now = crate::util::unix_now();
@@ -15088,10 +15321,11 @@ mod tests {
             content: String::new(),
             sig: String::new(),
         };
-        let stale = relay
+        let (stale, applied) = relay
             .apply_group_state(&edit, now + 1, Some("old-create-id"))
             .await;
         assert!(stale.is_empty());
+        assert!(!applied, "a stale incarnation must not be applied");
         assert_eq!(
             relay.groups.read().await.group("g1").unwrap().settings.name,
             ""
@@ -15105,9 +15339,10 @@ mod tests {
             .create_id
             .clone()
             .expect("create id");
-        let _ = relay
+        let (_, applied) = relay
             .apply_group_state(&edit, now + 1, Some(create_id.as_str()))
             .await;
+        assert!(applied);
         assert_eq!(
             relay.groups.read().await.group("g1").unwrap().settings.name,
             "new"
