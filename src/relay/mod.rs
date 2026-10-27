@@ -6971,6 +6971,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dm_open_reuses_an_existing_channel_after_key_rotation() {
+        let relay = build_relay_with_key(false, &"21".repeat(32)).await;
+        relay.groups.write().await.buzz_enabled = true;
+        relay.config.write().await.relay.enabled_buzz = true;
+        let a = secp256k1::Keypair::from_secret_bytes([5u8; 32]).unwrap();
+        let b = secp256k1::Keypair::from_secret_bytes([6u8; 32]).unwrap();
+        let a_pk = secp256k1::XOnlyPublicKey::from_keypair(&a).0.to_string();
+        let b_pk = secp256k1::XOnlyPublicKey::from_keypair(&b).0.to_string();
+        let now = crate::util::unix_now();
+        {
+            let mut groups = relay.groups.write().await;
+            let mut group = crate::nips::nip29::Group {
+                channel_type: "dm".into(),
+                created_at: Some(now - 100),
+                ..crate::nips::nip29::Group::default()
+            };
+            group
+                .members
+                .insert(a_pk.clone(), ["admin".to_string()].into());
+            group
+                .members
+                .insert(b_pk.clone(), std::collections::HashSet::new());
+            group.settings.private = true;
+            group.settings.restricted = true;
+            group.settings.closed = true;
+            group.settings.hidden = true;
+            groups.groups.insert("old-dm".into(), group);
+        }
+        let open = crate::event::Event {
+            id: String::new(),
+            pubkey: a_pk,
+            created_at: now,
+            kind: crate::nips::nip29::DM_OPEN,
+            tags: vec![vec!["p".into(), b_pk]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let outcome = relay.handle_dm_open(&open, &[]).await;
+        let channel = match outcome {
+            crate::db::PutOutcome::Duplicate(message) => {
+                let json = message.strip_prefix("response:").expect("DM response");
+                serde_json::from_str::<serde_json::Value>(json).unwrap()["channel_id"]
+                    .as_str()
+                    .expect("channel id")
+                    .to_string()
+            }
+            other => panic!("DM open failed: {other:?}"),
+        };
+        assert_eq!(
+            channel, "old-dm",
+            "the existing participant channel must survive key rotation"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn dm_open_does_not_delete_an_existing_channel_when_a_participant_was_removed() {
         let relay = build_relay_with_key(false, &"11".repeat(32)).await;
         relay.groups.write().await.buzz_enabled = true;

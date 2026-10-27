@@ -203,8 +203,28 @@ impl super::Relay {
             .key
             .as_ref()
             .map(|key| key.secret_key().to_secret_bytes());
-        let channel =
+        let mut channel =
             derive_channel_id(&participants, secret.as_ref().map(|bytes| bytes.as_slice()));
+        // The derived id includes the relay key. After a key rotation, an
+        // existing snapshot-backed DM would otherwise be duplicated under a
+        // new id. Reuse an existing DM with exactly this participant set so
+        // a normal re-open still reaches the old history.
+        {
+            let groups = self.groups.read().await;
+            if groups.group(&channel).is_none()
+                && let Some((gid, _)) = groups
+                    .groups
+                    .iter()
+                    .filter(|(_, group)| {
+                        group.channel_type == "dm"
+                            && group.members.len() == participants.len()
+                            && participants.iter().all(|pk| group.is_member(pk))
+                    })
+                    .max_by_key(|(_, group)| group.created_at.unwrap_or(0))
+            {
+                channel = gid.clone();
+            }
+        }
         let now = unix_now();
         if let Err(outcome) = self.dm_preflight(&cfg, event, now).await {
             return outcome;

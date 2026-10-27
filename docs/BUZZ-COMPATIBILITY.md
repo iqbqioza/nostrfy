@@ -230,8 +230,11 @@ host, because Buzz signs the relay URL it uploads to.
   allowlist entry but does not automatically remove NIP-43 role
   assignments.
 - DM channel ids are derived from `relay.private_key`. Rotating the relay
-  key changes every derived id: old DM groups remain in the snapshot, while
-  a new open creates a new channel. There is no automatic DM migration.
+  key changes the derived id, but a DM open now reuses an existing
+  snapshot-backed DM whose participant set exactly matches, so the old
+  channel and its history remain reachable. A channel with incomplete or
+  extra participants is not reused; there is no general automatic DM-id
+  migration.
 - In Buzz mode, a restored creator whose only role is exactly `admin` is
   upgraded to `owner` only when the snapshot has no explicit creator-role
   edit marker. A `9000`/`9001` edit of the creator sets that marker in the
