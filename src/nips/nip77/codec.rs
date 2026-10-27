@@ -49,12 +49,21 @@ pub(crate) fn write_bound(out: &mut Vec<u8>, bound: &Bound, prev_ts: &mut u64) {
         1 + (bound.ts.saturating_sub(*prev_ts))
     };
     *prev_ts = bound.ts;
+    // The max timestamp is the protocol's infinity sentinel and carries no
+    // prefix: a non-empty prefix there is meaningless (records may not use
+    // that timestamp) and writing it would make the encoded bound sort
+    // before the implicit infinity tail after a decode. Canonicalize it.
+    let prefix = if bound.ts == u64::MAX {
+        &[][..]
+    } else {
+        bound.prefix.as_slice()
+    };
     let mut buf = [0u8; 10];
     let n = write_varint(&mut buf, encoded);
     out.extend_from_slice(&buf[..n]);
-    let n = write_varint(&mut buf, bound.prefix.len() as u64);
+    let n = write_varint(&mut buf, prefix.len() as u64);
     out.extend_from_slice(&buf[..n]);
-    out.extend_from_slice(&bound.prefix);
+    out.extend_from_slice(prefix);
 }
 
 pub(crate) fn read_bound(data: &[u8], pos: &mut usize, prev_ts: &mut u64) -> anyhow::Result<Bound> {
@@ -77,6 +86,12 @@ pub(crate) fn read_bound(data: &[u8], pos: &mut usize, prev_ts: &mut u64) -> any
         .ok_or_else(|| anyhow!("truncated bound prefix"))?
         .to_vec();
     *pos += len;
+    // The max timestamp is the infinity sentinel. Since records cannot use
+    // it, a client-supplied non-empty prefix at that timestamp cannot
+    // exclude any real record: normalize it to infinity. Without this, the
+    // implicit infinity tail appended by `respond` sorts before the
+    // prefixed bound and produces descending response bounds.
+    let prefix = if ts == u64::MAX { Vec::new() } else { prefix };
     Ok(Bound { ts, prefix })
 }
 
@@ -224,6 +239,32 @@ mod tests {
     }
 
     #[test]
+    fn max_timestamp_bound_normalizes_to_infinity() {
+        // NEG-2: records cannot use the max timestamp, so a client bound at
+        // (u64::MAX, non-empty prefix) cannot exclude any record. Treat it
+        // as the infinity sentinel instead of accepting a bound that sorts
+        // above the implicit infinity tail (which produced descending
+        // response bounds).
+        let mut msg = vec![PROTOCOL_VERSION];
+        msg.extend(varint(0)); // encoded infinity timestamp
+        msg.extend(varint(2)); // non-canonical non-empty prefix
+        msg.extend([0xaa, 0xbb]);
+        msg.extend(varint(0)); // Skip
+        let ranges = parse_message(&msg, 16).unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].upper.ts, u64::MAX);
+        assert!(
+            ranges[0].upper.prefix.is_empty(),
+            "a max-timestamp bound must be normalized to infinity"
+        );
+        // Encoding the normalized bound is canonical.
+        let mut out = Vec::new();
+        let mut prev = 0;
+        write_bound(&mut out, &ranges[0].upper, &mut prev);
+        assert_eq!(out, vec![0, 0], "infinity is timestamp 0, empty prefix");
+    }
+
+    #[test]
     fn oversized_lengths_are_rejected_before_the_usize_cast() {
         // A length varint ≥ 2^32 must hit the cap as a u64: on a 32-bit
         // target the old `as usize` truncated it (2^32 -> 0) and an
@@ -335,7 +376,11 @@ mod tests {
                 1 => ts = u64::MAX,
                 _ => ts = ts.saturating_add(rng.next_u64() % 1_000_000),
             }
-            let prefix_len = rng.below(33);
+            // The max timestamp is infinity and canonically has no prefix;
+            // a non-empty prefix there is normalized by `read_bound`, so the
+            // generator emits the canonical form (the normalization itself
+            // has a dedicated regression test).
+            let prefix_len = if ts == u64::MAX { 0 } else { rng.below(33) };
             let prefix = (0..prefix_len).map(|_| rng.next_u64() as u8).collect();
             let mode = match rng.below(3) {
                 0 => TestMode::Skip,

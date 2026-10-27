@@ -453,8 +453,8 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
         }
         Msg::AggregateSample { limit, now, reply } => {
             match store.scan_neg(&crate::filter::Filter::default(), now, limit, SCAN_BUDGET) {
-                Ok(out) => {
-                    let _ = reply.send(Some(out));
+                Ok((items, more, _)) => {
+                    let _ = reply.send(Some((items, more)));
                 }
                 Err(e) => db_error(errors, &e),
             }
@@ -1519,8 +1519,8 @@ pub(crate) fn spawn(
                                         limit,
                                         SCAN_BUDGET,
                                     ) {
-                                        Ok(out) => {
-                                            let _ = reply.send(Some(out));
+                                        Ok((items, more, _)) => {
+                                            let _ = reply.send(Some((items, more)));
                                         }
                                         Err(e) => db_error(&thread_errors, &e),
                                     }

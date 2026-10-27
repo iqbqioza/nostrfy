@@ -5295,7 +5295,7 @@ fn neg_items_carry_visibility_flags() {
             assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
         }
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
-        let (items, _) = db.neg_items_reported(f, 100, now).await.unwrap_or_default();
+        let (items, _, _) = db.neg_items_reported(f, 100, now).await.unwrap_or_default();
         let by_id = |id: &str| items.iter().find(|i| hex::encode(i.id) == id).unwrap();
         assert!(by_id(&protected.id).protected, "protected flag set");
         assert!(
@@ -5343,7 +5343,7 @@ fn neg_items_carry_nip78_flag() {
             assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
         }
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1, 30078]})).unwrap();
-        let (items, _) = db.neg_items_reported(f, 100, now).await.unwrap_or_default();
+        let (items, _, _) = db.neg_items_reported(f, 100, now).await.unwrap_or_default();
         let by_id = |id: &str| items.iter().find(|i| hex::encode(i.id) == id).unwrap();
         assert!(by_id(&app.id).app_specific, "app-specific flag set");
         assert_eq!(
@@ -6114,7 +6114,7 @@ fn neg_items_carry_gift_wrap_recipients() {
         assert_eq!(db.put(wrap.clone(), now).await, PutOutcome::Stored);
         assert_eq!(db.put(plain.clone(), now).await, PutOutcome::Stored);
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1, 1059]})).unwrap();
-        let (items, _) = db.neg_items_reported(f, 100, now).await.unwrap_or_default();
+        let (items, _, _) = db.neg_items_reported(f, 100, now).await.unwrap_or_default();
         let wrap_item = items.iter().find(|i| hex::encode(i.id) == wrap.id).unwrap();
         assert_eq!(
             wrap_item.wrap_recipients.as_deref(),
@@ -11483,7 +11483,7 @@ fn nip91_history_count_and_negentropy_agree() {
                     db.count_result(vec![f.clone()], 100, now).await.unwrap();
                 assert_eq!(count as usize, expected.len(), "{raw}");
                 assert!(!approximate);
-                let (items, more) = db.neg_items_reported(f, 100, now).await.unwrap();
+                let (items, more, _) = db.neg_items_reported(f, 100, now).await.unwrap();
                 assert!(!more);
                 let mut ids: Vec<_> = items.iter().map(|i| hex::encode(i.id)).collect();
                 ids.sort();
@@ -11494,6 +11494,39 @@ fn nip91_history_count_and_negentropy_agree() {
         }
     });
     db.shutdown();
+}
+
+#[test]
+fn neg_reports_the_effective_processable_item_limit() {
+    // NEG-5: the NIP-77 "too big" fourth element must be the limit the
+    // scan actually applied, not merely the configured max_neg_items.
+    // A non-search query is additionally bounded by SCAN_BUDGET; a search
+    // query is bounded by its over-fetch cap (SEARCH_BUDGET_MAX).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let plain = Filter::default();
+        let (_, more, effective) = db.neg_items_reported(plain, 1_000_000, now).await.unwrap();
+        assert!(!more);
+        assert_eq!(effective, crate::db::SCAN_BUDGET);
+
+        let search: Filter =
+            serde_json::from_value(serde_json::json!({"search": "needle"})).unwrap();
+        let (_, more, effective) = db.neg_items_reported(search, 1_000_000, now).await.unwrap();
+        assert!(!more);
+        assert_eq!(effective, 100_000, "search over-fetch cap is lower");
+        db.shutdown();
+    });
 }
 
 #[test]

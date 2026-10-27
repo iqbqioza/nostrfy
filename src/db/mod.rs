@@ -457,7 +457,11 @@ enum Msg {
         filter: Filter,
         limit: usize,
         now: u64,
-        reply: oneshot::Sender<(NegItems, bool)>,
+        /// `(items, more, effective_item_limit)`: the third value is the
+        /// smallest cap the scan actually applied (config, search
+        /// over-fetch, or the shared work budget), for NIP-77's optional
+        /// NEG-ERR fourth element.
+        reply: oneshot::Sender<(NegItems, bool, usize)>,
     },
     Count {
         filters: Vec<Filter>,
@@ -2078,13 +2082,14 @@ impl DbClient {
 
     /// Negentropy query that reports failure (`None` on timeout /
     /// fail-fast): a timed-out sync must not be answered with an empty
-    /// item set, or the peer would delete its local events.
+    /// item set, or the peer would delete its local events. On success the
+    /// tuple is `(items, more, effective_item_limit)`.
     pub async fn neg_items_reported(
         &self,
         filter: Filter,
         limit: usize,
         now: u64,
-    ) -> Option<(NegItems, bool)> {
+    ) -> Option<(NegItems, bool, usize)> {
         self.request_read_result(|reply| Msg::NegQuery {
             filter,
             limit,
@@ -2142,7 +2147,7 @@ impl DbClient {
         filter: Filter,
         limit: usize,
         now: u64,
-    ) -> Option<(NegItems, bool)> {
+    ) -> Option<(NegItems, bool, usize)> {
         self.neg_items_reported(filter, limit, now).await
     }
 
