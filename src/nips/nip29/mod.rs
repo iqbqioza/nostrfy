@@ -2900,7 +2900,14 @@ impl GroupStore {
     /// The lightweight NIP-77 variant: only the group id, kind and timestamp
     /// are available.
     pub fn channel_ttl_expired_gid(&self, gid: &str, kind: u64, created_at: u64, now: u64) -> bool {
-        if is_group_action_kind(kind) || (GROUP_META..=GROUP_PINS).contains(&kind) {
+        if is_group_action_kind(kind)
+            || (GROUP_META..=GROUP_PINS).contains(&kind)
+            // Per-user state (NIP-DV visibility and membership notices) is
+            // not channel timeline content. Expiring it would make a DM
+            // reappear in the sidebar or hide a membership notification.
+            || is_membership_notice_kind(kind)
+            || kind == 30622
+        {
             return false;
         }
         let Some(ttl) = self.groups.get(gid).and_then(|group| group.settings.ttl) else {

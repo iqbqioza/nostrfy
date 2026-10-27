@@ -245,6 +245,16 @@ fn channel_ttl_expires_only_content_events() {
         !store.channel_ttl_expired(&metadata, now + 100),
         "group metadata must not expire with the message TTL"
     );
+    let dm_visibility = event(30622, USER, Some("g1"), vec![]);
+    assert!(
+        !store.channel_ttl_expired(&dm_visibility, now + 100),
+        "per-viewer DM visibility state must not expire as channel content"
+    );
+    let notice = event(MEMBER_ADDED, ADMIN, Some("g1"), vec![]);
+    assert!(
+        !store.channel_ttl_expired(&notice, now + 100),
+        "per-user membership notices must not expire as channel content"
+    );
 }
 
 #[test]
