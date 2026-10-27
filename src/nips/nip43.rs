@@ -393,7 +393,18 @@ impl RoleStore {
             members.entry(pubkey.clone()).or_default();
         }
         for pubkey in owners {
-            members.insert(pubkey.clone(), vec!["owner".to_string()]);
+            // Preserve an owner's explicitly assigned roles instead of
+            // replacing the whole entry with `owner`. Otherwise a rebuild
+            // that skipped the synthetic owner entry would also lose the
+            // assigned role, and an owner demoted from config would lose it
+            // permanently.
+            let mut roles = self.assignments.get(pubkey).cloned().unwrap_or_default();
+            roles.sort();
+            roles.dedup();
+            if !roles.iter().any(|role| role == "owner") {
+                roles.insert(0, "owner".to_string());
+            }
+            members.insert(pubkey.clone(), roles);
         }
         for (pubkey, roles) in members {
             let mut tag = vec!["member".to_string(), pubkey];
@@ -426,6 +437,27 @@ impl RoleStore {
     /// aborts startup. The history is streamed in ascending pages and
     /// applied as it arrives, so memory stays bounded by one page.
     pub async fn rebuild(&mut self, db: &DbClient, relay_pubkey: &str) -> bool {
+        // Synthetic allowlist entries are published as role-empty members by
+        // `membership_event`, but they are not role assignments. Rebuilding
+        // them into `assignments` lets an unallow/ban leave them in `13534`
+        // and consumes the relay member cap. Skip role-empty entries for the
+        // current allowlist; a real role grant to an allowlisted member has
+        // roles and is kept.
+        let allowlisted: std::collections::HashSet<String> = match db.load_access().await {
+            crate::db::LoadAccessOutcome::Loaded(access) => access
+                .allowed_pubkeys
+                .into_iter()
+                .map(|(pubkey, _)| pubkey.to_ascii_lowercase())
+                .collect(),
+            crate::db::LoadAccessOutcome::Missing => std::collections::HashSet::new(),
+            crate::db::LoadAccessOutcome::Failed => {
+                log::warn!(
+                    "role state rebuild cannot read the access allowlist; synthetic entries may \
+                     remain until the next role rebuild"
+                );
+                std::collections::HashSet::new()
+            }
+        };
         // A vanished pubkey must not be resurrected as a role holder by a
         // pre-vanish membership list. The vanish table is permanent and
         // attacker-growable, so do not materialize every marker: collect the
@@ -564,7 +596,12 @@ impl RoleStore {
                     }
                     MEMBERSHIP_LIST => {
                         for tag in &event.tags {
-                            if tag.len() >= 2 && tag[0] == "member" && !vanished.contains(&tag[1]) {
+                            if tag.len() >= 2
+                                && tag[0] == "member"
+                                && !vanished.contains(&tag[1])
+                                && !(tag.len() == 2
+                                    && allowlisted.contains(&tag[1].to_ascii_lowercase()))
+                            {
                                 // Sorted and deduplicated: the tag order is
                                 // not part of the protocol, and an unstable
                                 // order made rebuilt role lists differ from
@@ -597,7 +634,10 @@ impl RoleStore {
         let roles = &self.roles;
         let kept = members_without_roles(&self.assignments);
         for assigned in self.assignments.values_mut() {
-            assigned.retain(|role| roles.contains_key(role));
+            // `owner` is a synthetic roster role injected from the relay
+            // configuration, not necessarily a defined 33534 role. Keep it
+            // through the definition filter.
+            assigned.retain(|role| role == "owner" || roles.contains_key(role));
         }
         self.assignments
             .retain(|pubkey, assigned| kept.contains(pubkey) || !assigned.is_empty());
@@ -878,6 +918,8 @@ mod tests {
 
         let allowlisted = "dd".repeat(32);
         let owner = "ee".repeat(32);
+        store.create("mod", "mod", "", "", None);
+        assert!(store.assign(&owner, "mod"));
         let members = store.membership_event(
             "relaypub",
             now,
@@ -895,11 +937,15 @@ mod tests {
             members.tags.contains(&vec!["member".into(), allowlisted]),
             "an allowlisted pubkey must appear in the NIP-43 roster"
         );
+        let owner_tag = members
+            .tags
+            .iter()
+            .find(|tag| tag.len() >= 2 && tag[0] == "member" && tag[1] == owner)
+            .expect("the relay owner must be listed");
+        assert!(owner_tag.iter().any(|role| role == "owner"));
         assert!(
-            members
-                .tags
-                .contains(&vec!["member".into(), owner, "owner".into()]),
-            "the relay owner must carry the owner role"
+            owner_tag.iter().any(|role| role == "mod"),
+            "a synthetic owner tag must not overwrite an assigned role"
         );
 
         let add = store.add_user_event("c308e1f8", "relaypub", now);
