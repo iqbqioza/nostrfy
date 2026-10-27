@@ -3686,7 +3686,7 @@ impl Relay {
         // Buzz kind:9033 is an admin command that changes the NIP-11 icon.
         // Authorize and validate it before the event write; the config write
         // happens after the read guards are dropped below.
-        let workspace_icon = if event.kind == 9033 {
+        let _workspace_icon = if event.kind == 9033 {
             if !self.is_relay_owner_or_admin(&event.pubkey).await {
                 self.stats.bump(&self.stats.events_rejected, 1);
                 return PutOutcome::Invalid(
@@ -3764,22 +3764,6 @@ impl Relay {
             // Best-effort durable arrival sequence; a missing value falls
             // back to the legacy rank/id order on replay.
             let _ = self.db.assign_event_arrival(event_id).await;
-        }
-        if let Some(icon) = workspace_icon.as_deref()
-            && !self.apply_workspace_icon(icon).await
-        {
-            self.publish_rate_rollback(&event.pubkey, now);
-            self.stats.bump(&self.stats.events_rejected, 1);
-            return PutOutcome::Invalid(
-                "error: cannot persist the workspace icon; the command was not accepted".into(),
-            );
-        }
-        if matches!(event.kind, 9035 | 9036)
-            && let Err(reason) = self.apply_identity_archive(&event).await
-        {
-            self.publish_rate_rollback(&event.pubkey, now);
-            self.stats.bump(&self.stats.events_rejected, 1);
-            return PutOutcome::Invalid(reason);
         }
         let outcome = self
             .db
@@ -4586,6 +4570,27 @@ impl Relay {
                 );
             }
         }
+        if event.kind == 9033
+            && let Some(icon) = event
+                .tags
+                .iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == "icon")
+                .map(|tag| tag[1].as_str())
+            && !self.apply_workspace_icon(icon).await
+        {
+            log::warn!(
+                "stored workspace icon command {} but could not persist the icon",
+                event.id
+            );
+        }
+        if matches!(event.kind, 9035 | 9036)
+            && let Err(reason) = self.apply_identity_archive(&event).await
+        {
+            log::warn!(
+                "stored identity archive command {} but could not apply it: {reason}",
+                event.id
+            );
+        }
         if nip29_enabled && nip29::is_group_action(&event) {
             let (applied, group_unapplied) = self
                 .apply_group_event(&event, now, expected_group_create)
@@ -4949,8 +4954,15 @@ impl Relay {
                 None => return false,
             }
         }
-        let events = {
+        let mut events = {
             let roles = self.roles.read().await;
+            if self.roles_rebuild.dirty.load(Ordering::SeqCst)
+                || self.roles_rebuild.running.load(Ordering::SeqCst)
+                || self.roles_rebuild.removal_committed.load(Ordering::SeqCst)
+                || self.roles_rebuild.derived.in_flight()
+            {
+                return false;
+            }
             let mut events =
                 vec![roles.membership_event(&relay_pubkey, now, &extra_members, &owners)];
             for id in roles.roles.keys() {
@@ -4958,9 +4970,31 @@ impl Relay {
             }
             events
         };
+        // Sign before collecting IDs so a removal racing the publish can
+        // remove exactly the events this call actually stored. `store_role_event`
+        // signs again; the signature is deterministic for the same event.
+        if !events.iter_mut().all(|event| self.sign_relay_event(event)) {
+            return false;
+        }
+        let mut stored_ids = Vec::with_capacity(events.len());
         let mut all_stored = true;
         for mut event in events {
-            all_stored &= self.store_role_event(&mut event).await.is_ok();
+            let id = event.id_bytes();
+            let stored = self.store_role_event(&mut event).await.is_ok();
+            if stored && let Some(id) = id {
+                stored_ids.push(id);
+            }
+            all_stored &= stored;
+        }
+        if (self.roles_rebuild.removal_committed.load(Ordering::SeqCst)
+            || self.roles_rebuild.derived.in_flight())
+            && !stored_ids.is_empty()
+        {
+            // A removal began between the pre-check and the write. Remove
+            // whichever roster/definitions this call stored so the rebuild
+            // cannot resurrect the revoked grant.
+            let _ = self.db.remove_events_by_id(&stored_ids).await;
+            return false;
         }
         all_stored
     }
