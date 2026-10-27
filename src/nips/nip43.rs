@@ -100,6 +100,27 @@ pub(crate) struct RolesSnapshot {
     pub seq: u64,
 }
 
+/// Whether `role` is the synthetic roster token injected for configured
+/// relay owners. It is display metadata for Buzz, not a NIP-43 assignment:
+/// accepting it as a real role made a removed operator identity survive a
+/// rebuild and retain relay-admin authority.
+fn is_synthetic_owner_role(role: &str) -> bool {
+    role.eq_ignore_ascii_case("owner")
+}
+
+/// Removes the synthetic `owner` token from restored assignments. An entry
+/// that consisted only of `owner` was the synthetic roster row (or an old
+/// explicit owner grant, which has the same display-only semantics) and is
+/// dropped; a role-empty entry without `owner` is a claim-admitted member
+/// and must survive.
+fn strip_synthetic_owner_assignments(assignments: &mut HashMap<String, Vec<String>>) {
+    assignments.retain(|_, roles| {
+        let had_owner = roles.iter().any(|role| is_synthetic_owner_role(role));
+        roles.retain(|role| !is_synthetic_owner_role(role));
+        !had_owner || !roles.is_empty()
+    });
+}
+
 impl RoleStore {
     /// Whether the store holds event-derived role state: a role definition
     /// or an assignment that names at least one role. Role-empty entries can
@@ -162,6 +183,14 @@ impl RoleStore {
     pub(crate) fn restore(&mut self, snap: RolesSnapshot) {
         self.roles = snap.roles;
         self.assignments = snap.assignments;
+        // Older snapshots materialized the relay configuration's synthetic
+        // `owner` roster row into a real assignment. That made a removed
+        // operator identity retain the role after a restart. `owner` is a
+        // display-only row injected by `membership_event`, never an
+        // assignable NIP-43 role, so strip it while preserving every
+        // ordinary role on the same member. A claim-admitted member's empty
+        // entry is not an owner row and stays.
+        strip_synthetic_owner_assignments(&mut self.assignments);
         self.claims = snap.claims;
     }
 
@@ -233,7 +262,11 @@ impl RoleStore {
     }
 
     pub fn assign(&mut self, pubkey: &str, role: &str) -> bool {
-        if !self.roles.contains_key(role) {
+        // `owner` is the synthetic roster token, not an assignable role.
+        // Allowing it here would create an assignment that the rebuild
+        // deliberately discards, so report the same "unknown role" result
+        // as any other non-assignable id.
+        if is_synthetic_owner_role(role) || !self.roles.contains_key(role) {
             return false;
         }
         if !self.assignments.contains_key(pubkey) && self.assignments.len() >= MAX_RELAY_MEMBERS {
@@ -380,15 +413,23 @@ impl RoleStore {
         owners: &[String],
     ) -> Event {
         let mut event = Self::base(MEMBERSHIP_LIST, relay_pubkey, now);
-        let mut members: std::collections::BTreeMap<String, Vec<String>> = self
-            .assignments
-            .iter()
-            .map(|(pk, roles)| {
-                let mut roles = roles.clone();
-                roles.sort();
-                (pk.clone(), roles)
-            })
-            .collect();
+        let mut members: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (pk, assigned) in &self.assignments {
+            let had_owner = assigned.iter().any(|role| is_synthetic_owner_role(role));
+            let mut roles = assigned.clone();
+            // A stale snapshot or an explicit NIP-86 owner grant must not
+            // turn into a real roster role for an ordinary member. Only the
+            // configured-owner branch below emits `owner`. An entry that
+            // consisted only of the synthetic token is not a membership; a
+            // role-empty entry without it is a claim-admitted member.
+            roles.retain(|role| !is_synthetic_owner_role(role));
+            if had_owner && roles.is_empty() {
+                continue;
+            }
+            roles.sort();
+            members.insert(pk.clone(), roles);
+        }
         for pubkey in extra_members {
             members.entry(pubkey.clone()).or_default();
         }
@@ -397,8 +438,10 @@ impl RoleStore {
             // replacing the whole entry with `owner`. Otherwise a rebuild
             // that skipped the synthetic owner entry would also lose the
             // assigned role, and an owner demoted from config would lose it
-            // permanently.
+            // permanently. `owner` itself is display-only: it is not stored
+            // in `assignments` and does not authorize relay commands.
             let mut roles = self.assignments.get(pubkey).cloned().unwrap_or_default();
+            roles.retain(|role| !is_synthetic_owner_role(role));
             roles.sort();
             roles.dedup();
             if !roles.iter().any(|role| role == "owner") {
@@ -596,21 +639,39 @@ impl RoleStore {
                     }
                     MEMBERSHIP_LIST => {
                         for tag in &event.tags {
-                            if tag.len() >= 2
-                                && tag[0] == "member"
-                                && !vanished.contains(&tag[1])
-                                && !(tag.len() == 2
+                            if tag.len() < 2
+                                || tag[0] != "member"
+                                || vanished.contains(&tag[1])
+                                || (tag.len() == 2
                                     && allowlisted.contains(&tag[1].to_ascii_lowercase()))
                             {
-                                // Sorted and deduplicated: the tag order is
-                                // not part of the protocol, and an unstable
-                                // order made rebuilt role lists differ from
-                                // the published ones.
-                                let mut roles = tag[2..].to_vec();
-                                roles.sort();
-                                roles.dedup();
-                                self.assignments.insert(tag[1].clone(), roles);
+                                continue;
                             }
+                            // `owner` is injected by `membership_event` for
+                            // the configured relay identities; it is not a
+                            // real role. Materializing it made a removed
+                            // owner keep relay-admin authority forever.
+                            // Strip it and preserve the member's ordinary
+                            // roles; an owner-only row disappears. A bare
+                            // row without `owner` is a claim-admitted
+                            // member and remains an empty assignment.
+                            let had_owner =
+                                tag[2..].iter().any(|role| is_synthetic_owner_role(role));
+                            let mut roles: Vec<String> = tag[2..]
+                                .iter()
+                                .filter(|role| !is_synthetic_owner_role(role))
+                                .cloned()
+                                .collect();
+                            if had_owner && roles.is_empty() {
+                                continue;
+                            }
+                            // Sorted and deduplicated: the tag order is
+                            // not part of the protocol, and an unstable
+                            // order made rebuilt role lists differ from
+                            // the published ones.
+                            roles.sort();
+                            roles.dedup();
+                            self.assignments.insert(tag[1].clone(), roles);
                         }
                     }
                     _ => {}
@@ -634,10 +695,10 @@ impl RoleStore {
         let roles = &self.roles;
         let kept = members_without_roles(&self.assignments);
         for assigned in self.assignments.values_mut() {
-            // `owner` is a synthetic roster role injected from the relay
-            // configuration, not necessarily a defined 33534 role. Keep it
-            // through the definition filter.
-            assigned.retain(|role| role == "owner" || roles.contains_key(role));
+            // `owner` was already stripped above. Every remaining role must
+            // have survived its definition event; there is no synthetic
+            // exemption left that could keep a removed grant authorized.
+            assigned.retain(|role| roles.contains_key(role));
         }
         self.assignments
             .retain(|pubkey, assigned| kept.contains(pubkey) || !assigned.is_empty());
@@ -1213,6 +1274,140 @@ mod tests {
             );
             drop(db);
         });
+    }
+
+    #[test]
+    fn rebuild_does_not_materialize_synthetic_owner_roles() {
+        // `membership_event` publishes configured owners as `owner` rows for
+        // Buzz's roster. They are display metadata, not assignments: a
+        // removed operator must not retain relay-admin authority after a
+        // rebuild, while an owner's ordinary assigned role must survive.
+        use crate::nips::nip01;
+        use std::sync::Arc;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrfy-nip43-owner-rebuild-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let cfg = crate::config::DatabaseConfig {
+            path,
+            map_size: 16 * 1024 * 1024,
+            max_map_size: 32 * 1024 * 1024,
+            ..Default::default()
+        };
+        let db = crate::db::DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay_pk = "aa".repeat(32);
+            let current_owner = "11".repeat(32);
+            let former_owner = "22".repeat(32);
+            let claimy = "33".repeat(32);
+            let mut role = Event {
+                id: String::new(),
+                pubkey: relay_pk.clone(),
+                created_at: 100,
+                kind: ROLE_DEFINITION,
+                tags: vec![
+                    vec!["-".into()],
+                    vec!["d".into(), "mod".into()],
+                    vec!["label".into(), "Mod".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            let mut members = Event {
+                id: String::new(),
+                pubkey: relay_pk.clone(),
+                created_at: 200,
+                kind: MEMBERSHIP_LIST,
+                tags: vec![
+                    vec!["-".into()],
+                    // Synthetic owner-only row for a current/former config
+                    // identity: must not become an assignment.
+                    vec!["member".into(), current_owner.clone(), "owner".into()],
+                    // An owner with a real role keeps that role, but not the
+                    // synthetic `owner` token.
+                    vec![
+                        "member".into(),
+                        former_owner.clone(),
+                        "owner".into(),
+                        "mod".into(),
+                    ],
+                    // A claim-admitted member has no roles and is real.
+                    vec!["member".into(), claimy.clone()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            for ev in [&mut role, &mut members] {
+                ev.id = nip01::compute_id(ev);
+            }
+            let now = unix_now();
+            for ev in [&role, &members] {
+                assert_eq!(db.put(ev.clone(), now).await, crate::db::PutOutcome::Stored);
+            }
+            let mut store = RoleStore::default();
+            assert!(
+                store.rebuild(&db, &relay_pk).await,
+                "the rebuild must complete"
+            );
+            assert!(
+                !store.assignments.contains_key(&current_owner),
+                "a synthetic owner-only row must not become an assignment"
+            );
+            assert_eq!(
+                store.assignments.get(&former_owner),
+                Some(&vec!["mod".to_string()]),
+                "the owner's ordinary role must survive without the synthetic token"
+            );
+            assert!(
+                store.is_member_of(&claimy),
+                "a claim-admitted role-empty member must survive"
+            );
+            assert!(
+                store.has_role_state(),
+                "the surviving mod role makes the store authoritative"
+            );
+        });
+    }
+
+    #[test]
+    fn restore_strips_legacy_synthetic_owner_assignments() {
+        let owner = "11".repeat(32);
+        let former = "22".repeat(32);
+        let claimy = "33".repeat(32);
+        let mut assignments = std::collections::HashMap::new();
+        assignments.insert(owner.clone(), vec!["owner".to_string()]);
+        assignments.insert(former.clone(), vec!["owner".to_string(), "mod".to_string()]);
+        assignments.insert(claimy.clone(), Vec::new());
+        let mut store = RoleStore::default();
+        store.restore(RolesSnapshot {
+            assignments,
+            ..Default::default()
+        });
+        assert!(
+            !store.assignments.contains_key(&owner),
+            "an owner-only legacy snapshot row is synthetic and must be dropped"
+        );
+        assert_eq!(
+            store.assignments.get(&former),
+            Some(&vec!["mod".to_string()]),
+            "non-owner roles must survive snapshot sanitization"
+        );
+        assert!(
+            store.is_member_of(&claimy),
+            "a role-empty claim member must survive snapshot sanitization"
+        );
     }
 
     #[test]

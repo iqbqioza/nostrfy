@@ -966,6 +966,13 @@ impl super::Relay {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
             return RoleChange::Failed;
         }
+        // `owner` is the synthetic roster token for configured operator
+        // identities. It is not a NIP-43 role: accepting an assignment would
+        // report success for a grant the restart rebuild intentionally drops
+        // (and would reintroduce the removed-owner authority bug).
+        if role.eq_ignore_ascii_case("owner") {
+            return RoleChange::Unknown;
+        }
         // A rebuild marked before (or during) this call revokes the live
         // store: publishing its membership list would store a partial 13534
         // (only the member this call just assigned) and the rebuild would
@@ -1398,9 +1405,16 @@ impl super::Relay {
         removed
     }
 
-    /// NIP-43 leave request: removes the user from the member list and
-    /// republishes it with a remove-user event.
+    /// NIP-43 leave request: revokes relay access, removes the user from the
+    /// role list, and republishes the roster.
     pub(crate) async fn apply_leave_request(&self, event: &Event) {
+        // Revoke access *before* building the roster. `membership_event`
+        // injects the live allowlist as bare members, so publishing first
+        // put the leaver back into kind:13534; once the allowlist was
+        // removed, the next rebuild materialized that bare row as a
+        // claim-admitted member. A leaver who is only allowlisted (no role
+        // entry) also needs this revocation and a roster refresh.
+        let access_changed = self.revoke_leave_access(&event.pubkey).await;
         // A leave arriving while a role rebuild is in flight must still
         // take effect: the live store is the revoked empty store, so the
         // removal reports "not a member" and would never be captured for
@@ -1431,39 +1445,36 @@ impl super::Relay {
             .await;
         if removed {
             self.schedule_roles_persist();
-            // A failed republish would let the rebuild resurrect the
-            // member after a restart: surface it in the log.
-            if !self
-                .publish_membership(Some((false, event.pubkey.clone())))
-                .await
-            {
-                log::warn!(
-                    "apply_leave_request: the membership list could not be republished; {} may resurface after a restart",
-                    event.pubkey
-                );
-            }
-        } else if rebuild_pending {
-            // Buffered for replay (or a no-op when the member is absent):
-            // announce the departure with a remove-user event alone.
-            // Publishing the revoked store's member list here would
-            // broadcast (and store) a wrong list, while the remove-user
-            // event tells clients exactly what happened. The next
-            // membership change republishes the full list; the replayed
-            // removal keeps the member out of it.
-            if !self.publish_remove_user(&event.pubkey).await {
-                log::warn!(
-                    "apply_leave_request: the remove-user event could not be published; {} may resurface if the rebuild scan fails",
-                    event.pubkey
-                );
-            }
         }
         // A leave has no stored event that carries it across a rebuild. If a
         // rebuild started while the leave applied or published, capture the
         // removal for the replay (N43-L01); outside that window the live
         // store and its membership list are authoritative.
         super::buffer_pubkey_removal(&mut buffer, &self.roles_rebuild, &event.pubkey);
+        if rebuild_pending {
+            // The live store is revoked: publishing its full member list
+            // would store a partial list. Announce the departure with a
+            // remove-user event alone; the captured removal and the next
+            // rebuild produce the authoritative roster.
+            if !self.publish_remove_user(&event.pubkey).await {
+                log::warn!(
+                    "apply_leave_request: the remove-user event could not be published; {} may resurface if the rebuild scan fails",
+                    event.pubkey
+                );
+            }
+        } else if removed || access_changed {
+            // `access_changed` matters even when the role store did not
+            // contain the pubkey: the allowlist row itself is part of the
+            // published roster. Either way, publish only after the revoke.
+            let change = removed.then(|| (false, event.pubkey.clone()));
+            if !self.publish_membership(change).await {
+                log::warn!(
+                    "apply_leave_request: the membership list could not be republished; {} may resurface after a restart",
+                    event.pubkey
+                );
+            }
+        }
         drop(buffer);
-        self.revoke_leave_access(&event.pubkey).await;
     }
 
     /// A NIP-43 LEAVE withdraws the member from the relay, not just from
@@ -1471,14 +1482,17 @@ impl super::Relay {
     /// allowlist already; an allowlisted member or NIP-86 grantee who leaves
     /// must not keep write/management access. Configured owners are kept so
     /// their operator identity cannot be removed by a self-request.
-    async fn revoke_leave_access(&self, pubkey: &str) {
+    ///
+    /// Returns whether the live access state changed (even if persistence
+    /// failed; the queued ops are replayed by the next persist/reload).
+    async fn revoke_leave_access(&self, pubkey: &str) -> bool {
         if self
             .relay_owner_members()
             .await
             .iter()
             .any(|owner| owner.eq_ignore_ascii_case(pubkey))
         {
-            return;
+            return false;
         }
         let (removed_allow, methods) = {
             let mut access = self.access.write().await;
@@ -1498,7 +1512,10 @@ impl super::Relay {
         if removed_allow {
             ops.push(crate::config::AccessOp::UnallowPubkey {
                 pubkey: pubkey.to_string(),
-                insensitive: false,
+                // NIP-43/86 access matching is case-insensitive. An exact
+                // match would leave a legacy uppercase allowlist row behind,
+                // restoring the leaver's publish rights on the next reload.
+                insensitive: true,
             });
         }
         ops.extend(
@@ -1510,14 +1527,29 @@ impl super::Relay {
                 }),
         );
         if ops.is_empty() {
-            return;
+            return false;
         }
         self.push_access_ops(ops);
-        if !self.persist_access().await {
+        // The roster is republished from the live allowlist immediately; do
+        // not let a transient writer backlog leave the revocation
+        // memory-only. Retry a few times, like the shutdown journal flush.
+        let mut persisted = false;
+        for attempt in 0..3 {
+            if self.persist_access().await {
+                persisted = true;
+                break;
+            }
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        if !persisted {
             log::warn!(
-                "apply_leave_request: access revocation for {pubkey} is live but not durable"
+                "apply_leave_request: access revocation for {pubkey} is live but not durable; \
+                 the queued access op will be retried by the next persist/reload"
             );
         }
+        true
     }
 
     /// Publishes only the add-user event for an admission applied while the

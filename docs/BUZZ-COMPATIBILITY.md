@@ -56,7 +56,11 @@ relay's NIP-11 `pubkey` (`relay.pubkey`) and to `rpc.admin_pubkey`, so
 Buzz's community-members panel shows the operator as the owner instead of
 an absent or plain member. The relay's signing key (`relay.private_key`,
 NIP-11 `self`) is not added: it is the event signer, not an administrator
-identity.
+identity. The `owner` token is display-only roster metadata: it is never
+materialized into a stored role assignment and does not grant relay-admin
+commands. Removing an identity from the configuration therefore removes
+that authority on the next roster rebuild/restart. Ordinary roles assigned
+to the same identity are preserved.
 
 ## HTTP bridge
 
@@ -172,14 +176,15 @@ host, because Buzz signs the relay URL it uploads to.
   receive a system channel's relay-signed state unless it names the channel
   (`#h`, `#d`, `#t:system` or `#P`).
 - Buzz's relay-member management commands (`kind:9030`-`9032`) are accepted
-  from a relay owner/NIP-86 admin or a NIP-43 `owner`/`admin` assignment and
-  update the NIP-43 role roster (member/admin; role changes use the same
-  roles). They update `kind:13534` and persist the role snapshot. They do not
-  edit the NIP-86 allowlist used by `restrict_relay`; manage that separately
-  with `nostrfy relay allow/deny` or NIP-86. Channel member management
-  (`kind:9000`/`9001`) and the member UI work as before.
-- Buzz's workspace-profile command (`kind:9033`) is accepted from a relay
-  owner/NIP-86 admin or a NIP-43 `owner`/`admin` assignment. It validates the
+  from a configured relay owner/NIP-86 admin or a NIP-43 `admin` assignment
+  and update the NIP-43 role roster (member/admin; role changes use the same
+  roles). A roster `owner` row is display metadata and does not authorize
+  these commands. They update `kind:13534` and persist the role snapshot.
+  They do not edit the NIP-86 allowlist used by `restrict_relay`; manage that
+  separately with `nostrfy relay allow/deny` or NIP-86. Channel member
+  management (`kind:9000`/`9001`) and the member UI work as before.
+- Buzz's workspace-profile command (`kind:9033`) is accepted from a
+  configured relay owner/NIP-86 admin or a NIP-43 `admin` assignment. It validates the
   single `icon` tag (`https://` or `data:image/`, or empty), updates the
   NIP-11 icon immediately, and persists `relay.icon` when a config path is
   available; a failed file write rolls the in-memory change back. The
@@ -244,6 +249,11 @@ host, because Buzz signs the relay URL it uploads to.
   allowlist if it should publish too. NIP-86 `banpubkey` removes an
   allowlist entry but does not automatically remove NIP-43 role
   assignments.
+- A NIP-43 LEAVE revokes the leaver's allowlist row and NIP-86 method
+  grants before republishing `13534`, matching case-insensitively. A
+  leaver who was only allowlisted (no role entry) is republished out of the
+  roster too, so a restart rebuild cannot turn the stale bare row into a
+  claim-admitted member. Configured relay owners are kept.
 - DM channel ids are derived from `relay.private_key`. Rotating the relay
   key changes the derived id, but a DM open now reuses an existing
   snapshot-backed DM whose participant set exactly matches, so the old

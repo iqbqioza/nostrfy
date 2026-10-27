@@ -1211,10 +1211,12 @@ pub async fn rpc_handler(
             // for an unknown (future) id, pre-banning it. Only a store
             // failure must not be reported as success (the ban would
             // silently disappear on the next restart).
-            // Keep both derived stores from certifying a snapshot between
-            // the commit and the remove/mark below.
+            // Keep the group store from certifying a snapshot between the
+            // commit and the remove/mark below. The target cannot be role
+            // state: relay-signed role kinds were rejected above, so a role
+            // claim here would unnecessarily block/delete a concurrent
+            // roster publish for an ordinary event ban.
             let _groups_in_flight = relay.begin_group_derived();
-            let _roles_in_flight = relay.begin_role_derived();
             let outcome = relay.db.ban_event(id, reason).await;
             let (_, state_removed) = match outcome {
                 Ok(outcome) => {
