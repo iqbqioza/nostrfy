@@ -251,6 +251,29 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(None);
             false
         }
+        Msg::GroupApplyPending { event_ids, reply } => {
+            let out = match store.group_apply_pending_for(&event_ids) {
+                Ok(map) => Some(map),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::MarkGroupApplyPending { reply, .. } => {
+            let _ = reply.send(None);
+            false
+        }
+        Msg::ClearGroupApplyPending { reply, .. } => {
+            let _ = reply.send(false);
+            false
+        }
+        Msg::RecoverGroupApplyPending { reply } => {
+            let _ = reply.send(None);
+            false
+        }
         Msg::LoadDmCarry { reply } => {
             let out = match store.load_dm_carry() {
                 Ok(data) => Some(data),
@@ -1531,6 +1554,46 @@ pub(crate) fn spawn(
                                         }
                                     };
                                     let _ = reply.send(out);
+                                }
+                                Msg::MarkGroupApplyPending { event_id, reply } => {
+                                    let fresh = match store.mark_group_apply_pending(&event_id) {
+                                        Ok(fresh) => Some(fresh),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(fresh);
+                                }
+                                Msg::ClearGroupApplyPending { event_id, reply } => {
+                                    let cleared = match store.clear_group_apply_pending(&event_id) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(cleared);
+                                }
+                                Msg::GroupApplyPending { event_ids, reply } => {
+                                    let out = match store.group_apply_pending_for(&event_ids) {
+                                        Ok(map) => Some(map),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::RecoverGroupApplyPending { reply } => {
+                                    let recovered = match store.recover_group_apply_pending() {
+                                        Ok(count) => Some(count),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(recovered);
                                 }
                                 Msg::SaveDmCarry { data, reply } => {
                                     let saved = match store.save_dm_carry(&data) {

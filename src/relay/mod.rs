@@ -3766,6 +3766,29 @@ impl Relay {
         // that happened.
         let group_scan_generation = (nip29_enabled && nip29::is_group_action(&event))
             .then(|| self.groups_rebuild.rebuilds.load(Ordering::SeqCst));
+        // Record the pending apply before the event can become visible to a
+        // rebuild. Startup recovery removes a marked event, so a crash
+        // between the put and the live apply cannot replay a grant the live
+        // path rejected. The marker is cleared after a successful apply
+        // (before broadcast) or after the rejected event is removed.
+        let group_pending = if nip29_enabled
+            && nip29::is_group_action(&event)
+            && let Some(id) = event.id_bytes()
+        {
+            match self.db.mark_group_apply_pending(id).await {
+                Some(fresh) => Some(fresh),
+                None => {
+                    self.publish_rate_rollback(&event.pubkey, now);
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    return PutOutcome::Invalid(
+                        "error: database unavailable: group apply marker was not written; retry"
+                            .into(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let outcome = self
             .db
             .put_with_first_seen(Arc::clone(&event), now, first_seen)
@@ -3777,6 +3800,13 @@ impl Relay {
         );
         if !accepted {
             self.publish_rate_rollback(&event.pubkey, now);
+            // A duplicate of a previously pending event keeps its marker for
+            // startup recovery; a marker this call created is garbage.
+            if group_pending == Some(true)
+                && let Some(id) = event.id_bytes()
+            {
+                let _ = self.db.clear_group_apply_pending(id).await;
+            }
         } else if nip29::is_group_action(&event)
             && let Some(event_id) = event.id_bytes()
         {
@@ -4424,6 +4454,25 @@ impl Relay {
         }
     }
 
+    /// Clears the pending-apply marker for a user-submitted group event.
+    /// Retries a transient writer backlog; a failed clear is fail-closed
+    /// because startup recovery will remove the event instead of replaying
+    /// an unconfirmed state mutation.
+    async fn clear_group_apply_pending(&self, event: &Event) -> bool {
+        let Some(id) = event.id_bytes() else {
+            return true;
+        };
+        for attempt in 0..3 {
+            if self.db.clear_group_apply_pending(id).await {
+                return true;
+            }
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        false
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn after_put(
         &self,
@@ -4624,6 +4673,13 @@ impl Relay {
                 // it could not be removed, a re-send would only hit the
                 // duplicate path, so surface the retryable removal failure.
                 self.publish_rate_rollback(&event.pubkey, now);
+                if removed && !self.clear_group_apply_pending(&event).await {
+                    log::warn!(
+                        "could not clear the pending marker for rejected group event {}; \
+                         startup recovery will remove it",
+                        event.id
+                    );
+                }
                 return if removed {
                     RemovalAck::Rejected(reason)
                 } else {
@@ -4636,6 +4692,19 @@ impl Relay {
             // A group action is either a `9005` deletion or a state update,
             // so at most one of the two unapplied requests can be set.
             unapplied = unapplied.or(group_unapplied);
+        }
+        if nip29_enabled
+            && nip29::is_group_action(&event)
+            && !self.clear_group_apply_pending(&event).await
+        {
+            // The event was applied in memory but its marker could not be
+            // cleared. Keep the marker (fail-closed): a crash will make
+            // startup recovery discard the event rather than replay it.
+            log::warn!(
+                "could not clear the pending marker for applied group event {}; startup \
+                 recovery will discard it",
+                event.id
+            );
         }
         // Command events: with `relay.enabled_command_events` a kind:1
         // event authored by the relay's own pubkey carries an operator

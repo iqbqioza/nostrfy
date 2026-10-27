@@ -238,6 +238,12 @@ pub(crate) const STATE_SEQ_GROUP_KEY: &[u8] = b"state_seq_group";
 /// [`INDEX_META`] key of the NIP-43 role-state sequence: the role snapshot
 /// counterpart of [`STATE_SEQ_GROUP_KEY`].
 pub(crate) const STATE_SEQ_ROLE_KEY: &[u8] = b"state_seq_role";
+/// [`INDEX_META`] prefix for a group-state event whose live apply has not
+/// been confirmed. The marker is written before the event and cleared only
+/// after the group store applied it (before broadcast/ACK). Startup recovery
+/// removes any marked event, so a crash between the put and the apply cannot
+/// make a rejected grant/join reappear on the next rebuild.
+const GROUP_APPLY_PENDING_PREFIX: &[u8] = b"group_apply_pending:";
 
 /// Which derived store a state-relevant `kind` feeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2357,6 +2363,13 @@ pub(crate) fn migrate_access_pubkeys(env: &Env, access: &Database<Bytes, Bytes>)
 
 // ----- key builders -----
 
+fn group_apply_pending_key(event_id: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(GROUP_APPLY_PENDING_PREFIX.len() + event_id.len());
+    key.extend_from_slice(GROUP_APPLY_PENDING_PREFIX);
+    key.extend_from_slice(event_id);
+    key
+}
+
 pub(crate) fn created_key(created: u64, id: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(CREATED_LEN + ID_LEN);
     key.extend_from_slice(&created.to_be_bytes());
@@ -3126,6 +3139,88 @@ impl Store {
         self.index_meta.put(&mut wtxn, &key, &next.to_be_bytes())?;
         wtxn.commit()?;
         Ok(next)
+    }
+
+    /// Marks a user-submitted group-state event as pending live apply.
+    /// Returns whether the marker was newly created (an existing marker
+    /// belongs to a pending event from a previous attempt/process).
+    pub(crate) fn mark_group_apply_pending(&self, event_id: &[u8]) -> Result<bool> {
+        if event_id.len() != ID_LEN {
+            return Err(anyhow::anyhow!("invalid group-apply event id"));
+        }
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        let key = group_apply_pending_key(event_id);
+        let fresh = self.index_meta.get(&wtxn, &key)?.is_none();
+        self.index_meta.put(&mut wtxn, &key, b"1")?;
+        wtxn.commit()?;
+        Ok(fresh)
+    }
+
+    /// Clears the pending-apply marker after the event was applied or
+    /// removed. A failed clear leaves the marker for startup recovery.
+    pub(crate) fn clear_group_apply_pending(&self, event_id: &[u8]) -> Result<()> {
+        if event_id.len() != ID_LEN {
+            return Err(anyhow::anyhow!("invalid group-apply event id"));
+        }
+        let mut wtxn = self.env.write_txn()?;
+        let key = group_apply_pending_key(event_id);
+        self.index_meta.delete(&mut wtxn, &key)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Returns the pending-apply event ids from a rebuild page. `None` is
+    /// never returned: the read transaction either answers or fails, and the
+    /// caller treats an error as a fail-closed rebuild.
+    pub(crate) fn group_apply_pending_for(
+        &self,
+        event_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashSet<String>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = std::collections::HashSet::with_capacity(event_ids.len());
+        for id in event_ids {
+            if id.len() != ID_LEN {
+                continue;
+            }
+            let key = group_apply_pending_key(id);
+            if self.index_meta.get(&rtxn, &key)?.is_some() {
+                out.insert(hex::encode(id));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Removes every event left with a pending-apply marker, then clears the
+    /// marker. Runs before the startup rebuild: a marked event was never
+    /// confirmed as applied, so replaying it could resurrect a grant/join
+    /// the live path rejected (or a state write interrupted before apply).
+    pub(crate) fn recover_group_apply_pending(&self) -> Result<usize> {
+        let rtxn = self.env.read_txn()?;
+        let mut ids = Vec::new();
+        for item in self
+            .index_meta
+            .prefix_iter(&rtxn, GROUP_APPLY_PENDING_PREFIX)?
+        {
+            let (key, _) = item?;
+            if let Some(id) = key.strip_prefix(GROUP_APPLY_PENDING_PREFIX)
+                && id.len() == ID_LEN
+            {
+                ids.push(id.to_vec());
+            }
+        }
+        drop(rtxn);
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut wtxn = self.env.write_txn()?;
+        for id in &ids {
+            self.remove_event(&mut wtxn, id)?;
+            let key = group_apply_pending_key(id);
+            self.index_meta.delete(&mut wtxn, &key)?;
+        }
+        wtxn.commit()?;
+        Ok(ids.len())
     }
 
     pub(crate) fn event_arrivals(

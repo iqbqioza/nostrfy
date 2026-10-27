@@ -3918,6 +3918,60 @@ fn event_arrival_sequence_round_trips() {
 }
 
 #[test]
+fn group_apply_pending_marker_recovers_the_unconfirmed_event() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let cfg = config();
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .expect("database must open");
+        let now = unix_now();
+        let mut ev = event(9000, "pending", now, vec![]);
+        ev.id = nip01::compute_id(&ev);
+        assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        let event_id = ev.id_bytes().expect("event id");
+        assert_eq!(
+            db.mark_group_apply_pending(event_id).await,
+            Some(true),
+            "the first marker write must create it"
+        );
+        assert_eq!(
+            db.mark_group_apply_pending(event_id).await,
+            Some(false),
+            "a retry must not report a fresh marker"
+        );
+        let pending = db
+            .group_apply_pending_startup(vec![event_id.to_vec()])
+            .await
+            .expect("pending read");
+        assert!(pending.contains(&ev.id));
+        assert_eq!(
+            db.recover_group_apply_pending().await,
+            Some(1),
+            "startup recovery must remove the pending event"
+        );
+        let filter: Filter = serde_json::from_value(serde_json::json!({"ids": [ev.id]})).unwrap();
+        let (stored, _) = db.query(vec![filter], 10, now).await;
+        assert!(stored.is_empty(), "the unconfirmed event must be gone");
+        assert!(
+            db.group_apply_pending_startup(vec![event_id.to_vec()])
+                .await
+                .expect("pending read after recovery")
+                .is_empty(),
+            "the marker must be cleared with the event"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
 fn group_epoch_index_round_trips_additively() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
