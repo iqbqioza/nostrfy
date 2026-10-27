@@ -162,10 +162,10 @@ host, because Buzz signs the relay URL it uploads to.
 - Channel `ttl` is enforced at read time for non-state channel content on
   WebSocket REQ/COUNT/live/NEG, the HTTP bridge and the REST API. Messages
   older than the group's TTL are hidden immediately, including after a TTL
-  edit. Startup also performs a bounded physical purge for TTL groups; there
-  is no continuous TTL reaper yet, so rows that expire while the relay stays
-  up remain stored (but hidden) until the next restart. NIP-40
-  `expiration` remains independent.
+  edit. Startup and the periodic database-maintenance tick perform a bounded
+  physical purge for TTL groups; read-time enforcement remains authoritative
+  if a maintenance scan is interrupted. NIP-40 `expiration` remains
+  independent.
 - NIP-CL's system-channel exclusion is applied to the HTTP bridge and to
   WebSocket REQ, COUNT, live delivery and NEG: a global filter does not
   receive a system channel's relay-signed state unless it names the channel

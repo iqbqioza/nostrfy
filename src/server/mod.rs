@@ -2606,6 +2606,17 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                             // completes.
                             relay.mark_roles_stale().await;
                         }
+                        // Channel TTL is separate from NIP-40's storage
+                        // expiry index; reclaim its expired content on the
+                        // same periodic maintenance tick. Read-time TTL
+                        // enforcement remains authoritative if this scan is
+                        // interrupted or fails.
+                        if let Err(error) = purge_expired_group_messages(&relay).await {
+                            log::warn!(
+                                "periodic channel-TTL cleanup failed; read-time TTL enforcement \
+                                 remains active: {error}"
+                            );
+                        }
                     }
                     _ = shutdown.changed() => break,
                 }
