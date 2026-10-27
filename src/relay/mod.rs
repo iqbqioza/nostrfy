@@ -746,8 +746,9 @@ enum RemovalAck {
     /// A required removal (NIP-09 deletion or NIP-29 9005) was not applied
     /// (writer overload): the client must be told to retry, not `OK true`.
     NotApplied,
-    /// Apply-time capacity lost a race against another mutation. The stored
-    /// event was removed so a retry can be admitted; report the reason.
+    /// Apply-time authorization, incarnation or capacity validation rejected
+    /// the state mutation. The stored event was removed (or never present)
+    /// so the client can retry; report the rejection reason.
     Rejected(String),
 }
 
@@ -3455,8 +3456,8 @@ impl Relay {
         }
         // Capture the incarnation before validation, not after it. If a
         // delete/recreate interleaves with the precheck, the apply check
-        // fails closed (the event is stored but ignored) instead of binding
-        // the event to an incarnation that validation never saw.
+        // fails closed (the stored event is removed with a rejection) instead
+        // of binding it to an incarnation that validation never saw.
         let expected_group_create: Option<String> =
             if nip29::is_group_action(&event) && event.kind != nip29::CREATE_GROUP {
                 let groups = self.groups.read().await;
@@ -3759,13 +3760,12 @@ impl Relay {
             self.stats.bump(&self.stats.events_rejected, 1);
             return PutOutcome::Invalid(reason);
         }
-        if nip29::is_group_action(&event)
-            && let Some(event_id) = event.id_bytes()
-        {
-            // Best-effort durable arrival sequence; a missing value falls
-            // back to the legacy rank/id order on replay.
-            let _ = self.db.assign_event_arrival(event_id).await;
-        }
+        // A rebuild scan that overlaps this put can read the event before
+        // an apply-time rejection removes it. Remember the completed-scan
+        // generation so the rejection path can force one more rebuild if
+        // that happened.
+        let group_scan_generation = (nip29_enabled && nip29::is_group_action(&event))
+            .then(|| self.groups_rebuild.rebuilds.load(Ordering::SeqCst));
         let outcome = self
             .db
             .put_with_first_seen(Arc::clone(&event), now, first_seen)
@@ -3777,6 +3777,15 @@ impl Relay {
         );
         if !accepted {
             self.publish_rate_rollback(&event.pubkey, now);
+        } else if nip29::is_group_action(&event)
+            && let Some(event_id) = event.id_bytes()
+        {
+            // Best-effort durable arrival sequence only after the event is
+            // actually stored. Assigning before the put also rewrote the
+            // sequence on a duplicate/rejected re-send, which could move a
+            // stored JOIN past a same-second removal on the next rebuild.
+            // A missing value falls back to the legacy rank/id order.
+            let _ = self.db.assign_event_arrival(event_id).await;
         }
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
@@ -3788,6 +3797,7 @@ impl Relay {
                         nip43,
                         nip29_enabled,
                         expected_group_create.as_deref(),
+                        group_scan_generation,
                     )
                     .await
                 {
@@ -4414,6 +4424,7 @@ impl Relay {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn after_put(
         &self,
         event: Arc<Event>,
@@ -4422,6 +4433,7 @@ impl Relay {
         nip43: bool,
         nip29_enabled: bool,
         expected_group_create: Option<&str>,
+        group_scan_generation: Option<u64>,
     ) -> RemovalAck {
         // Persist the incarnation this state event was validated against.
         // The additive sidecar lets a replay reject a future-dated event
@@ -4604,13 +4616,21 @@ impl Relay {
             );
         }
         if nip29_enabled && nip29::is_group_action(&event) {
-            let (applied, group_unapplied, capacity_rejection) = self
-                .apply_group_event(&event, now, expected_group_create)
+            let (removed, group_unapplied, group_rejection) = self
+                .apply_group_event(&event, now, expected_group_create, group_scan_generation)
                 .await;
-            if let Some(reason) = capacity_rejection {
-                return RemovalAck::Rejected(reason);
+            if let Some(reason) = group_rejection {
+                // The stored event was rejected before its state effect. If
+                // it could not be removed, a re-send would only hit the
+                // duplicate path, so surface the retryable removal failure.
+                self.publish_rate_rollback(&event.pubkey, now);
+                return if removed {
+                    RemovalAck::Rejected(reason)
+                } else {
+                    RemovalAck::NotApplied
+                };
             }
-            if !applied {
+            if !removed {
                 removal_failed = true;
             }
             // A group action is either a `9005` deletion or a state update,
@@ -6605,6 +6625,10 @@ impl Relay {
     /// not buffered — its ghost/tombstone/purge outcome is not
     /// reconstructible from the database — so it forces the worker to
     /// discard the scan and rebuild instead.
+    ///
+    /// The third tuple element is an apply-time rejection reason. A rejected
+    /// event reached the database before this check ran, so the caller must
+    /// remove it (and must not broadcast it or let a rebuild replay it).
     async fn apply_group_state(
         &self,
         event: &Event,
@@ -6632,14 +6656,21 @@ impl Relay {
                 .and_then(|gid| groups.group(gid))
                 .and_then(|group| group.create_id.as_deref());
             if current != Some(expected) {
-                return (Vec::new(), false, None);
+                if buffer.scanning {
+                    buffer.retry = true;
+                }
+                return (
+                    Vec::new(),
+                    false,
+                    Some("error: group state changed during apply; retry".into()),
+                );
             }
         }
         // Re-check authorization and the incarnation timestamp while the
         // write lock is held. Intake validation happened before the
         // database commit; an admin removal or delete/recreate may have
-        // landed in between. A rejected event is stored (its id is fixed)
-        // but must have no side effects.
+        // landed in between. A rejection is returned to the caller, which
+        // removes the stored event so a rebuild cannot replay it.
         if let Some(gid) = nip29::group_id(event) {
             if event.kind != nip29::CREATE_GROUP
                 && groups
@@ -6647,17 +6678,30 @@ impl Relay {
                     .and_then(|group| group.created_at)
                     .is_some_and(|created| event.created_at < created)
             {
-                return (Vec::new(), false, None);
+                if buffer.scanning {
+                    buffer.retry = true;
+                }
+                return (
+                    Vec::new(),
+                    false,
+                    Some("restricted: event predates the current group incarnation".into()),
+                );
             }
             if let Err(reason) = groups.authorize_live_state_event(event, &relay_pubkey) {
                 log::warn!(
                     "dropping group state event {} after apply-time authorization: {reason}",
                     event.id
                 );
-                return (Vec::new(), false, None);
+                if buffer.scanning {
+                    buffer.retry = true;
+                }
+                return (Vec::new(), false, Some(reason));
             }
         }
         if let Some(reason) = groups.capacity_rejection(event) {
+            if buffer.scanning {
+                buffer.retry = true;
+            }
             return (Vec::new(), false, Some(reason));
         }
         if buffer.scanning {
@@ -6770,21 +6814,52 @@ impl Relay {
         self.groups.write().await.unghost(gid);
     }
 
+    /// Repairs a rebuild scan that overlapped an apply-rejected event.
+    ///
+    /// The event is removed after the live apply check, but a scan that was
+    /// already walking the database can have read it first and swapped its
+    /// state into the live store. A scan still in flight is handled by
+    /// `RebuildBuffer::retry` (set under the buffer lock); a scan that
+    /// completed in the window is detected by the generation captured before
+    /// the put and forces one scoped rebuild from the surviving history.
+    async fn repair_rejected_group_scan(
+        &self,
+        gid: Option<&str>,
+        group_scan_generation: Option<u64>,
+    ) {
+        let Some(baseline) = group_scan_generation else {
+            return;
+        };
+        if self.groups_rebuild.rebuilds.load(Ordering::SeqCst) == baseline {
+            return;
+        }
+        log::warn!(
+            "a group rebuild overlapped an apply-rejected event; rebuilding the affected \
+             state from the surviving history"
+        );
+        match gid {
+            Some(gid) => self.mark_group_state_stale_for(&[gid.to_string()]).await,
+            None => self.mark_group_state_stale().await,
+        }
+    }
+
     /// Applies a stored NIP-29 event to the group state and publishes the
     /// relay-generated metadata events.
     ///
     /// Returns `false` when a required `9005` removal side effect was not
-    /// applied: the caller must report the retryable outcome instead of
-    /// `OK true`. Every other path returns `true` (a failed `9008` purge
-    /// keeps the id fail-closed as a ghost, which is a safe, non-removal
-    /// outcome). The second element carries the unapplied request so the
-    /// caller can hold it for the `delete_pending` flush (see
-    /// [`Self::after_put`]).
+    /// applied, or when an apply-rejected stored event could not be removed:
+    /// the caller must report a retryable outcome instead of `OK true`. The
+    /// second element carries an unapplied `9005` request so the caller can
+    /// hold it for the `delete_pending` flush. The third element is an
+    /// apply-time rejection: the event was removed (or never present) and
+    /// must not be broadcast. A failed `9008` purge keeps the id fail-closed
+    /// as a ghost, which is a safe, non-removal outcome.
     async fn apply_group_event(
         &self,
         event: &Event,
         now: u64,
         expected_group_create: Option<&str>,
+        group_scan_generation: Option<u64>,
     ) -> (
         bool,
         Option<crate::db::store::PendingDeletion>,
@@ -6816,9 +6891,34 @@ impl Relay {
                 .ghost_deleted_group_if_current(event, expected_group_create)
                 .await
             else {
-                // Stale incarnation: the event remains stored but must not
-                // purge or tombstone the current group.
-                return (true, None, None);
+                // Stale incarnation: purge nothing and remove the event so a
+                // rebuild cannot replay it against the current group. The
+                // normal rejection cleanup below handles ghosts; this early
+                // path has not marked one.
+                if let Some(id) = event.id_bytes() {
+                    match self.db.remove_events_by_id(&[id]).await {
+                        Some(_) => {}
+                        None => {
+                            log::error!(
+                                "could not remove stale group delete {}; rebuild replay will \
+                                 rely on its stored incarnation",
+                                event.id
+                            );
+                            return (false, None, Some(
+                                "error: database overloaded: stale group delete was not removed; \
+                                 retry"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+                self.repair_rejected_group_scan(nip29::group_id(event), group_scan_generation)
+                    .await;
+                return (
+                    true,
+                    None,
+                    Some("error: group state changed during apply; retry".into()),
+                );
             };
             if self.persist_groups_outcome().await == PersistOutcome::Failed
                 && let Some(gid) = nip29::group_id(event)
@@ -6844,28 +6944,21 @@ impl Relay {
         } else {
             Vec::new()
         };
-        let (generated, state_applied, capacity_rejection) = self
+        let (generated, state_applied, rejection) = self
             .apply_group_state(event, now, expected_group_create)
             .await;
         // Debounced persistence: restarts restore from the snapshot instead
         // of replaying history, and a skipped save is detected at startup
         // through the group-state sequence (`DbClient::state_seq_group`).
         self.schedule_groups_persist();
-        if let Some(reason) = capacity_rejection {
-            // The intake validation saw free capacity, but another event
-            // took it before this apply. The event is stored; remove it so
-            // a retry can actually be admitted (a duplicate would otherwise
-            // be a permanent no-op), and report the rejection to the client.
-            if let Some(id) = event.id_bytes() {
-                let _ = self.db.remove_events_by_id(&[id]).await;
-            }
-            return (true, None, Some(reason));
-        }
-        if !state_applied {
-            // The event is stored, but its apply-time authorization or
-            // incarnation check rejected it. In particular, a revoked
-            // admin's queued 9008 must not leave a ghost behind on a live
-            // group (and a queued 9005 must not delete anything).
+        if let Some(reason) = rejection {
+            // The event reached the store, but its apply-time incarnation,
+            // authorization or capacity check rejected it. Leaving it there
+            // made the rebuild replay an unauthorized grant/join that the
+            // live path had refused, and broadcast a state event whose
+            // mutation was ignored. Remove it so a retry is not a permanent
+            // duplicate; if the removal itself cannot be confirmed, report a
+            // retryable failure instead of a final rejection.
             if let Some(false) = delete_ghost
                 && let Some(gid) = nip29::group_id(event)
             {
@@ -6874,6 +6967,40 @@ impl Relay {
                     groups.clear_ghost(gid);
                 }
             }
+            if let Some(id) = event.id_bytes() {
+                match self.db.remove_events_by_id(&[id]).await {
+                    Some(_) => {
+                        self.repair_rejected_group_scan(
+                            nip29::group_id(event),
+                            group_scan_generation,
+                        )
+                        .await;
+                        return (true, None, Some(reason));
+                    }
+                    None => {
+                        log::error!(
+                            "could not remove apply-rejected group event {}; a rebuild could \
+                             replay it",
+                            event.id
+                        );
+                        return (
+                            false,
+                            None,
+                            Some(
+                                "error: database overloaded: rejected group event was not \
+                                 removed; retry"
+                                    .into(),
+                            ),
+                        );
+                    }
+                }
+            }
+            return (true, None, Some(reason));
+        }
+        if !state_applied {
+            // Defensive: every rejection path above supplies a reason. If a
+            // future arm returns false without one, treat the event as an
+            // ignored no-op rather than applying it.
             return (true, None, None);
         }
 
@@ -7147,7 +7274,9 @@ impl PendingBatch {
             let mut ack_override = None;
             match outcome {
                 PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                    let ack = relay.after_put(event, now, nip9, nip43, nip29, None).await;
+                    let ack = relay
+                        .after_put(event, now, nip9, nip43, nip29, None, None)
+                        .await;
                     match ack {
                         RemovalAck::Applied(delivered) => {
                             if !delivered {
@@ -7249,6 +7378,7 @@ mod tests {
     use super::LiveQueue;
     use super::ROLES_REBUILD_BUFFER_MAX;
     use super::Relay;
+    use super::RemovalAck;
     use super::StampClock;
     use super::enqueue_live_batch;
     use super::roles::RoleChange;
@@ -14037,7 +14167,7 @@ mod tests {
         // the generated empty 39004 cannot be committed.
         let leave = signed_group_event(&admin, 9002, gid, vec![], now + 2);
         relay.db.shutdown();
-        let _ = relay.apply_group_event(&leave, now + 2, None).await;
+        let _ = relay.apply_group_event(&leave, now + 2, None, None).await;
         assert_eq!(
             relay.livekit_participants.lock().await.get(gid),
             Some(&old),
@@ -15347,7 +15477,7 @@ mod tests {
                 vec![vec!["p".into(), member.clone(), "mod".into()]],
                 now,
             );
-            relay.apply_group_event(&grant, now, None).await;
+            relay.apply_group_event(&grant, now, None, None).await;
             let buffered = {
                 let mut buffer = relay.groups_rebuild.buffer.lock().await;
                 assert_eq!(
@@ -15425,7 +15555,7 @@ mod tests {
                 vec![vec!["p".into(), member.clone(), "mod".into()]],
                 now,
             );
-            relay.apply_group_event(&grant, now, None).await;
+            relay.apply_group_event(&grant, now, None, None).await;
             {
                 let buffer = relay.groups_rebuild.buffer.lock().await;
                 assert!(
@@ -15721,14 +15851,19 @@ mod tests {
             .await
             .apply(&create, "", now, false, false);
         let delete = signed_group_event(&admin, 9008, "g1", vec![], now + 1);
-        let (applied, unapplied, _) = relay
-            .apply_group_event(&delete, now + 1, Some("old-create-id"))
-            .await;
-        assert!(
-            applied,
-            "a stale delete is stored without a removal failure"
+        assert_eq!(
+            relay.db.put(delete.clone(), now + 1).await,
+            crate::db::PutOutcome::Stored
         );
+        let (removed, unapplied, rejection) = relay
+            .apply_group_event(&delete, now + 1, Some("old-create-id"), None)
+            .await;
+        assert!(removed, "a stale delete must be removable");
         assert!(unapplied.is_none());
+        assert!(
+            rejection.is_some(),
+            "a stale incarnation must return a rejection reason"
+        );
         let groups = relay.groups.read().await;
         assert!(
             groups.group("g1").is_some(),
@@ -15739,6 +15874,13 @@ mod tests {
             "a stale 9008 must not leave a fail-closed ghost"
         );
         drop(groups);
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": [delete.id]})).unwrap();
+        let (stored, _) = relay.db.query(vec![filter], 10, now + 2).await;
+        assert!(
+            stored.is_empty(),
+            "a stale delete must not remain stored for replay"
+        );
         relay.db.shutdown();
     }
 
@@ -15766,10 +15908,18 @@ mod tests {
             vec![vec!["e".into(), target.id.clone()]],
             now + 2,
         );
-        let (applied, _, _) = relay
-            .apply_group_event(&delete, now + 2, Some("old-create-id"))
+        assert_eq!(
+            relay.db.put(delete.clone(), now + 2).await,
+            crate::db::PutOutcome::Stored
+        );
+        let (removed, _, rejection) = relay
+            .apply_group_event(&delete, now + 2, Some("old-create-id"), None)
             .await;
-        assert!(applied);
+        assert!(removed, "the stale 9005 must be removable");
+        assert!(
+            rejection.is_some(),
+            "a stale incarnation must return a rejection reason"
+        );
         let filter: crate::filter::Filter =
             serde_json::from_value(serde_json::json!({"ids": [target.id]})).unwrap();
         let (events, _) = relay.db.query(vec![filter], 10, now + 3).await;
@@ -15777,6 +15927,62 @@ mod tests {
             events.len(),
             1,
             "a stale 9005 must not delete new-incarnation targets"
+        );
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": [delete.id]})).unwrap();
+        let (stored, _) = relay.db.query(vec![filter], 10, now + 3).await;
+        assert!(
+            stored.is_empty(),
+            "a stale 9005 must not remain stored for replay"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn capacity_rejected_create_is_removed_before_replay() {
+        // The intake precheck can see free capacity, then another create
+        // takes the last slot before this event applies. The event must not
+        // stay stored: a restart rebuild would otherwise resurrect a group
+        // the live path explicitly refused.
+        let relay = build_relay().await;
+        *relay.groups.write().await = crate::nips::nip29::GroupStore::with_cap(1);
+        let admin = secp256k1::Keypair::from_secret_bytes([13u8; 32]).unwrap();
+        let now = crate::util::unix_now();
+        let first = signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&first, "", now, false, false);
+        let second = signed_group_event(
+            &admin,
+            crate::nips::nip29::CREATE_GROUP,
+            "g2",
+            vec![],
+            now + 1,
+        );
+        assert_eq!(
+            relay.db.put(second.clone(), now + 1).await,
+            crate::db::PutOutcome::Stored
+        );
+        let (removed, _, rejection) = relay.apply_group_event(&second, now + 1, None, None).await;
+        assert!(removed, "the capacity-rejected create must be removable");
+        assert!(
+            rejection
+                .as_deref()
+                .is_some_and(|reason| reason.contains("limit")),
+            "the capacity reason must be reported: {rejection:?}"
+        );
+        assert!(
+            relay.groups.read().await.group("g2").is_none(),
+            "the rejected create must not enter the live store"
+        );
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": [second.id]})).unwrap();
+        let (stored, _) = relay.db.query(vec![filter], 10, now + 2).await;
+        assert!(
+            stored.is_empty(),
+            "the capacity-rejected create must not remain stored for replay"
         );
         relay.db.shutdown();
     }
@@ -15787,6 +15993,85 @@ mod tests {
         let admin = secp256k1::Keypair::from_secret_bytes([4u8; 32]).unwrap();
         let attacker = secp256k1::Keypair::from_secret_bytes([5u8; 32]).unwrap();
         let target = "cc".repeat(32);
+        let now = crate::util::unix_now();
+        let create =
+            signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
+        assert_eq!(
+            relay.db.put(create.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        );
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, "", now, false, false);
+        let grant = signed_group_event(
+            &attacker,
+            9000,
+            "g1",
+            vec![vec!["p".into(), target.clone()]],
+            now + 1,
+        );
+        assert_eq!(
+            relay.db.put(grant.clone(), now + 1).await,
+            crate::db::PutOutcome::Stored
+        );
+        // Simulate a rebuild scan that may already have read the event.
+        relay.groups_rebuild.buffer.lock().await.scanning = true;
+        let (removed, _, rejection) = relay.apply_group_event(&grant, now + 1, None, None).await;
+        {
+            let mut buffer = relay.groups_rebuild.buffer.lock().await;
+            assert!(
+                buffer.retry,
+                "a rejection during a scan must force the fresh store to be discarded"
+            );
+            buffer.scanning = false;
+            buffer.retry = false;
+        }
+        assert!(removed, "the rejected event must be removable");
+        assert!(
+            rejection.is_some(),
+            "apply-time authorization must return a rejection reason"
+        );
+        assert!(
+            !relay
+                .groups
+                .read()
+                .await
+                .group("g1")
+                .unwrap()
+                .is_member(&target),
+            "a non-admin must not apply a queued grant"
+        );
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": [grant.id]})).unwrap();
+        let (stored, _) = relay.db.query(vec![filter], 10, now + 2).await;
+        assert!(
+            stored.is_empty(),
+            "an apply-rejected grant must not remain stored for replay"
+        );
+        let mut rebuilt = crate::nips::nip29::GroupStore::with_cap(0);
+        assert!(
+            rebuilt.rebuild(&relay.db, None).await,
+            "the surviving group history must rebuild"
+        );
+        assert!(
+            !rebuilt.group("g1").unwrap().is_member(&target),
+            "a rebuild must not resurrect the rejected grant"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn apply_rejected_group_event_is_not_acked_as_applied() {
+        // The accept path runs `after_put` before broadcasting/acking. An
+        // apply-time rejection must surface as a rejection, not as OK:true
+        // for an event whose state was ignored (and which would be replayed
+        // on the next rebuild).
+        let relay = build_relay().await;
+        let admin = secp256k1::Keypair::from_secret_bytes([14u8; 32]).unwrap();
+        let attacker = secp256k1::Keypair::from_secret_bytes([15u8; 32]).unwrap();
+        let target = "dd".repeat(32);
         let now = crate::util::unix_now();
         let create =
             signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
@@ -15802,10 +16087,24 @@ mod tests {
             vec![vec!["p".into(), target.clone()]],
             now + 1,
         );
-        let (applied, _, _) = relay.apply_group_event(&grant, now + 1, None).await;
+        assert_eq!(
+            relay.db.put(grant.clone(), now + 1).await,
+            crate::db::PutOutcome::Stored
+        );
+        let ack = relay
+            .after_put(
+                Arc::new(grant.clone()),
+                now + 1,
+                false,
+                false,
+                true,
+                None,
+                None,
+            )
+            .await;
         assert!(
-            applied,
-            "the queued event is stored; only its state mutation is ignored"
+            matches!(ack, RemovalAck::Rejected(ref reason) if reason.contains("admin")),
+            "an apply-time authorization failure must be rejected, got {ack:?}"
         );
         assert!(
             !relay
@@ -15814,8 +16113,75 @@ mod tests {
                 .await
                 .group("g1")
                 .unwrap()
-                .is_member(&target),
-            "a non-admin must not apply a queued grant"
+                .is_member(&target)
+        );
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": [grant.id]})).unwrap();
+        let (stored, _) = relay.db.query(vec![filter], 10, now + 2).await;
+        assert!(
+            stored.is_empty(),
+            "the rejected event must not remain for a rebuild"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn apply_rejection_invalidates_a_scan_completed_during_the_put() {
+        // A scan can read the event, finish, and swap its state before the
+        // rejection removes the event. The completed-scan generation must
+        // force one scoped rebuild; otherwise the rejected grant survives
+        // in the live store until the next unrelated rebuild.
+        let relay = build_relay().await;
+        let admin = secp256k1::Keypair::from_secret_bytes([16u8; 32]).unwrap();
+        let attacker = secp256k1::Keypair::from_secret_bytes([17u8; 32]).unwrap();
+        let now = crate::util::unix_now();
+        let create =
+            signed_group_event(&admin, crate::nips::nip29::CREATE_GROUP, "g1", vec![], now);
+        relay
+            .groups
+            .write()
+            .await
+            .apply(&create, "", now, false, false);
+        let grant = signed_group_event(
+            &attacker,
+            9000,
+            "g1",
+            vec![vec!["p".into(), "ee".repeat(32)]],
+            now + 1,
+        );
+        assert_eq!(
+            relay.db.put(grant.clone(), now + 1).await,
+            crate::db::PutOutcome::Stored
+        );
+        let baseline = relay
+            .groups_rebuild
+            .rebuilds
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // Simulate a scan that completed after the put's generation was
+        // captured but before the rejection path ran.
+        relay
+            .groups_rebuild
+            .rebuilds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        relay.signal_drain();
+        let (removed, _, rejection) = relay
+            .apply_group_event(&grant, now + 1, None, Some(baseline))
+            .await;
+        assert!(removed);
+        assert!(rejection.is_some());
+        assert!(
+            relay
+                .groups_rebuild
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the completed overlapping scan must be invalidated"
+        );
+        assert!(
+            relay
+                .groups_rebuild
+                .dirty
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a retry rebuild must be scheduled"
         );
         relay.db.shutdown();
     }

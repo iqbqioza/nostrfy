@@ -3899,6 +3899,14 @@ fn event_arrival_sequence_round_trips() {
             .await
             .expect("second sequence");
         assert!(second_seq > first_seq);
+        let reassigned = db
+            .assign_event_arrival(first)
+            .await
+            .expect("existing sequence");
+        assert_eq!(
+            reassigned, first_seq,
+            "a duplicate/replayed event must keep its first arrival sequence"
+        );
         let arrivals = db
             .event_arrivals(vec![first.to_vec(), second.to_vec()])
             .await

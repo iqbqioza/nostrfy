@@ -3094,12 +3094,26 @@ impl Store {
     /// Assigns the next ingest sequence to a group-state event. The counter
     /// and the per-event key commit together, so a restart cannot assign a
     /// sequence twice or lose an already-assigned event.
+    ///
+    /// The assignment is first-write-wins: re-sending an already stored
+    /// event (which the relay reports as a duplicate and does not reapply)
+    /// must not move it past a same-second removal on the next rebuild.
     pub(crate) fn assign_event_arrival(&self, event_id: &[u8]) -> Result<u64> {
         if event_id.len() != ID_LEN {
             return Err(anyhow::anyhow!("invalid arrival event id"));
         }
         self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
+        let mut key = Vec::with_capacity(8 + event_id.len());
+        key.extend_from_slice(b"arrival:");
+        key.extend_from_slice(event_id);
+        if let Some(raw) = self.index_meta.get(&wtxn, &key)?
+            && let Some(raw) = raw.get(..8)
+        {
+            return Ok(u64::from_be_bytes(
+                raw.try_into().expect("checked arrival length"),
+            ));
+        }
         let next = self
             .index_meta
             .get(&wtxn, b"arrival_seq")?
@@ -3109,9 +3123,6 @@ impl Store {
             .saturating_add(1);
         self.index_meta
             .put(&mut wtxn, b"arrival_seq", &next.to_be_bytes())?;
-        let mut key = Vec::with_capacity(8 + event_id.len());
-        key.extend_from_slice(b"arrival:");
-        key.extend_from_slice(event_id);
         self.index_meta.put(&mut wtxn, &key, &next.to_be_bytes())?;
         wtxn.commit()?;
         Ok(next)
