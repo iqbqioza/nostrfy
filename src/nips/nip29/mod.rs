@@ -1061,6 +1061,54 @@ impl GroupStore {
         self.max_groups > 0 && self.groups.len() >= self.max_groups
     }
 
+    /// Validates the live capacity checks under the same group lock used by
+    /// apply. This is the post-validation half of the admission race: an
+    /// event can lose the group/member budget after intake accepted it.
+    /// Returns the user-facing rejection when apply would silently drop it.
+    pub(crate) fn capacity_rejection(&self, event: &Event) -> Option<String> {
+        let gid = group_id(event)?;
+        match event.kind {
+            CREATE_GROUP => {
+                if self.at_capacity() {
+                    return Some("restricted: group limit reached".into());
+                }
+                if self.at_member_capacity(1) {
+                    return Some("restricted: the relay member limit is reached".into());
+                }
+            }
+            JOIN => {
+                let group = self.groups.get(gid)?;
+                if !group.is_member(&event.pubkey) {
+                    if group.members.len() >= MAX_MEMBERS {
+                        return Some("restricted: the group is full".into());
+                    }
+                    if self.at_member_capacity(1) {
+                        return Some("restricted: the relay member limit is reached".into());
+                    }
+                }
+            }
+            PUT_USER => {
+                let group = self.groups.get(gid)?;
+                let fresh = event
+                    .tags
+                    .iter()
+                    .filter(|tag| tag.len() >= 2 && tag[0] == P)
+                    .map(|tag| tag[1].as_str())
+                    .filter(|pubkey| !group.is_member(pubkey))
+                    .collect::<HashSet<_>>()
+                    .len();
+                if group.members.len().saturating_add(fresh) > MAX_MEMBERS {
+                    return Some("restricted: too many group members".into());
+                }
+                if self.at_member_capacity(fresh) {
+                    return Some("restricted: the relay member limit is reached".into());
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// Whether a create currently hits the live group budget. Test-only:
     /// production uses [`Self::at_capacity`] directly.
     #[cfg(test)]
