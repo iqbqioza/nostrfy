@@ -25,6 +25,43 @@ const OTHER: &str = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 const ADMIN2: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 #[test]
+fn an_explicit_creator_demotion_survives_buzz_restore() {
+    let mut store = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    let now = 1_600_000_000;
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        now,
+        false,
+        false,
+    );
+    assert!(store.group("g1").unwrap().is_admin(ADMIN));
+    let demote = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["p".into(), ADMIN.into(), "admin".into()]],
+    );
+    store.apply(&demote, "relay", now + 1, false, false);
+    let snapshot = store.snapshot();
+    assert!(snapshot.groups["g1"].creator_role_explicit);
+    let mut restored = GroupStore {
+        buzz_enabled: true,
+        ..GroupStore::default()
+    };
+    restored.restore(snapshot);
+    let roles = &restored.group("g1").unwrap().members[ADMIN];
+    assert!(roles.contains("admin"));
+    assert!(
+        !roles.contains("owner"),
+        "an explicit demotion must not be upgraded back to owner"
+    );
+}
+
+#[test]
 fn channel_ttl_expires_only_content_events() {
     let mut store = GroupStore {
         buzz_enabled: true,

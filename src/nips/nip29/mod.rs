@@ -313,6 +313,11 @@ pub struct Group {
     /// startup derives it from the stored create where possible.
     #[serde(default)]
     pub create_id: Option<String>,
+    /// The creator's role was explicitly set by a 9000/9001 event. Disables
+    /// the Buzz-mode snapshot migration that otherwise upgrades a lone
+    /// `admin` to `owner` (or downgrades a Buzz default back to `admin`).
+    #[serde(default)]
+    pub creator_role_explicit: bool,
     /// NIP-CL channel type (`stream`, `forum`, `dm`, `workflow`, `system`).
     /// Empty for snapshots written before the field existed; clients then
     /// fall back to their own default, as NIP-CL requires for older events.
@@ -700,7 +705,10 @@ impl GroupStore {
             let Some(roles) = group.members.get_mut(&creator) else {
                 continue;
             };
-            let upgrade = self.buzz_enabled && roles.len() == 1 && roles.contains("admin");
+            let upgrade = self.buzz_enabled
+                && !group.creator_role_explicit
+                && roles.len() == 1
+                && roles.contains("admin");
             // A Buzz-created channel (it always carries a channel_type) is
             // restored by a relay that turned Buzz off: keep the documented
             // plain-NIP-29 creator label instead of exposing the Buzz-only
@@ -708,6 +716,7 @@ impl GroupStore {
             // explicitly assigned `owner` role in a normal NIP-29 group is
             // left untouched.
             let downgrade = !self.buzz_enabled
+                && !group.creator_role_explicit
                 && !group.channel_type.is_empty()
                 && roles.len() == 1
                 && roles.contains("owner");
@@ -1772,6 +1781,16 @@ impl GroupStore {
                             group.bots.remove(&pk);
                         }
                         group.members.insert(pk, roles);
+                    }
+                    if event.tags.iter().any(|tag| {
+                        tag.len() >= 2
+                            && tag[0] == P
+                            && group
+                                .creator
+                                .as_deref()
+                                .is_some_and(|creator| creator == tag[1])
+                    }) {
+                        group.creator_role_explicit = true;
                     }
                 }
                 if added > 0 {

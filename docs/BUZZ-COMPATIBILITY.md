@@ -231,10 +231,11 @@ host, because Buzz signs the relay URL it uploads to.
   key changes every derived id: old DM groups remain in the snapshot, while
   a new open creates a new channel. There is no automatic DM migration.
 - In Buzz mode, a restored creator whose only role is exactly `admin` is
-  upgraded to `owner`. An explicit later demotion from owner to `admin`
-  uses the same exact shape and is therefore indistinguishable from the old
-  default on the next snapshot restore; use a non-default role label when a
-  deliberate demotion must survive a restart.
+  upgraded to `owner` only when the snapshot has no explicit creator-role
+  edit marker. A `9000`/`9001` edit of the creator sets that marker in the
+  snapshot, so a deliberate owner→admin demotion (or a plain-mode role
+  change) survives later Buzz-mode restores. Old snapshots without the
+  marker keep the previous upgrade behavior.
 - Re-opening an existing DM whose participant set is incomplete (for example
   after an admin removed a member) is rejected rather than acknowledged as a
   partial channel. The existing channel is left intact; an admin can
