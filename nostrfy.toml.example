@@ -255,8 +255,16 @@ max_connections_per_sec_per_ip = 0
 # Maximum size in bytes of a single incoming WebSocket message.
 max_ws_message_bytes = 1048576
 
-# Kernel receive buffer size (kilobytes) requested per WebSocket socket.
+# Kernel receive buffer size (kilobytes) requested per accepted socket.
+# 0 = leave it to kernel autotuning.
 socket_recv_buffer_kb = 64
+
+# Kernel send buffer size (kilobytes) requested per accepted socket.
+# 0 (default) = leave it to kernel autotuning, which grows the buffer for
+# large downloads (Blossom media). An explicit small value disables
+# autotuning and caps each connection's download throughput at roughly
+# buffer/RTT; set one only to bound per-connection kernel memory.
+socket_send_buffer_kb = 0
 
 # Seconds a connection has to deliver a complete HTTP request head (the
 # request line and headers) before it is closed: closes slow-loris sockets

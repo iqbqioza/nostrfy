@@ -36,6 +36,15 @@ pub(crate) struct Descriptor {
     pub pubkey: String,
 }
 
+/// A mapping resolved once for a read: the descriptor answers HEAD/GET
+/// headers and `owners` is passed to [`BlobStore::open_resolved`] /
+/// [`BlobStore::any_exists`] so a request does not load the same LMDB row a
+/// second time.
+pub(crate) struct ResolvedBlob {
+    pub descriptor: Descriptor,
+    pub owners: Vec<String>,
+}
+
 /// The file storage backend, chosen by `blossom.storage`.
 enum Storage {
     Local(LocalStore),
@@ -206,6 +215,14 @@ pub(crate) struct BlobStore {
     /// Bytes currently reserved on the system temp filesystem for S3 spool
     /// uploads (the S3 backend has no local store counter of its own).
     s3_spool_reserved: std::sync::atomic::AtomicU64,
+    /// Hex pubkey → (canonical npub, legacy bech32m npub) directory names.
+    /// Every read computes these for each owner (bech32 encoding + hex
+    /// decode); a hot media blob with several owners otherwise pays that
+    /// cost per request. Bounded like the other caches: a full map is
+    /// cleared (the names are deterministic, so this is only a speed
+    /// optimization).
+    npub_cache:
+        std::sync::RwLock<std::collections::HashMap<String, std::sync::Arc<(String, String)>>>,
     /// Test-only one-shot fault injection: the next owner-mapping commit is
     /// treated as a database failure so the publish-first ordering (an
     /// orphan object, never a phantom mapping) is testable without a real
@@ -252,6 +269,7 @@ impl BlobStore {
                     .collect(),
             ),
             s3_spool_reserved: std::sync::atomic::AtomicU64::new(0),
+            npub_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             #[cfg(test)]
             fail_next_mapping: std::sync::atomic::AtomicBool::new(false),
         })
@@ -581,10 +599,10 @@ impl BlobStore {
         {
             return Err(anyhow::Error::new(BlobOwnerLimit));
         }
-        let npub = npub_of(pubkey);
+        let dirs = self.pubkey_dirs(pubkey);
         let stored = match &self.storage {
-            Storage::Local(s) => s.put_file(&npub, sha256, path).await,
-            Storage::S3(s) => s.put_file(&npub, sha256, path, size, mime).await,
+            Storage::Local(s) => s.put_file(&dirs.0, sha256, path).await,
+            Storage::S3(s) => s.put_file(&dirs.0, sha256, path, size, mime).await,
         };
         // Publish before mapping: without a durable object the mapping
         // would be a phantom that 404s and consumes an owner slot. A
@@ -631,7 +649,10 @@ impl BlobStore {
 
     /// Resolves a blob by its sha256 straight from LMDB. A database
     /// failure is reported as `Err`, never as `Ok(None)`: an existing blob
-    /// must not 404 on overload (the handlers answer 503 instead).
+    /// must not 404 on overload (the handlers answer 503 instead). The HTTP
+    /// paths use [`Self::resolve`] (they need the owner list too); kept for
+    /// the storage tests.
+    #[cfg(test)]
     pub(crate) async fn find(&self, sha256: &str) -> crate::error::Result<Option<Descriptor>> {
         let Some(meta) = self.db.blossom_load_checked(sha256).await else {
             return Err(db_unavailable());
@@ -712,6 +733,38 @@ impl BlobStore {
             .remove(sha256);
     }
 
+    /// Loads a blob's mapping once and returns its descriptor plus every
+    /// owner. GET needs the descriptor (size/mime) to parse `Range` before it
+    /// opens the object, and HEAD needs both the descriptor and the owner
+    /// list; resolving them together avoids the second LMDB round trip the
+    /// handlers used to make (`find` followed by `open_stream_any`/
+    /// `exists_any`).
+    ///
+    /// The checked load keeps a database failure distinguishable from "no
+    /// mapping": the handlers answer 503 for the former and 404 only for the
+    /// latter.
+    pub(crate) async fn resolve(&self, sha256: &str) -> Result<Option<ResolvedBlob>> {
+        let Some(meta) = self.db.blossom_load_checked(sha256).await else {
+            return Err(db_unavailable());
+        };
+        let Some(meta) = meta else {
+            return Ok(None);
+        };
+        let Some(pubkey) = meta.owners.first().cloned() else {
+            return Ok(None);
+        };
+        Ok(Some(ResolvedBlob {
+            descriptor: Descriptor {
+                sha256: meta.sha256,
+                size: meta.size,
+                mime: meta.mime,
+                uploaded: meta.uploaded,
+                pubkey,
+            },
+            owners: meta.owners,
+        }))
+    }
+
     /// Opens a blob by hash, trying every owner in upload order. The first
     /// owner's file may be gone (crash/manual delete) while a later owner's
     /// copy is intact: opening only `owners[0]` would 404 a retrievable
@@ -724,21 +777,30 @@ impl BlobStore {
     /// 64-owner × 2-spelling scan on every request.
     ///
     /// Returns the stream and the owner whose file was opened.
+    #[cfg(test)]
     pub(crate) async fn open_stream_any(
         &self,
         sha256: &str,
         start: u64,
         len: u64,
     ) -> Result<Option<(BlobStream, String)>> {
-        // The checked load keeps a database failure distinguishable from
-        // "no mapping" (`Ok(None)`): the handlers answer 503 for the
-        // former and 404 only for the latter.
-        let Some(meta) = self.db.blossom_load_checked(sha256).await else {
-            return Err(db_unavailable());
-        };
-        let Some(meta) = meta else {
+        let Some(resolved) = self.resolve(sha256).await? else {
             return Ok(None);
         };
+        self.open_resolved(sha256, &resolved.owners, start, len)
+            .await
+    }
+
+    /// Opens a stream using an owner list already loaded by
+    /// [`Self::resolve`] (the GET path). Shares the negative-cache and
+    /// missing-object accounting with [`Self::open_stream_any`].
+    pub(crate) async fn open_resolved(
+        &self,
+        sha256: &str,
+        owners: &[String],
+        start: u64,
+        len: u64,
+    ) -> Result<Option<(BlobStream, String)>> {
         if self.missing_cached(sha256) {
             return Ok(None);
         }
@@ -746,7 +808,7 @@ impl BlobStore {
         let mut last_error: Option<anyhow::Error> = None;
         let mut missing = false;
         let mut refused = false;
-        for owner in &meta.owners {
+        for owner in owners {
             match self.open_stream(owner, sha256, start, len).await {
                 // Found: stream it (and lift any negative-cache entry).
                 Ok(OpenOutcome::Found(stream)) => {
@@ -789,13 +851,17 @@ impl BlobStore {
     /// Whether any owner's object is reachable, without opening a stream
     /// (a HEAD must not turn into a full S3 GET). The negative cache is
     /// shared with [`Self::open_stream_any`].
+    #[cfg(test)]
     pub(crate) async fn exists_any(&self, sha256: &str) -> Result<bool> {
-        let Some(meta) = self.db.blossom_load_checked(sha256).await else {
-            return Err(db_unavailable());
-        };
-        let Some(meta) = meta else {
+        let Some(resolved) = self.resolve(sha256).await? else {
             return Ok(false);
         };
+        self.any_exists(sha256, &resolved.owners).await
+    }
+
+    /// The existence half of [`Self::open_resolved`] for an owner list
+    /// already loaded by [`Self::resolve`] (the HEAD path).
+    pub(crate) async fn any_exists(&self, sha256: &str, owners: &[String]) -> Result<bool> {
         if self.missing_cached(sha256) {
             return Ok(false);
         }
@@ -803,7 +869,7 @@ impl BlobStore {
         let mut last_error: Option<anyhow::Error> = None;
         let mut missing = false;
         let mut refused = false;
-        for owner in &meta.owners {
+        for owner in owners {
             match self.exists(owner, sha256).await {
                 Ok(Some(true)) => {
                     self.forget_missing(sha256);
@@ -839,10 +905,9 @@ impl BlobStore {
     /// npub directories. `None` means the lookup was refused (symlinked
     /// path), matching [`Self::open_stream`]'s `Refused` semantics.
     async fn exists(&self, pubkey: &str, sha256: &str) -> Result<Option<bool>> {
-        let npub = npub_of(pubkey);
-        let legacy = legacy_npub_of(pubkey);
+        let dirs = self.pubkey_dirs(pubkey);
         let mut refused = false;
-        for candidate in [npub.as_str(), legacy.as_str()] {
+        for candidate in [dirs.0.as_str(), dirs.1.as_str()] {
             let outcome = match &self.storage {
                 Storage::Local(s) => s.exists(candidate, sha256).await?,
                 Storage::S3(s) => s.exists(candidate, sha256).await?,
@@ -858,12 +923,42 @@ impl BlobStore {
 
     /// Whether `pubkey` has uploaded this blob. A database failure is an
     /// error, not `false`: the DELETE handler must not answer 403 "only the
-    /// uploader" for a blob it could not check.
+    /// uploader" for a blob it could not check. The HTTP paths now use
+    /// [`Self::resolve`] (which returns the owner list with the descriptor);
+    /// kept for the storage tests.
+    #[cfg(test)]
     pub(crate) async fn has(&self, pubkey: &str, sha256: &str) -> Result<bool> {
         let Some(meta) = self.db.blossom_load_checked(sha256).await else {
             return Err(db_unavailable());
         };
         Ok(meta.is_some_and(|meta| meta.owners.iter().any(|o| o == pubkey)))
+    }
+
+    /// The canonical and legacy npub directory names for one hex pubkey,
+    /// memoized: the mapping is immutable, so a hot blob's owner scan skips
+    /// the bech32 encode/hex decode per request. The map is bounded; a full
+    /// map is cleared rather than evicting one entry (the values are cheap
+    /// to recompute).
+    fn pubkey_dirs(&self, pubkey: &str) -> std::sync::Arc<(String, String)> {
+        const NPUB_CACHE_MAX: usize = 8192;
+        if let Some(cached) = self
+            .npub_cache
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(pubkey)
+        {
+            return std::sync::Arc::clone(cached);
+        }
+        let dirs = std::sync::Arc::new((npub_of(pubkey), legacy_npub_of(pubkey)));
+        let mut cache = self
+            .npub_cache
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.len() >= NPUB_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(pubkey.to_string(), std::sync::Arc::clone(&dirs));
+        dirs
     }
 
     /// Opens a streamable reader for the blob, positioned at `start`
@@ -882,10 +977,9 @@ impl BlobStore {
         // The canonical npub first; a blob stored under the legacy
         // bech32m npub directory (before the encoder became canonical)
         // is found via the fallback so old uploads stay readable.
-        let npub = npub_of(pubkey);
-        let legacy = legacy_npub_of(pubkey);
+        let dirs = self.pubkey_dirs(pubkey);
         let mut refused = false;
-        for candidate in [npub.as_str(), legacy.as_str()] {
+        for candidate in [dirs.0.as_str(), dirs.1.as_str()] {
             let outcome = match &self.storage {
                 Storage::Local(s) => s.open(candidate, sha256, start, len).await?,
                 Storage::S3(s) => s.open(candidate, sha256, start, len).await?,
@@ -910,8 +1004,7 @@ impl BlobStore {
     /// the LMDB mapping. Other uploaders of the same bytes keep theirs.
     pub(crate) async fn delete(&self, pubkey: &str, sha256: &str) -> Result<bool> {
         let _blob_guard = self.blob_lock(sha256).await;
-        let npub = npub_of(pubkey);
-        let legacy = legacy_npub_of(pubkey);
+        let dirs = self.pubkey_dirs(pubkey);
         let mut existed = false;
         // Both spellings are this owner's copies of the same bytes (a
         // pre-upgrade upload under the legacy bech32m directory plus a
@@ -919,7 +1012,7 @@ impl BlobStore {
         // must remove every copy, not stop at the first hit: a leftover
         // legacy file would survive the owner's delete as an unserved
         // orphan on disk. A missing file is `Ok(false)`.
-        for candidate in [npub.as_str(), legacy.as_str()] {
+        for candidate in [dirs.0.as_str(), dirs.1.as_str()] {
             let hit = match &self.storage {
                 Storage::Local(s) => s.delete(candidate, sha256).await?,
                 Storage::S3(s) => s.delete(candidate, sha256).await?,
@@ -1311,12 +1404,9 @@ impl LocalStore {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(&path)
         {
-            Ok(file) => {
-                if !file.metadata()?.is_dir() {
-                    return Err(anyhow!("blossom storage directory is not a directory"));
-                }
-                Ok(Some(file))
-            }
+            // `O_DIRECTORY` already guarantees the opened fd is a directory;
+            // an extra fstat here cost one syscall on every GET owner scan.
+            Ok(file) => Ok(Some(file)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e)
                 if e.raw_os_error() == Some(libc::ELOOP)
@@ -2238,6 +2328,13 @@ mod tests {
         assert_eq!(db.pubkey, b);
 
         assert_eq!(s.find(&sha).await.unwrap().unwrap().pubkey, a);
+        // One resolve answers both the descriptor and the full owner list
+        // (the GET/HEAD path uses this instead of find + a second lookup).
+        let resolved = s.resolve(&sha).await.unwrap().expect("the blob resolves");
+        assert_eq!(resolved.descriptor.pubkey, a);
+        assert_eq!(resolved.descriptor.size, bytes.len() as u64);
+        assert_eq!(resolved.descriptor.mime, "text/plain");
+        assert!(resolved.owners.contains(&a) && resolved.owners.contains(&b));
         assert!(s.has(&a, &sha).await.unwrap());
         assert!(s.has(&b, &sha).await.unwrap());
         assert!(!s.has(&pk(3), &sha).await.unwrap());

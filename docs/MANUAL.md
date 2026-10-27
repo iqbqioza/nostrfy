@@ -217,7 +217,8 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | `max_connections` | Maximum concurrent connections | `10000` |
 | `max_connections_per_ip` | Max connections per source IP (0 = unlimited) | `64` |
 | `max_ws_message_bytes` | Max bytes per WebSocket message/frame | `1048576` (1 MB) |
-| `socket_recv_buffer_kb` | Per-connection kernel receive buffer (KiB, `0` = kernel default; the kernel may double the value). Larger values let a fast publisher's burst absorb into one batch while the relay commits it (higher ingest throughput); the buffer only uses real memory while data is queued, so idle connections cost nothing. The send buffer stays 16 KiB | `64` |
+| `socket_recv_buffer_kb` | Per-connection kernel receive buffer (KiB, `0` = kernel default; the kernel may double the value). Larger values let a fast publisher's burst absorb into one batch while the relay commits it (higher ingest throughput); the buffer only uses real memory while data is queued, so idle connections cost nothing | `64` |
+| `socket_send_buffer_kb` | Per-connection kernel send buffer (KiB, `0` = kernel autotuning). The default is fastest for large Blossom downloads; an explicit small value disables autotuning and caps each connection at roughly `buffer/RTT`. Set non-zero only to bound per-connection kernel memory | `0` |
 | `max_filters` | Max filters per REQ | `20` |
 | `max_subscriptions` | Max subscriptions per connection | `20` |
 | `max_limit` | Ceiling for the REQ `limit` | `500` |
@@ -711,6 +712,8 @@ Uploads, deletes and listings authenticate with a Nostr auth event (kind 24242, 
 
 The descriptor `url` includes the MIME-derived extension (e.g. `https://media.example.com/<sha256>.png`; unknown types get `.bin`), like the Blossom spec's examples. The extension is advisory: the file is served by its hash alone, and `/<sha256>.<ext>` (any extension) resolves to the same blob.
 
+**Performance:** GET/HEAD load the sha→owner mapping once per request (the descriptor and owner list come from the same LMDB read), local bodies stream with zero-copy 64 KiB chunks from a pinned directory fd, and uploads spool to the blob filesystem (a rename on publish) while hashing. The kernel send buffer is left to autotuning by default so a single large download is not capped at `buffer/RTT`; set `limits.socket_send_buffer_kb` to a non-zero value only when per-connection kernel memory must be bounded. For high-bandwidth-delay uploads, raise `limits.socket_recv_buffer_kb` (or set it to `0` for kernel autotuning).
+
 ### 11.4 Example
 
 ```bash
@@ -854,7 +857,7 @@ kill -HUP $(cat nostrfy.pid)
 
 The reload is **not all-or-nothing**: every live setting is applied even when the same edit also changes a startup-only one. Settings that take effect on reload: the relay name/description/pubkey/contact/icon/post-policy, `public_url`, the auth and policy knobs (`reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey`), most `[limits]` entries (the restart-only ones are listed below), the REST API concurrency and queue ceilings, `daemon.stats_file`, `daemon.pid_file` (the marker is moved if possible), `rpc.management_token`/`admin_pubkey`, `blossom.restrict_uploads` and `access.restrict_relay`. NIP toggles (`enabled_nips`/`disabled_nips`, incl. NIP-40) require a restart.
 
-Settings that require a **restart**: each changed one is warned about (`... a restart is required to apply it`) and keeps its running value. They are `private_key` (warned about and ignored), `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, `server.host`/`port`/`ws_paths`/`trusted_proxies`, `rpc.max_admin_body_bytes`, `database.path`/`purge_interval_secs`/`map_size`/`max_map_size`/`max_dbs`/`max_readers`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`/`db_request_timeout_secs`/`max_db_queue_msgs`/`max_db_queue_events`/`max_db_queue_bytes`/`max_indexed_words`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`/`log_file`, `limits.live_buffer`/`live_batch_size`/`live_batch_interval_ms`/`socket_recv_buffer_kb`/`max_connections`/`max_connections_per_ip`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip`, all `blossom.*` except `restrict_uploads` (which applies on reload), and `relay.max_groups`. See the CONFIGURATION.md SIGHUP table for the full matrix.
+Settings that require a **restart**: each changed one is warned about (`... a restart is required to apply it`) and keeps its running value. They are `private_key` (warned about and ignored), `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, `server.host`/`port`/`ws_paths`/`trusted_proxies`, `rpc.max_admin_body_bytes`, `database.path`/`purge_interval_secs`/`map_size`/`max_map_size`/`max_dbs`/`max_readers`/`search_index`/`meta_index`/`reader_threads`/`disabled_fsync`/`db_request_timeout_secs`/`max_db_queue_msgs`/`max_db_queue_events`/`max_db_queue_bytes`/`max_indexed_words`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`/`log_file`, `limits.live_buffer`/`live_batch_size`/`live_batch_interval_ms`/`socket_recv_buffer_kb`/`socket_send_buffer_kb`/`max_connections`/`max_connections_per_ip`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip`, all `blossom.*` except `restrict_uploads` (which applies on reload), and `relay.max_groups`. See the CONFIGURATION.md SIGHUP table for the full matrix.
 
 The `[access]` kind/IP lists are runtime-managed via NIP-86 (a config edit is ignored and warned about); `restrict_relay` applies on reload. A file that fails validation is rejected as a whole: the error is logged and the old configuration stays in force. The database-owned allow/deny lists are the exception: they refresh from the database on every reload attempt (even a rejected one), in the fail-safe direction.
 
@@ -892,7 +895,7 @@ into the millions requires host-level tuning:
 | --- | --- | --- |
 | `ulimit -n` / systemd `LimitNOFILE` | ≥ 2× the target connections (+1000) | Every connection holds an fd |
 | `net.core.somaxconn` | ≥ 1024 | Pending accept queue for connection bursts |
-| `net.ipv4.tcp_mem` / `net.ipv4.tcp_rmem` / `tcp_wmem` | tuned to the host RAM | The relay sets the send buffer to 16 KiB and the receive buffer to `limits.socket_recv_buffer_kb` (64 KiB default); the kernel defaults must still cover the aggregate |
+| `net.ipv4.tcp_mem` / `net.ipv4.tcp_rmem` / `tcp_wmem` | tuned to the host RAM | The relay leaves the send buffer to kernel autotuning by default (`limits.socket_send_buffer_kb = 0`) and requests `limits.socket_recv_buffer_kb` (64 KiB default); the kernel defaults must still cover the aggregate. An explicit `socket_send_buffer_kb` overrides autotuning |
 | `net.ipv4.tcp_fin_timeout` | low (e.g. 10) | Reclaims TIME_WAIT sockets faster |
 | `vm.overcommit_memory` | 1 or 2 | The LMDB map is a large sparse virtual reservation (see `database.max_map_size`) |
 
@@ -903,11 +906,15 @@ any serious connection count), and `kern.ipc.somaxconn` replaces
 Linux; note that FreeBSD does not double the requested `SO_RCVBUF`
 value, so the actual receive buffer equals the configured size.
 
-Per-connection kernel memory is ~80 KiB (16 KiB send + 64 KiB receive,
-set by the relay) and user space ~10 KiB (the task, the connection state,
-the WebSocket buffer), so a million connections need roughly 90 GiB of
-kernel + user memory on top of the database. The WebSocket reader pool
-has two threads; a single heavy REQ no longer stalls every query.
+Per-connection kernel memory is at least ~64 KiB (the configured receive
+buffer) plus the send buffer, which is left to kernel autotuning and only
+grows while a response is queued; user space is ~10 KiB (the task, the
+connection state, the WebSocket buffer). A million mostly-idle connections
+therefore need roughly 74 GiB of kernel + user memory on top of the
+database, and active downloads use more send buffer. Set
+`limits.socket_send_buffer_kb` to pin the send side if that matters. The
+WebSocket reader pool has two threads; a single heavy REQ no longer stalls
+every query.
 
 ### Throughput (events per second)
 

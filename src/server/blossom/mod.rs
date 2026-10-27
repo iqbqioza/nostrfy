@@ -788,11 +788,12 @@ fn parse_range(header: &str, size: usize) -> anyhow::Result<Option<(usize, usize
 }
 
 /// Streams a local file in 64 KiB chunks (the `remaining` bound keeps a
-/// Range response from reading past the requested window).
+/// Range response from reading past the requested window). `read_buf` fills
+/// a `BytesMut` directly and the chunk is frozen without the extra
+/// `Bytes::copy_from_slice` copy the old path made for every 64 KiB.
 struct FileChunks {
     file: tokio::fs::File,
     remaining: u64,
-    buf: Vec<u8>,
 }
 
 impl futures_util::Stream for FileChunks {
@@ -803,18 +804,20 @@ impl futures_util::Stream for FileChunks {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         use tokio::io::AsyncReadExt;
+        const CHUNK: usize = 64 * 1024;
         let this = &mut *self;
-        let to_read = (this.buf.len() as u64).min(this.remaining) as usize;
-        if to_read == 0 {
+        if this.remaining == 0 {
             return std::task::Poll::Ready(None);
         }
+        let want = (this.remaining.min(CHUNK as u64)) as usize;
+        let mut buf = bytes::BytesMut::with_capacity(want);
         let file = &mut this.file;
-        let read = std::task::ready!(std::pin::pin!(file.read(&mut this.buf[..to_read])).poll(_cx));
+        let read = std::task::ready!(std::pin::pin!(file.read_buf(&mut buf)).poll(_cx));
         match read {
             Ok(0) => std::task::Poll::Ready(None),
             Ok(n) => {
                 this.remaining -= n as u64;
-                std::task::Poll::Ready(Some(Ok(bytes::Bytes::copy_from_slice(&this.buf[..n]))))
+                std::task::Poll::Ready(Some(Ok(buf.freeze())))
             }
             Err(e) => std::task::Poll::Ready(Some(Err(e))),
         }
@@ -978,11 +981,15 @@ async fn get_blob(
     let Some(sha) = split_blob(&blob) else {
         return error(StatusCode::BAD_REQUEST, "invalid blob hash");
     };
-    let desc = match state.store.find(&sha).await {
-        Ok(Some(desc)) => desc,
+    // One LMDB load for both the descriptor and the owner list: the old
+    // path called `find` and then `open_stream_any`, which loaded the same
+    // mapping a second time on every GET.
+    let resolved = match state.store.resolve(&sha).await {
+        Ok(Some(resolved)) => resolved,
         Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
         Err(e) => return store_error(e),
     };
+    let desc = &resolved.descriptor;
     let size = desc.size;
     // `size` is a `u64` from a stored (possibly corrupt) descriptor: narrow
     // it fallibly so a corrupt entry degrades to a 404-sized empty blob on
@@ -1038,7 +1045,11 @@ async fn get_blob(
     } else {
         (end - start + 1) as u64
     };
-    match state.store.open_stream_any(&sha, start as u64, len).await {
+    match state
+        .store
+        .open_resolved(&sha, &resolved.owners, start as u64, len)
+        .await
+    {
         Ok(Some((stream, _owner))) => {
             // A range-unaware S3-compatible backend answers a ranged GET
             // with 200 and the full object from byte 0: serve the whole
@@ -1049,7 +1060,6 @@ async fn get_blob(
                     axum::body::Body::from_stream(FileChunks {
                         file,
                         remaining: len,
-                        buf: vec![0u8; 64 * 1024],
                     }),
                     true,
                     len,
@@ -1123,16 +1133,19 @@ async fn head_blob(
     let Some(sha) = split_blob(&blob) else {
         return head_error(StatusCode::BAD_REQUEST, "invalid blob hash");
     };
-    let desc = match state.store.find(&sha).await {
-        Ok(Some(desc)) => desc,
+    // One LMDB load for both the descriptor and the owner list (the old
+    // path loaded the mapping in `find` and again in `exists_any`).
+    let resolved = match state.store.resolve(&sha).await {
+        Ok(Some(resolved)) => resolved,
         Ok(None) => return head_error(StatusCode::NOT_FOUND, "blob not found"),
         Err(e) => return store_error_head(e),
     };
+    let desc = &resolved.descriptor;
     let size = desc.size;
     // Resolve the backing object exactly like GET: a mapping without a
     // readable blob must 404. This is a HEAD request on the backend
-    // (`exists_any`), not an S3 GET whose body is discarded.
-    match state.store.exists_any(&sha).await {
+    // (`any_exists`), not an S3 GET whose body is discarded.
+    match state.store.any_exists(&sha, &resolved.owners).await {
         Ok(true) => {}
         Ok(false) => return head_error(StatusCode::NOT_FOUND, "blob not found"),
         Err(e) => return store_error_head(e),
@@ -1402,7 +1415,7 @@ async fn spool_upload(
         TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     let mut cleanup = TempUploadCleanup::new(path.clone(), drain);
-    let mut file = match tokio::fs::OpenOptions::new()
+    let file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         // The spool may hold a blob that is never published (a rejected or
@@ -1420,6 +1433,12 @@ async fn spool_upload(
             )));
         }
     };
+    // Coalesce the body chunks into 256 KiB writes: `write_all` on a raw
+    // tokio file submits one blocking-pool task per HTTP chunk, which can be
+    // as small as a few KiB. The buffer stays on the heap and never crosses
+    // an await boundary, so the upload still streams (it does not hold the
+    // whole body in memory).
+    let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, file);
     let mut stream = body.into_data_stream();
     let mut hash = Sha256::new();
     let mut size = 0u64;
@@ -1782,24 +1801,27 @@ async fn list(
     // well-formed) cursor yields an empty page — never the first page — so
     // a stale cursor cannot loop over duplicates forever.
     let (after_uploaded, after_sha) = match cursor.as_deref() {
-        Some(sha) => match state.store.find(sha).await {
-            Ok(Some(desc)) => {
-                // Owner-scoped cursor: `find` is global, so a cursor naming
-                // another owner's blob would position this owner's page and
-                // reveal the foreign hash exists (existence oracle). Treat
-                // a cursor the lister does not own like an unknown one —
-                // an empty page — so only owned cursors paginate.
-                match state.store.has(&pubkey, sha).await {
-                    Ok(true) => (Some(desc.uploaded.max(0) as u64), Some(sha.to_string())),
-                    Ok(false) => {
-                        let empty: Vec<Value> = Vec::new();
-                        return (
-                            [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            serde_json::to_string(&empty).unwrap(),
-                        )
-                            .into_response();
-                    }
-                    Err(e) => return store_error(e),
+        Some(sha) => match state.store.resolve(sha).await {
+            Ok(Some(resolved)) => {
+                // Owner-scoped cursor: `resolve` is global, so a cursor
+                // naming another owner's blob would position this owner's
+                // page and reveal the foreign hash exists (existence
+                // oracle). Treat a cursor the lister does not own like an
+                // unknown one — an empty page — so only owned cursors
+                // paginate. The owner list came with the same load as the
+                // upload timestamp.
+                if resolved.owners.iter().any(|owner| owner == &pubkey) {
+                    (
+                        Some(resolved.descriptor.uploaded.max(0) as u64),
+                        Some(sha.to_string()),
+                    )
+                } else {
+                    let empty: Vec<Value> = Vec::new();
+                    return (
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        serde_json::to_string(&empty).unwrap(),
+                    )
+                        .into_response();
                 }
             }
             Err(e) => return store_error(e),
@@ -1871,23 +1893,21 @@ async fn delete_blob(
     let Some(pubkey) = verify_auth(&relay, &state, &headers, "delete", Some(&sha)).await else {
         return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
     };
-    match state.store.find(&sha).await {
-        Ok(Some(_)) => {}
+    // One mapping load answers both "does it exist" and "is the requester an
+    // owner"; the old `find` + `has` pair loaded the same row twice.
+    let resolved = match state.store.resolve(&sha).await {
+        Ok(Some(resolved)) => resolved,
         Ok(None) => return error(StatusCode::NOT_FOUND, "blob not found"),
         Err(e) => return store_error(e),
-    }
+    };
     // Only an uploader of these bytes may delete their own copy; other
     // uploaders of identical content keep theirs. A failed ownership check
     // must not answer 403: the requester may well be the uploader.
-    match state.store.has(&pubkey, &sha).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return error(
-                StatusCode::FORBIDDEN,
-                "only the uploader may delete this blob",
-            );
-        }
-        Err(e) => return store_error(e),
+    if !resolved.owners.iter().any(|owner| owner == &pubkey) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "only the uploader may delete this blob",
+        );
     }
     match state.store.delete(&pubkey, &sha).await {
         Ok(true) => StatusCode::OK.into_response(),

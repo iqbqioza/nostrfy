@@ -2108,6 +2108,7 @@ pub async fn run_server(
         per_sec_per_ip,
         trusted_proxies,
         recv_buf_kb,
+        send_buf_kb,
     ) = {
         let cfg = relay.config.read().await;
         (
@@ -2130,6 +2131,7 @@ pub async fn run_server(
                     .collect::<Vec<_>>(),
             ),
             cfg.limits.socket_recv_buffer_kb,
+            cfg.limits.socket_send_buffer_kb,
         )
     };
     let _ = serve_limited(
@@ -2141,6 +2143,7 @@ pub async fn run_server(
         per_sec_per_ip,
         trusted_proxies,
         recv_buf_kb,
+        send_buf_kb,
         relay.stats.clone(),
         shutdown_rx,
     )
@@ -3266,6 +3269,7 @@ async fn serve_limited(
     per_sec_per_ip: Option<Arc<IpConnLimiter>>,
     trusted_proxies: Arc<[TrustedProxy]>,
     recv_buf_kb: u32,
+    send_buf_kb: u32,
     stats: Arc<Stats>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -3396,24 +3400,31 @@ async fn serve_limited(
                     (!trusted).then_some(accounting),
                 );
 
-                // Keep per-connection kernel buffers small so that hundreds
-                // of thousands of idle connections do not pin gigabytes of
-                // kernel memory (see the same tuning in `ws_handler`).
-                // The receive buffer follows `limits.socket_recv_buffer_kb`
-                // (default 64 KiB; the kernel may double it) so a fast
-                // publisher's burst absorbs into one batch while the relay
-                // commits; the send buffer stays 16 KiB (the outgoing path
-                // flushes eagerly). The receive buffer only consumes real
-                // memory while data is actually queued, so idle
-                // connections cost nothing.
+                // Keep per-connection kernel buffers bounded without turning
+                // off TCP autotuning by default: an explicit small SO_SNDBUF
+                // caps a single connection's throughput at roughly
+                // `buffer / RTT` and made 1 MiB Blossom downloads an order of
+                // magnitude slower. `0` therefore leaves each buffer to the
+                // kernel (which grows it for large downloads); a non-zero
+                // `limits.*_buffer_kb` pins it for memory-constrained hosts.
+                // The receive buffer only consumes real memory while data is
+                // queued, so idle connections cost nothing either way.
                 let _ = stream.set_nodelay(true);
                 unsafe {
-                    set_sock_opt(
-                        &stream,
-                        libc::SO_RCVBUF,
-                        i32::try_from(recv_buf_kb.saturating_mul(1024)).unwrap_or(i32::MAX),
-                    );
-                    set_sock_opt(&stream, libc::SO_SNDBUF, 16 * 1024);
+                    if recv_buf_kb > 0 {
+                        set_sock_opt(
+                            &stream,
+                            libc::SO_RCVBUF,
+                            i32::try_from(recv_buf_kb.saturating_mul(1024)).unwrap_or(i32::MAX),
+                        );
+                    }
+                    if send_buf_kb > 0 {
+                        set_sock_opt(
+                            &stream,
+                            libc::SO_SNDBUF,
+                            i32::try_from(send_buf_kb.saturating_mul(1024)).unwrap_or(i32::MAX),
+                        );
+                    }
                 }
 
                 let app = app.clone();
@@ -4138,6 +4149,10 @@ async fn apply_reloaded_config(
             old.limits.socket_recv_buffer_kb != new_config.limits.socket_recv_buffer_kb,
         ),
         (
+            "limits.socket_send_buffer_kb",
+            old.limits.socket_send_buffer_kb != new_config.limits.socket_send_buffer_kb,
+        ),
+        (
             "rpc.max_admin_body_bytes",
             old.rpc.max_admin_body_bytes != new_config.rpc.max_admin_body_bytes,
         ),
@@ -4259,6 +4274,7 @@ async fn apply_reloaded_config(
     new_config.limits.http_read_timeout_secs = old.limits.http_read_timeout_secs;
     new_config.limits.max_connections_per_sec_per_ip = old.limits.max_connections_per_sec_per_ip;
     new_config.limits.socket_recv_buffer_kb = old.limits.socket_recv_buffer_kb;
+    new_config.limits.socket_send_buffer_kb = old.limits.socket_send_buffer_kb;
     // The kind/IP access lists are runtime-managed
     // (persisted in the database); only `restrict_relay`
     // is config-owned.
@@ -6672,6 +6688,7 @@ mod tests {
             per_sec.map(Arc::new),
             Arc::from(trusted),
             16,
+            0,
             crate::stats::Stats::new(),
             rx,
         ));
@@ -6698,6 +6715,7 @@ mod tests {
             per_sec.map(Arc::new),
             Arc::from(Vec::new()),
             16,
+            0,
             stats,
             rx,
         ));
@@ -7059,6 +7077,7 @@ mod tests {
             None,
             Arc::from(vec![TrustedProxy::parse("127.0.0.1/32").unwrap()]),
             16,
+            0,
             stats.clone(),
             rx,
         ));
@@ -7291,6 +7310,7 @@ mod tests {
             None,
             Arc::from(Vec::new()),
             16,
+            0,
             crate::stats::Stats::new(),
             rx,
         ));
@@ -7434,6 +7454,7 @@ mod tests {
             None,
             Arc::from(Vec::new()),
             16,
+            0,
             crate::stats::Stats::new(),
             rx,
         ));

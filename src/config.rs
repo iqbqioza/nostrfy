@@ -291,6 +291,14 @@ pub struct LimitsConfig {
     /// kernel memory while data is actually queued, so a large value does
     /// not cost idle connections anything.
     pub socket_recv_buffer_kb: u32,
+    /// Per-connection kernel send buffer (KiB, 0 = kernel autotuning).
+    /// The default lets the kernel grow the buffer for large downloads
+    /// (Blossom media): an explicit small value disables autotuning and
+    /// caps a single connection's throughput at roughly
+    /// `buffer / RTT`, which made 1 MiB loopback downloads an order of
+    /// magnitude slower. Set a non-zero value only to bound per-connection
+    /// kernel memory on a host with very many concurrently sending clients.
+    pub socket_send_buffer_kb: u32,
     pub max_filters: usize,
     pub max_subscriptions: usize,
     pub max_limit: usize,
@@ -521,6 +529,7 @@ impl Default for LimitsConfig {
             max_connections_per_ip: 64,
             max_ws_message_bytes: 1 << 20,
             socket_recv_buffer_kb: 64,
+            socket_send_buffer_kb: 0,
             max_filters: 20,
             max_subscriptions: 20,
             max_limit: 500,
@@ -1650,6 +1659,11 @@ impl Config {
         if self.limits.socket_recv_buffer_kb > 4096 {
             return Err(config_err(
                 "limits.socket_recv_buffer_kb must be at most 4096",
+            ));
+        }
+        if self.limits.socket_send_buffer_kb > 4096 {
+            return Err(config_err(
+                "limits.socket_send_buffer_kb must be at most 4096",
             ));
         }
         if self.limits.max_created_at_future_secs > MAX_CREATED_AT_FUTURE_SECS {
@@ -3136,6 +3150,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_connections_per_ip",
                 "max_ws_message_bytes",
                 "socket_recv_buffer_kb",
+                "socket_send_buffer_kb",
                 "max_filters",
                 "max_subscriptions",
                 "max_limit",
@@ -4647,6 +4662,22 @@ max_log_files = 2
         assert!(
             !Config::default().relay.enabled_buzz,
             "the Buzz compatibility layer must be opt-in"
+        );
+    }
+
+    #[test]
+    fn socket_send_buffer_bounds_are_validated() {
+        // 0 means kernel autotuning; an explicit value must stay within the
+        // same 4 MiB cap as the receive buffer.
+        let mut cfg = Config::default();
+        cfg.limits.socket_send_buffer_kb = 0;
+        assert!(cfg.validate().is_ok());
+        cfg.limits.socket_send_buffer_kb = 4096;
+        assert!(cfg.validate().is_ok());
+        cfg.limits.socket_send_buffer_kb = 4097;
+        assert!(
+            cfg.validate().is_err(),
+            "an oversized send buffer must be rejected"
         );
     }
 
