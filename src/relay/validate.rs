@@ -466,6 +466,25 @@ impl super::Relay {
             {
                 self.repair_unbacked_group_ghost(gid, now).await;
             }
+            // When the exact ghost set overflowed, an unknown id may have
+            // surviving history without a marker. Re-check the database
+            // before allowing a create, or a fresh public group would make
+            // that history readable.
+            if event.kind == nip29::CREATE_GROUP
+                && let Some(gid) = nip29::group_id(event)
+            {
+                let unknown_overflow = {
+                    let groups = self.groups.read().await;
+                    groups.ghost_overflowed() && groups.group(gid).is_none()
+                };
+                if unknown_overflow
+                    && self.group_create_has_surviving_history(gid, now).await != Some(false)
+                {
+                    return Precheck::Reject(
+                        "restricted: stored group history exists for this id".into(),
+                    );
+                }
+            }
             // H02: ghosts are historical fail-closed markers, not live
             // groups, so they no longer consume the live `max_groups`
             // budget. The targeted repair above still unghosts an id only
@@ -663,6 +682,59 @@ impl super::Relay {
              created again"
         );
         true
+    }
+
+    /// Whether an unknown id has any stored history that a fresh
+    /// `CREATE_GROUP` must not make readable. Used only while the exact
+    /// ghost set is in fail-closed overflow mode; `None` means the database
+    /// could not prove the id clean.
+    async fn group_create_has_surviving_history(&self, gid: &str, now: u64) -> Option<bool> {
+        match self.db.pending_purges().await {
+            Some(pending) if !pending.iter().any(|(pending_gid, _, _)| pending_gid == gid) => {}
+            _ => return Some(true),
+        }
+        let query = |value: serde_json::Value| -> Vec<crate::filter::Filter> {
+            serde_json::from_value(value).expect("static filter")
+        };
+        let history = query(serde_json::json!([{ "#h": [gid] }]));
+        match self.db.query_req_reported(history, 1, now).await {
+            Some((stored, false)) if stored.is_empty() => {}
+            _ => return Some(true),
+        }
+        let members = query(serde_json::json!([{
+            "kinds": [
+                nip29::GROUP_ADMINS,
+                nip29::GROUP_MEMBERS,
+                nip29::GROUP_ROLES,
+                nip29::GROUP_PARTICIPANTS,
+                nip29::GROUP_PINS,
+            ],
+            "#d": [gid],
+        }]));
+        match self.db.query_req_reported(members, 1, now).await {
+            Some((stored, false)) if stored.is_empty() => {}
+            _ => return Some(true),
+        }
+        // A bare 39000 is the legacy declared-placeholder metadata, not
+        // group history (see `repair_unbacked_group_ghost`).
+        let meta = query(serde_json::json!([{
+            "kinds": [nip29::GROUP_META],
+            "#d": [gid],
+        }]));
+        let (stored, more) = self.db.query_req_reported(meta, 4, now).await?;
+        if more {
+            return None;
+        }
+        if stored.iter().all(|event| {
+            event.tags.len() == 1
+                && event.tags[0].len() == 2
+                && event.tags[0][0] == "d"
+                && event.tags[0][1] == gid
+        }) {
+            Some(false)
+        } else {
+            Some(true)
+        }
     }
 }
 

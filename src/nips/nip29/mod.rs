@@ -91,6 +91,12 @@ pub(crate) const MAX_PINS: usize = 100;
 /// bound repeated `9009` events would grow the set without limit.
 pub(crate) const MAX_INVITES: usize = 100;
 
+/// Hard bound on exact NIP-29 ghost markers. If a relay has more orphan
+/// group ids than this, the store switches to a fail-closed overflow mode:
+/// every unknown group id is withheld (and cannot be re-created without a
+/// DB-backed history check) instead of retaining an unbounded id set.
+pub(crate) const MAX_GHOSTS: usize = 10_000;
+
 /// Per-code and aggregate byte bounds for metadata that is mirrored into
 /// relay-signed 39000/39003 events. The count caps alone still allow very
 /// large generated events if each value is attacker-sized.
@@ -110,6 +116,11 @@ pub(crate) const MAX_GROUP_ROLES: usize = 256;
 pub(crate) const MAX_ROLE_BYTES: usize = 256;
 pub(crate) const MAX_ROLES_BYTES_PER_MEMBER: usize = 4 * 1024;
 pub(crate) const MAX_GROUP_ROLE_BYTES: usize = 64 * 1024;
+/// Total `p`/role tag budget in the relay-generated 39001 event. The
+/// per-member caps bound one row, but a 10k-member group with 16 roles each
+/// would still build a 160k-tag event on every change.
+pub(crate) const MAX_ADMIN_ROLE_TAGS: usize = 4_096;
+pub(crate) const MAX_ADMIN_ROLE_BYTES: usize = 512 * 1024;
 
 /// Sorts, de-duplicates and bounds the free-form role labels attached to a
 /// member. The same helper is used by replay and the relay-generated
@@ -657,6 +668,11 @@ pub struct GroupStore {
     /// (fail-closed). A fresh CREATE_GROUP later removes the id from this
     /// set.
     ghost: HashSet<String>,
+    /// Set when a new ghost marker could not be stored because [`MAX_GHOSTS`]
+    /// was reached. Unknown ids are hidden from then on (fail-closed), since
+    /// an omitted marker may represent surviving history. Live groups are
+    /// unaffected.
+    ghost_overflow: bool,
     /// Per-group timestamp of the last published member list (39002).
     /// NIP-29 marks the member list optional, and a 10k-member group would
     /// otherwise build, sign and store a 10k-tag event on every JOIN/LEAVE.
@@ -732,6 +748,11 @@ pub(crate) struct GroupsSnapshot {
     /// force a full rebuild and silently discard the rest of the state).
     #[serde(default)]
     pub ghost: HashSet<String>,
+    /// Present in snapshots written after the ghost cap was introduced.
+    /// An overflow snapshot keeps every unknown group id hidden, even
+    /// though the exact ghost set is bounded.
+    #[serde(default)]
+    pub ghost_overflow: bool,
     /// The database's group-state generation the snapshot was taken at
     /// (see `DbClient::state_stamp`): a restore must reject a snapshot
     /// stamped before the current generation, because it predates a
@@ -808,6 +829,7 @@ struct DmBackupRef<'a> {
     groups: HashMap<&'a str, &'a Group>,
     deleted: &'a HashSet<String>,
     ghost: &'a HashSet<String>,
+    ghost_overflow: bool,
     stamp: u64,
     seq: u64,
     group_seq: Option<u64>,
@@ -832,6 +854,7 @@ pub(crate) fn dm_backup_json(
             .collect(),
         deleted: &empty,
         ghost: &empty,
+        ghost_overflow: false,
         stamp,
         seq,
         group_seq: Some(seq),
@@ -942,6 +965,7 @@ impl GroupStore {
             groups: self.groups.clone(),
             deleted: self.deleted.clone(),
             ghost: self.ghost.clone(),
+            ghost_overflow: self.ghost_overflow,
             // Filled by the persist path, which reads the database's
             // group-state generation (`DbClient::state_stamp` and
             // `DbClient::state_seq`).
@@ -970,6 +994,7 @@ impl GroupStore {
             groups: &'a HashMap<String, Group>,
             deleted: &'a HashSet<String>,
             ghost: &'a HashSet<String>,
+            ghost_overflow: bool,
             stamp: u64,
             seq: u64,
             group_seq: Option<u64>,
@@ -979,6 +1004,7 @@ impl GroupStore {
             groups: &self.groups,
             deleted: &self.deleted,
             ghost: &self.ghost,
+            ghost_overflow: self.ghost_overflow,
             stamp,
             seq,
             group_seq: Some(seq),
@@ -996,6 +1022,9 @@ impl GroupStore {
     /// group under that id.
     pub(crate) fn merge_dm_snapshot(&mut self, snapshot: GroupsSnapshot) -> bool {
         let mut changed = false;
+        if snapshot.ghost_overflow {
+            self.ghost_overflow = true;
+        }
         for (gid, group) in snapshot.groups {
             if group.channel_type != "dm" {
                 continue;
@@ -1083,6 +1112,48 @@ impl GroupStore {
         self.groups = snap.groups;
         self.deleted = snap.deleted;
         self.ghost = snap.ghost;
+        self.ghost_overflow = snap.ghost_overflow;
+        if self.ghost.len() > MAX_GHOSTS {
+            // An older/buggy snapshot may exceed the exact cap. Keep a
+            // deterministic prefix and hide every unknown id; dropping a
+            // marker without overflow would expose orphan history.
+            let mut ids: Vec<String> = self.ghost.drain().collect();
+            ids.sort();
+            self.ghost.extend(ids.into_iter().take(MAX_GHOSTS));
+            self.ghost_overflow = true;
+        }
+        // Snapshots predate the per-group caps in older builds. Bound their
+        // restored member/role/invite/pin state before it reaches a builder.
+        for group in self.groups.values_mut() {
+            if group.members.len() > MAX_MEMBERS {
+                let mut keys: Vec<String> = group.members.keys().cloned().collect();
+                keys.sort();
+                keys.truncate(MAX_MEMBERS);
+                let keep: HashSet<String> = keys.into_iter().collect();
+                group.members.retain(|pk, _| keep.contains(pk));
+            }
+            for roles in group.members.values_mut() {
+                *roles = bounded_member_roles(roles.iter().cloned())
+                    .into_iter()
+                    .collect();
+            }
+            if group.invites.len() > MAX_INVITES {
+                let mut codes: Vec<String> = group
+                    .invites
+                    .iter()
+                    .filter(|code| !code.is_empty() && code.len() <= MAX_INVITE_CODE_BYTES)
+                    .cloned()
+                    .collect();
+                codes.sort();
+                codes.truncate(MAX_INVITES);
+                group.invites = codes.into_iter().collect();
+            } else {
+                group
+                    .invites
+                    .retain(|code| !code.is_empty() && code.len() <= MAX_INVITE_CODE_BYTES);
+            }
+            group.pins.truncate(MAX_PINS);
+        }
         // A crash between the pre-delete ghost snapshot and the final
         // unghost/delete persist can leave a group entry beside its
         // fail-closed marker. Such an entry is not live state: restoring it
@@ -3246,6 +3317,9 @@ impl GroupStore {
     /// [`Self::mark_ghost`]).
     pub(crate) fn is_ghosted(&self, gid: &str) -> bool {
         self.ghost.contains(gid)
+            || (self.ghost_overflow
+                && !self.groups.contains_key(gid)
+                && !self.deleted.contains(gid))
     }
 
     /// Re-checks the authorization of a live moderation event immediately
@@ -3381,7 +3455,7 @@ impl GroupStore {
         previous_ghost: impl IntoIterator<Item = String>,
     ) {
         for gid in previous_ghost {
-            self.ghost.insert(gid);
+            let _ = self.insert_ghost(&gid);
         }
         for gid in previous_deleted {
             if !self.groups.contains_key(&gid) {
@@ -3401,7 +3475,7 @@ impl GroupStore {
     pub fn ghost_missing(&mut self, previous: impl IntoIterator<Item = String>) {
         for gid in previous {
             if !self.groups.contains_key(&gid) && !self.deleted.contains(&gid) {
-                self.ghost.insert(gid);
+                let _ = self.insert_ghost(&gid);
             }
         }
     }
@@ -3440,6 +3514,12 @@ impl GroupStore {
         // deleted or expired) cannot be restored with its settings: treat
         // it as gone so its surviving content is not served to everyone.
         if self.ghost.contains(gid) {
+            return false;
+        }
+        if self.ghost_overflow && !self.groups.contains_key(gid) {
+            // An exact marker may have been omitted at the cap: withhold
+            // every unknown id (fail-closed). Live groups below are
+            // unaffected.
             return false;
         }
         let Some(group) = self.groups.get(gid) else {
@@ -3640,6 +3720,9 @@ impl GroupStore {
             self.unrestored = false;
             self.stale = false;
             self.stale_groups.clear();
+            // A completed full scan re-derived the exact ghost set; at the
+            // cap (or above) unknown ids must stay hidden.
+            self.ghost_overflow = self.ghost.len() >= MAX_GHOSTS;
         }
         rebuilt
     }
@@ -4107,19 +4190,45 @@ impl GroupStore {
             }
             // The ghost set is a fail-closed memory structure, not a live
             // group budget (H02). It grows with the surviving h-tagged
-            // history; refusing the rebuild once it reaches max_groups would
-            // turn a single orphan h-id into an unrestored store that hides
-            // every group. Keep inserting so the orphan history stays
-            // withheld, and warn at the crossing point.
+            // history. At MAX_GHOSTS the exact set stops growing and
+            // `ghost_overflow` hides every unknown id instead, so one
+            // orphan h-id still cannot turn the whole rebuild into an
+            // unrestored store.
             if self.max_groups > 0 && self.ghost.len() == self.max_groups {
                 log::warn!(
                     "NIP-29 rebuild ghost set reached relay.max_groups ({}); continuing in fail-closed mode",
                     self.max_groups
                 );
             }
-            self.ghost.insert(gid);
+            let _ = self.insert_ghost(&gid);
         }
         true
+    }
+
+    /// Inserts an exact ghost marker. At the cap the store sets the
+    /// fail-closed overflow flag instead of growing the set; an omitted
+    /// marker is then safe because unknown ids are hidden too.
+    fn insert_ghost(&mut self, gid: &str) -> bool {
+        if self.ghost.contains(gid) {
+            return true;
+        }
+        if self.ghost.len() >= MAX_GHOSTS {
+            if !self.ghost_overflow {
+                log::warn!(
+                    "NIP-29 ghost marker cap ({MAX_GHOSTS}) reached; withholding every unknown group id"
+                );
+            }
+            self.ghost_overflow = true;
+            return false;
+        }
+        self.ghost.insert(gid.to_string());
+        true
+    }
+
+    /// Whether the exact ghost set overflowed and unknown ids must be
+    /// withheld fail-closed.
+    pub(crate) fn ghost_overflowed(&self) -> bool {
+        self.ghost_overflow
     }
 
     /// Fail-closed marker for a group whose stored history may still exist:
@@ -4129,7 +4238,7 @@ impl GroupStore {
     /// clears it again (see `unghost`).
     pub(crate) fn mark_ghost(&mut self, gid: &str) {
         self.reclaim_tombstones(1);
-        self.ghost.insert(gid.to_string());
+        let _ = self.insert_ghost(gid);
     }
 
     /// Removes a group id from the ghost set once its history is confirmed

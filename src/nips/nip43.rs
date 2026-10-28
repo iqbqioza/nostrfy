@@ -219,6 +219,12 @@ impl RoleStore {
     /// Restores state persisted by [`Self::snapshot`].
     pub(crate) fn restore(&mut self, snap: RolesSnapshot) {
         self.roles = snap.roles;
+        if self.roles.len() > MAX_ROLES {
+            let mut ids: Vec<String> = self.roles.keys().cloned().collect();
+            ids.sort();
+            let keep: std::collections::HashSet<String> = ids.into_iter().take(MAX_ROLES).collect();
+            self.roles.retain(|id, _| keep.contains(id));
+        }
         self.assignments = snap.assignments;
         // Older snapshots materialized the relay configuration's synthetic
         // `owner` roster row into a real assignment. That made a removed
@@ -228,6 +234,16 @@ impl RoleStore {
         // ordinary role on the same member. A claim-admitted member's empty
         // entry is not an owner row and stays.
         strip_synthetic_owner_assignments(&mut self.assignments);
+        if self.assignments.len() > MAX_RELAY_MEMBERS {
+            let mut keys: Vec<String> = self.assignments.keys().cloned().collect();
+            keys.sort();
+            let keep: std::collections::HashSet<String> =
+                keys.into_iter().take(MAX_RELAY_MEMBERS).collect();
+            self.assignments.retain(|pk, _| keep.contains(pk));
+        }
+        for roles in self.assignments.values_mut() {
+            *roles = bounded_roster_roles(std::mem::take(roles), MAX_ROLES_PER_MEMBER);
+        }
         self.claims = snap.claims;
         if self.claims.len() > MAX_CLAIMS {
             // A snapshot written before the cap (or by an older build) must

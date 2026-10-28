@@ -9,6 +9,15 @@ use crate::nips::nip01;
 use crate::nips::nip43::{MAX_RELAY_MEMBERS, RoleStore};
 use crate::util::unix_now;
 
+/// Small rosters are republished on every change; larger ones are coalesced
+/// so one reusable invite code cannot force an O(n) 13534 signature/store
+/// per admission.
+const MEMBERSHIP_EAGER_MAX: usize = 1_000;
+const MEMBERSHIP_INTERVAL_SECS: u64 = 60;
+/// The same coalescing for the NIP-IA 13535 snapshot.
+const ARCHIVE_EAGER_MAX: usize = 1_000;
+const ARCHIVE_INTERVAL_SECS: u64 = 60;
+
 /// Outcome of an RPC-facing role grant/revoke. NIP-86 reports `true`
 /// for both a landed change and an idempotent no-op (a duplicate grant
 /// or a missing revocation); only an unknown grant target, a disabled
@@ -293,7 +302,29 @@ impl super::Relay {
         let now = self.stamp_floor(unix_now());
         let archived = self.archive.read().await.clone();
         let mut event = crate::nips::nip_ia::snapshot(&relay_pubkey, now, &archived);
-        self.store_relay_event(&mut event).await.is_ok()
+        let stored = self.store_relay_event(&mut event).await.is_ok();
+        if stored {
+            self.archive_published_at
+                .store(unix_now(), Ordering::Relaxed);
+            self.archive_dirty.store(false, Ordering::SeqCst);
+        }
+        stored
+    }
+
+    /// Publishes a deferred full 13535 snapshot when the coalescing
+    /// interval has elapsed. The stats tick calls this.
+    pub(crate) async fn republish_archive_if_dirty(&self) {
+        if !self.archive_dirty.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if !self.publish_archive_snapshot().await {
+            self.archive_dirty.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn archive_publish_due(&self, len: usize, now: u64) -> bool {
+        let last = self.archive_published_at.load(Ordering::Relaxed);
+        len <= ARCHIVE_EAGER_MAX || last == 0 || now >= last.saturating_add(ARCHIVE_INTERVAL_SECS)
     }
 
     /// Applies a NIP-IA archive/unarchive request. The request event is
@@ -588,9 +619,21 @@ impl super::Relay {
                 target.clone(),
             ]);
         }
-        if self.store_relay_event(&mut delta).await.is_err()
-            || !self.publish_archive_snapshot().await
-        {
+        let publish_full = if self.store_relay_event(&mut delta).await.is_err() {
+            false
+        } else {
+            let now = unix_now();
+            let len = self.archive.read().await.len();
+            if self.archive_publish_due(len, now) {
+                self.publish_archive_snapshot().await
+            } else {
+                // The per-identity delta is durable; only the O(n) full
+                // snapshot is coalesced. The stats tick republishes it.
+                self.archive_dirty.store(true, Ordering::SeqCst);
+                true
+            }
+        };
+        if !publish_full {
             // Keep the durable set and the published snapshot in step: the
             // request is not ACKed, so a retry must be able to make progress
             // instead of finding an already-applied but unpublished state.
@@ -606,6 +649,24 @@ impl super::Relay {
             return Err("error: could not publish the archive state".into());
         }
         Ok(())
+    }
+
+    /// Publishes a deferred full 13534 roster when its coalescing interval
+    /// has elapsed. Add/remove deltas are unaffected.
+    pub(crate) async fn republish_membership_if_dirty(&self) {
+        if !self.membership_dirty.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if !self.publish_membership(None).await {
+            self.membership_dirty.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn membership_publish_due(&self, len: usize, now: u64) -> bool {
+        let last = self.membership_published_at.load(Ordering::Relaxed);
+        len <= MEMBERSHIP_EAGER_MAX
+            || last == 0
+            || now >= last.saturating_add(MEMBERSHIP_INTERVAL_SECS)
     }
 
     /// Publishes the current membership list and an add/remove user event.
@@ -648,7 +709,8 @@ impl super::Relay {
                 None => return false,
             }
         }
-        let mut events = {
+        let wall_now = unix_now();
+        let (mut events, full_due) = {
             let roles = self.roles.read().await;
             // The caller re-read the rebuild flags before calling, but a
             // removal can mark the store and revoke it between that read and
@@ -662,8 +724,21 @@ impl super::Relay {
             {
                 return false;
             }
-            let mut events =
-                vec![roles.membership_event(&relay_pubkey, now, &filtered_extra, &filtered_owners)];
+            let roster_len = roles
+                .assignments
+                .len()
+                .saturating_add(filtered_extra.len())
+                .saturating_add(filtered_owners.len());
+            let full_due = self.membership_publish_due(roster_len, wall_now);
+            let mut events = Vec::with_capacity(2);
+            if full_due {
+                events.push(roles.membership_event(
+                    &relay_pubkey,
+                    now,
+                    &filtered_extra,
+                    &filtered_owners,
+                ));
+            }
             if let Some(pubkey) = pubkey {
                 events.push(if add {
                     roles.add_user_event(&pubkey, &relay_pubkey, now)
@@ -671,8 +746,11 @@ impl super::Relay {
                     roles.remove_user_event(&pubkey, &relay_pubkey, now)
                 });
             }
-            events
+            (events, full_due)
         };
+        if !full_due {
+            self.membership_dirty.store(true, Ordering::SeqCst);
+        }
         // Sign before collecting IDs. The role builders intentionally return
         // an unsigned event (id empty), and signing happens inside the store
         // helper; collecting IDs first therefore produced an empty list and
@@ -706,8 +784,17 @@ impl super::Relay {
             // event the rebuild reads, resurrecting the removed grant.
             // Remove whatever this call actually stored, not a pre-signing
             // empty id list.
+            self.membership_dirty.store(true, Ordering::SeqCst);
             let _ = self.db.remove_events_by_id(&stored_ids).await;
             return false;
+        }
+        if list_stored {
+            self.membership_published_at
+                .store(unix_now(), Ordering::Relaxed);
+            self.membership_dirty.store(false, Ordering::SeqCst);
+        } else if full_due {
+            // A due full roster failed to store; retry it from the tick.
+            self.membership_dirty.store(true, Ordering::SeqCst);
         }
         all_stored
     }

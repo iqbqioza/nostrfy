@@ -176,17 +176,25 @@ host, because Buzz signs the relay URL it uploads to.
   remains independent.
 - Relay-generated rosters and the derived group/role state are bounded:
   NIP-29 keeps at most 16 role labels per member, 256 bytes per label,
-  4 KiB of labels per member and 256 distinct labels in a 39003; NIP-43
-  keeps at most 256 role definitions, 16 assignments per member, a 64-byte
-  role id, 10,000 relay members and 10,000 invite claims. Oversized intake
-  is rejected, and replay truncates legacy state before rebuilding mirrored
-  events. The NIP-IA archive set is capped at 10,000 identities and a
-  persisted set above that is trimmed at startup with a warning. The
-  NIP-29 startup and migration pending-state buffers are capped by both
-  count (50,000) and bytes (64 MiB). Child/parent ids use the same
-  tag-index bound as group ids rather than the older 128-byte limit, and
-  NIP-CL channel tags are validated even while Buzz is disabled so a later
-  enable cannot revive unchecked labels.
+  4 KiB of labels per member, 256 distinct labels in a 39003, and a
+  4,096-tag / 512 KiB total budget in 39001; NIP-43 keeps at most 256 role
+  definitions, 16 assignments per member, a 64-byte role id, 10,000 relay
+  members and 10,000 invite claims. Oversized intake is rejected, and
+  replay/restore truncates legacy state before rebuilding mirrored events.
+  The NIP-IA archive set is capped at 10,000 identities and a persisted set
+  above that is trimmed at startup with a warning. The NIP-29 startup and
+  migration pending-state buffers are capped by both count (50,000) and
+  bytes (64 MiB). Child/parent ids use the same tag-index bound as group
+  ids rather than the older 128-byte limit, and NIP-CL channel tags are
+  validated even while Buzz is disabled so a later enable cannot revive
+  unchecked labels.
+- The exact NIP-29 ghost marker set is capped at 10,000 ids. If a relay
+  exceeds it, unknown group ids are withheld fail-closed (live groups keep
+  serving) and `CREATE_GROUP` for an unknown id is allowed only after a
+  database history check. Large NIP-43 `13534` rosters and NIP-IA `13535`
+  snapshots are coalesced: the per-change add/remove/delta event is still
+  durable immediately, while the O(n) full snapshot is republished by the
+  stats tick at most once per minute (small sets remain eager).
 - The NIP-98 replay guard, monotonic but drift-capped relay stamp clock, and
   the `8000`/`8001` role-family classification cover the corresponding
   NIP-43/LiveKit hardening paths; see the source comments for the exact
