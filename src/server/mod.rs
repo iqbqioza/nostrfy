@@ -771,38 +771,61 @@ async fn filter_vanished_group_snapshot(
 /// only event-derived fallback when both the main snapshot and the additive
 /// DM backup are missing. It only fills ids the rebuilt store does not know,
 /// never overwrites a live group, and skips deleted/ghosted ids.
-async fn restore_dm_metadata(relay: &Relay) -> Result<usize> {
+async fn restore_dm_metadata(relay: &Relay, require_complete: bool) -> Result<()> {
     let Some(relay_pubkey) = relay.relay_pubkey() else {
-        return Ok(0);
+        if require_complete {
+            return Err(anyhow::anyhow!(
+                "the relay key is missing, so stored DM metadata cannot be verified"
+            ));
+        }
+        return Ok(());
     };
     if relay.groups.read().await.is_unrestored() {
-        return Ok(0);
+        if require_complete {
+            return Err(anyhow::anyhow!(
+                "the group store is unrestored; refusing partial DM recovery"
+            ));
+        }
+        return Ok(());
     }
     let now = unix_now();
-    let Some(meta_events) =
+    let Some((meta_events, meta_more)) =
         query_dm_metadata(relay, crate::nips::nip29::GROUP_META, &relay_pubkey, now).await
     else {
-        log::warn!("could not read DM group metadata; leaving DM recovery to the snapshot");
-        return Ok(0);
+        return Err(anyhow::anyhow!("could not read DM group metadata"));
     };
-    let Some(admin_events) =
+    let Some((admin_events, admin_more)) =
         query_dm_metadata(relay, crate::nips::nip29::GROUP_ADMINS, &relay_pubkey, now).await
     else {
-        log::warn!("could not read DM admin metadata; leaving DM recovery to the snapshot");
-        return Ok(0);
+        return Err(anyhow::anyhow!("could not read DM admin metadata"));
     };
-    let Some(member_events) =
+    let Some((member_events, member_more)) =
         query_dm_metadata(relay, crate::nips::nip29::GROUP_MEMBERS, &relay_pubkey, now).await
     else {
-        log::warn!("could not read DM member metadata; leaving DM recovery to the snapshot");
-        return Ok(0);
+        return Err(anyhow::anyhow!("could not read DM member metadata"));
     };
+    if require_complete && (meta_more || admin_more || member_more) {
+        return Err(anyhow::anyhow!("DM metadata scan was truncated"));
+    }
+    if meta_more || admin_more || member_more {
+        log::warn!("DM metadata scan was truncated; recovering the events that fit");
+    }
     let meta = latest_dm_events(meta_events);
     let admins = latest_dm_events(admin_events);
     let members = latest_dm_events(member_events);
     let hidden = match query_dm_visibility(relay, &relay_pubkey, now).await {
-        Some(events) => hidden_dm_viewers(events),
+        Some((events, false)) => hidden_dm_viewers(events),
+        Some((events, true)) => {
+            if require_complete {
+                return Err(anyhow::anyhow!("hidden-DM snapshot scan was truncated"));
+            }
+            log::warn!("hidden-DM snapshot scan was truncated; recovering the events that fit");
+            hidden_dm_viewers(events)
+        }
         None => {
+            if require_complete {
+                return Err(anyhow::anyhow!("could not read hidden-DM snapshots"));
+            }
             log::warn!("could not read hidden-DM snapshots; recovering DMs without them");
             std::collections::HashMap::new()
         }
@@ -826,20 +849,20 @@ async fn restore_dm_metadata(relay: &Relay) -> Result<usize> {
         }
     }
     if snapshot.groups.is_empty() {
-        return Ok(0);
+        return Ok(());
     }
     // A vanished participant must not be re-added by relay metadata created
     // before the vanish. This is the same filter used for snapshot restores.
     filter_vanished_group_snapshot(relay, &mut snapshot).await?;
     snapshot.groups.retain(|_, group| !group.members.is_empty());
     if snapshot.groups.is_empty() {
-        return Ok(0);
+        return Ok(());
     }
     let changed = relay.groups.write().await.merge_dm_snapshot(snapshot);
     if changed {
         info!("recovered DM group state from stored relay metadata");
     }
-    Ok(if changed { 1 } else { 0 })
+    Ok(())
 }
 
 async fn query_dm_metadata(
@@ -847,41 +870,33 @@ async fn query_dm_metadata(
     kind: u64,
     relay_pubkey: &str,
     now: u64,
-) -> Option<Vec<crate::event::Event>> {
+) -> Option<(Vec<crate::event::Event>, bool)> {
     let mut filter = crate::filter::Filter {
         kinds: Some(vec![kind]),
         authors: Some(vec![relay_pubkey.to_string()]),
         ..crate::filter::Filter::default()
     };
     filter.tags.insert("#t".to_string(), json!(["dm"]));
-    let (events, more) = relay
+    relay
         .db
         .query_full_startup(vec![filter], 100_000, now, false)
-        .await?;
-    if more {
-        log::warn!("DM metadata scan was truncated; recovering the events that fit");
-    }
-    Some(events)
+        .await
 }
 
 async fn query_dm_visibility(
     relay: &Relay,
     relay_pubkey: &str,
     now: u64,
-) -> Option<Vec<crate::event::Event>> {
+) -> Option<(Vec<crate::event::Event>, bool)> {
     let filter = crate::filter::Filter {
         kinds: Some(vec![30622]),
         authors: Some(vec![relay_pubkey.to_string()]),
         ..crate::filter::Filter::default()
     };
-    let (events, more) = relay
+    relay
         .db
         .query_full_startup(vec![filter], 100_000, now, false)
-        .await?;
-    if more {
-        log::warn!("hidden-DM snapshot scan was truncated; recovering the events that fit");
-    }
-    Some(events)
+        .await
 }
 
 fn latest_dm_events(
@@ -1100,12 +1115,12 @@ async fn restore_group_state(
             "rebuilding the NIP-29 group state because a previous crash left an unconfirmed \
              group event"
         );
-        return rebuild_group_state(relay, groups_enabled).await;
+        return rebuild_group_state(relay, groups_enabled, true).await;
     }
     let mut snapshot = match relay.db.load_groups().await {
         crate::db::LoadGroupsOutcome::Loaded(snapshot) => snapshot,
         crate::db::LoadGroupsOutcome::Missing => {
-            return rebuild_group_state(relay, groups_enabled).await;
+            return rebuild_group_state(relay, groups_enabled, false).await;
         }
         crate::db::LoadGroupsOutcome::Failed => {
             // A corrupt/unreadable snapshot must not make the relay
@@ -1119,11 +1134,18 @@ async fn restore_group_state(
                 "cannot read the persisted NIP-29 group snapshot; rebuilding from the \
                  surviving events instead of refusing startup"
             );
-            return rebuild_group_state(relay, groups_enabled).await;
+            return rebuild_group_state(relay, groups_enabled, true).await;
         }
     };
     populate_group_create_ids(relay, &mut snapshot).await?;
     filter_vanished_group_snapshot(relay, &mut snapshot).await?;
+    // A stale snapshot only forces fail-closed DM recovery when it actually
+    // contained DM-only state. A database with public groups only must still
+    // be able to rebuild on a keyless relay without hiding everything.
+    let snapshot_had_dm = snapshot
+        .groups
+        .values()
+        .any(|group| group.channel_type == "dm");
     let stamp = relay.db.state_stamp().await;
     let seq = relay.db.state_seq_group().await;
     match (stamp, seq) {
@@ -1138,6 +1160,7 @@ async fn restore_group_state(
                 .await
                 .restore_checked(snapshot, stamp, seq)
             {
+                relay.release_unrestored_group_snapshots();
                 info!("NIP-29 group state restored from the database snapshot");
                 if mode_changed {
                     // The stored 39000/39001/39002 were generated under the
@@ -1178,14 +1201,36 @@ async fn restore_group_state(
             );
         }
     }
-    rebuild_group_state(relay, groups_enabled).await
+    rebuild_group_state(relay, groups_enabled, snapshot_had_dm).await
+}
+
+/// Replaces the live group store with the fail-closed empty store without
+/// persisting anything. The snapshot and its DM/Buzz backups are preserved
+/// for a later startup: clearing them here would destroy the only copy of
+/// DM-only state that an event rebuild cannot reconstruct.
+async fn fail_closed_group_state(relay: &Relay, reason: &str) {
+    relay.preserve_unrestored_group_snapshots();
+    let mut groups = relay.groups.write().await;
+    let buzz_enabled = groups.buzz_enabled;
+    *groups = crate::nips::nip29::GroupStore::default();
+    groups.buzz_enabled = buzz_enabled;
+    groups.mark_unrestored();
+    drop(groups);
+    log::error!(
+        "NIP-29 group state is unrestored ({reason}); all group content is hidden and group \
+         writes are rejected until a later startup can rebuild it"
+    );
 }
 
 /// The replay/rebuild migration of [`restore_group_state`]: replays the
 /// stored moderation events and persists the result so later restarts skip
 /// the replay. A failed rebuild is fatal: starting with an incomplete
 /// group store would expose private/hidden content.
-async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> {
+async fn rebuild_group_state(
+    relay: &Relay,
+    groups_enabled: bool,
+    require_dm_recovery: bool,
+) -> Result<()> {
     if !groups_enabled {
         // The replay migration only runs when the NIP is enabled (see the
         // caller). The store stays empty — which reads as "every group id
@@ -1210,33 +1255,66 @@ async fn rebuild_group_state(relay: &Relay, groups_enabled: bool) -> Result<()> 
     {
         // A fail-closed store is safer than refusing the whole relay: an
         // attacker who creates one oversized boundary second must not make
-        // every restart impossible. Unknown ids are private while
-        // `unrestored`, and group writes are rejected; the operator can
-        // repair the history and restart.
-        let mut groups = relay.groups.write().await;
-        let buzz_enabled = groups.buzz_enabled;
-        *groups = crate::nips::nip29::GroupStore::default();
-        groups.buzz_enabled = buzz_enabled;
-        groups.mark_unrestored();
-        drop(groups);
-        log::error!(
-            "NIP-29 group state rebuild failed; starting with the group store \
-             unrestored (all group content hidden and group writes rejected) \
-             until the history is repaired and the relay restarts"
-        );
-        relay.persist_groups().await;
+        // every restart impossible. Do not clear the snapshot/backups here:
+        // a DM-only state has no event history, so this path must keep the
+        // only copy for a later recovery attempt.
+        fail_closed_group_state(relay, "the event rebuild failed").await;
         return Ok(());
     }
+    relay.release_unrestored_group_snapshots();
     // The main snapshot is absent/stale, but the same-transaction DM and
     // Buzz backups may still be current. Merge them before this rebuild's
     // snapshot write replaces the backups with event-derived state.
-    merge_dm_backup(relay).await?;
+    let dm_backup = match merge_dm_backup(relay, require_dm_recovery).await {
+        Ok(backup) => backup,
+        Err(error) => {
+            // A read failure is not "no backup": saving event-derived state
+            // here would overwrite the only durable DM copy. Hide everything
+            // and keep the bytes for the next startup.
+            fail_closed_group_state(relay, &format!("the DM backup could not be read: {error}"))
+                .await;
+            return Ok(());
+        }
+    };
     // The snapshot and its additive backup may both be absent, but a DM
     // still leaves relay-signed 39000/39001/39002/30622 metadata in the
     // database. Recover what the available metadata proves before the
     // rebuild snapshot is written.
-    restore_dm_metadata(relay).await?;
-    merge_buzz_backup(relay).await?;
+    let dm_metadata = match restore_dm_metadata(relay, require_dm_recovery).await {
+        Ok(()) => true,
+        Err(error) => {
+            if require_dm_recovery && dm_backup.is_none() {
+                fail_closed_group_state(
+                    relay,
+                    &format!("DM metadata recovery failed without a usable backup: {error}"),
+                )
+                .await;
+                return Ok(());
+            }
+            warn!(
+                "could not recover all DM metadata ({error}); continuing with the usable \
+                 snapshot/backup state"
+            );
+            false
+        }
+    };
+    if dm_backup.is_none() && !dm_metadata {
+        // Without an authoritative backup, an unavailable metadata scan
+        // cannot prove that no DM group is missing. Never persist a partial
+        // event-derived store over the only possible DM copy.
+        fail_closed_group_state(relay, "DM recovery was unavailable").await;
+        return Ok(());
+    }
+    if let Err(error) = merge_buzz_backup(relay, require_dm_recovery).await {
+        // Same rule as the DM backup: an unreadable backup must not be
+        // overwritten by the event-derived Buzz state.
+        fail_closed_group_state(
+            relay,
+            &format!("the Buzz backup could not be read: {error}"),
+        )
+        .await;
+        return Ok(());
+    }
     // The rebuilt state has no (or stale) relay-signed metadata: publish the
     // current 39000/39001/39002/39005 for every group so clients can see
     // them (a migrated database never had them).
@@ -1364,41 +1442,65 @@ async fn restore_dm_carry(relay: &Relay) -> Result<()> {
 /// DMs have no stored create/join events, so the ordinary rebuild cannot
 /// recreate them. A stale backup (a state removal/event advanced the
 /// generation) is discarded rather than resurrecting a removed member.
-async fn merge_dm_backup(relay: &Relay) -> Result<bool> {
+async fn merge_dm_backup(relay: &Relay, require_complete: bool) -> Result<Option<bool>> {
     if relay.groups.read().await.is_unrestored() {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(backup) = relay.db.load_dm_backup().await else {
-        log::warn!("could not read the DM backup; continuing with the event-derived group state");
-        return Ok(false);
+        return Err(anyhow::anyhow!("could not read the DM backup"));
     };
     let Some(mut backup) = backup else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(stamp) = relay.db.state_stamp().await else {
+        if require_complete {
+            return Err(anyhow::anyhow!(
+                "could not read the group generation for the DM backup"
+            ));
+        }
         log::warn!("could not verify the DM backup generation; skipping it");
-        return Ok(false);
+        return Ok(None);
     };
     let Some(seq) = relay.db.state_seq_group().await else {
+        if require_complete {
+            return Err(anyhow::anyhow!(
+                "could not read the group sequence for the DM backup"
+            ));
+        }
         log::warn!("could not verify the DM backup sequence; skipping it");
-        return Ok(false);
+        return Ok(None);
     };
-    if !crate::nips::nip29::GroupStore::snapshot_is_current(backup.stamp, stamp)
-        || !crate::nips::nip29::GroupStore::snapshot_is_current(backup.seq, seq)
-    {
+    let current = match backup.group_seq {
+        Some(group_seq) => crate::nips::nip29::GroupStore::snapshot_is_current(group_seq, seq),
+        None => {
+            crate::nips::nip29::GroupStore::snapshot_is_current(backup.stamp, stamp)
+                && crate::nips::nip29::GroupStore::snapshot_is_current(backup.seq, seq)
+        }
+    };
+    if !current {
         log::warn!("discarding a stale DM backup: it predates the current group-state generation");
-        return Ok(false);
+        return Ok(None);
     }
     filter_vanished_group_snapshot(relay, &mut backup).await?;
     backup.groups.retain(|_, group| !group.members.is_empty());
-    Ok(relay.groups.write().await.merge_dm_snapshot(backup))
+    Ok(Some(relay.groups.write().await.merge_dm_snapshot(backup)))
 }
 
 async fn restore_dm_backup(relay: &Relay) -> Result<()> {
-    if merge_dm_backup(relay).await? && !relay.persist_groups_durable().await {
-        log::warn!(
-            "could not durably persist the restored DM backup; the backup remains for the next startup"
-        );
+    match merge_dm_backup(relay, false).await {
+        Ok(Some(true)) if !relay.persist_groups_durable().await => {
+            log::warn!(
+                "could not durably persist the restored DM backup; the backup remains for the \
+                 next startup"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            log::warn!(
+                "could not read the DM backup during the secondary restore ({error}); keeping \
+                 it for the next startup"
+            );
+        }
     }
     Ok(())
 }
@@ -1407,41 +1509,65 @@ async fn restore_dm_backup(relay: &Relay) -> Result<()> {
 /// separate role grants) that a plain-mode event replay cannot reconstruct.
 /// The backup is generation-stamped with the snapshot, so a rebuild after a
 /// later state removal/event rejects it.
-async fn merge_buzz_backup(relay: &Relay) -> Result<bool> {
+async fn merge_buzz_backup(relay: &Relay, require_complete: bool) -> Result<Option<bool>> {
     if relay.groups.read().await.is_unrestored() {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(backup) = relay.db.load_buzz_backup().await else {
-        log::warn!("could not read the Buzz backup; continuing with the replayed group state");
-        return Ok(false);
+        return Err(anyhow::anyhow!("could not read the Buzz backup"));
     };
     let Some(backup) = backup else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(stamp) = relay.db.state_stamp().await else {
+        if require_complete {
+            return Err(anyhow::anyhow!(
+                "could not read the group generation for the Buzz backup"
+            ));
+        }
         log::warn!("could not verify the Buzz backup generation; skipping it");
-        return Ok(false);
+        return Ok(None);
     };
     let Some(seq) = relay.db.state_seq_group().await else {
+        if require_complete {
+            return Err(anyhow::anyhow!(
+                "could not read the group sequence for the Buzz backup"
+            ));
+        }
         log::warn!("could not verify the Buzz backup sequence; skipping it");
-        return Ok(false);
+        return Ok(None);
     };
-    if !crate::nips::nip29::GroupStore::snapshot_is_current(backup.stamp, stamp)
-        || !crate::nips::nip29::GroupStore::snapshot_is_current(backup.seq, seq)
-    {
+    let current = match backup.group_seq {
+        Some(group_seq) => crate::nips::nip29::GroupStore::snapshot_is_current(group_seq, seq),
+        None => {
+            crate::nips::nip29::GroupStore::snapshot_is_current(backup.stamp, stamp)
+                && crate::nips::nip29::GroupStore::snapshot_is_current(backup.seq, seq)
+        }
+    };
+    if !current {
         log::warn!(
             "discarding a stale Buzz backup: it predates the current group-state generation"
         );
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(relay.groups.write().await.merge_buzz_backup(backup))
+    Ok(Some(relay.groups.write().await.merge_buzz_backup(backup)))
 }
 
 async fn restore_buzz_backup(relay: &Relay) -> Result<()> {
-    if merge_buzz_backup(relay).await? && !relay.persist_groups().await {
-        log::warn!(
-            "could not persist the restored Buzz backup; the backup remains for the next startup"
-        );
+    match merge_buzz_backup(relay, false).await {
+        Ok(Some(true)) if !relay.persist_groups().await => {
+            log::warn!(
+                "could not persist the restored Buzz backup; the backup remains for the next \
+                 startup"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            log::warn!(
+                "could not read the Buzz backup during the secondary restore ({error}); keeping \
+                 it for the next startup"
+            );
+        }
     }
     Ok(())
 }
@@ -4986,10 +5112,9 @@ mod tests {
             .write()
             .await
             .restore(crate::nips::nip29::GroupsSnapshot::default());
-        let recovered = restore_dm_metadata(&relay)
+        restore_dm_metadata(&relay, false)
             .await
             .expect("DM metadata recovery must succeed");
-        assert!(recovered > 0);
         let groups = relay.groups.read().await;
         let group = groups.group(&channel).expect("recovered DM group");
         assert_eq!(group.channel_type, "dm");
@@ -5036,7 +5161,7 @@ mod tests {
             .write()
             .await
             .restore(crate::nips::nip29::GroupsSnapshot::default());
-        rebuild_group_state(&relay, true)
+        rebuild_group_state(&relay, true, false)
             .await
             .expect("DM metadata rebuild must succeed");
         let groups = relay.groups.read().await;
@@ -5259,6 +5384,149 @@ mod tests {
             "the pre-existing state must be bound to the current group epoch"
         );
         assert_eq!(relay.db.group_epochs_backfilled().await, Some(true));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn corrupt_group_snapshot_without_dm_recovery_stays_unrestored() {
+        // A corrupt main snapshot must not be replaced by an event-derived
+        // state that has no DM backup and no relay key to verify DM
+        // metadata. The fail-closed store hides every group, and the corrupt
+        // snapshot is left in place for a later operator/recovery attempt
+        // rather than being overwritten with a DM-less snapshot.
+        let relay = blossom_relay().await;
+        assert!(
+            relay
+                .db
+                .save_groups_encoded(b"{corrupt".to_vec(), Vec::new(), Vec::new())
+                .await
+        );
+        restore_group_state(&relay, true, false)
+            .await
+            .expect("the recovery path must complete fail-closed");
+        assert!(
+            relay.groups.read().await.is_unrestored(),
+            "without a usable DM recovery source the group store must stay unrestored"
+        );
+        assert!(
+            matches!(
+                relay.db.load_groups().await,
+                crate::db::LoadGroupsOutcome::Failed
+            ),
+            "the failed recovery must not overwrite the corrupt snapshot"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn corrupt_group_snapshot_recovers_from_a_current_dm_backup() {
+        // The same corruption with a current same-transaction DM backup must
+        // rebuild and merge the DM-only group instead of hiding it.
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let stamp = relay.db.state_stamp().await.expect("stamp");
+        let seq = relay.db.state_seq_group().await.expect("seq");
+        let member = "aa".repeat(32);
+        let mut group = crate::nips::nip29::Group {
+            channel_type: "dm".into(),
+            ..crate::nips::nip29::Group::default()
+        };
+        group.members.insert(member.clone(), Default::default());
+        let mut snapshot = crate::nips::nip29::GroupsSnapshot {
+            stamp,
+            seq,
+            buzz_enabled: Some(false),
+            ..crate::nips::nip29::GroupsSnapshot::default()
+        };
+        snapshot.groups.insert("dm-recover".into(), group);
+        let dm =
+            crate::nips::nip29::dm_backup_json(&snapshot.groups, stamp, seq, snapshot.buzz_enabled)
+                .expect("DM backup encoding");
+        assert!(
+            relay
+                .db
+                .save_groups_encoded(b"{corrupt".to_vec(), dm, b"{}".to_vec())
+                .await
+        );
+        restore_group_state(&relay, true, false)
+            .await
+            .expect("the DM backup recovery must succeed");
+        let groups = relay.groups.read().await;
+        assert!(!groups.is_unrestored());
+        assert!(
+            groups.group("dm-recover").is_some(),
+            "the current DM backup must be merged"
+        );
+        assert!(groups.group("dm-recover").unwrap().is_member(&member));
+        drop(groups);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn group_snapshot_survives_a_role_only_removal() {
+        // A role-state removal advances the shared removal stamp but not the
+        // group-family sequence. The new snapshot's group_seq must still be
+        // current, so DM groups and their backups are not discarded while
+        // the role store rebuilds.
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let stamp = relay.db.state_stamp().await.expect("stamp");
+        let seq = relay.db.state_seq_group().await.expect("seq");
+        let mut group = crate::nips::nip29::Group {
+            channel_type: "dm".into(),
+            ..crate::nips::nip29::Group::default()
+        };
+        group.members.insert("aa".repeat(32), Default::default());
+        let mut snapshot = crate::nips::nip29::GroupsSnapshot {
+            stamp,
+            seq,
+            group_seq: Some(seq),
+            ..crate::nips::nip29::GroupsSnapshot::default()
+        };
+        snapshot.groups.insert("dm-role-survives".into(), group);
+        assert!(relay.db.save_groups(snapshot).await);
+
+        // A stored role-state event's vanish advances the shared stamp and
+        // the role sequence only.
+        let mut role_event = Event {
+            id: String::new(),
+            pubkey: "aa".repeat(32),
+            created_at: unix_now(),
+            kind: crate::nips::nip43::MEMBERSHIP_LIST,
+            tags: vec![vec!["-".into()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        role_event.id = crate::nips::nip01::compute_id(&role_event);
+        assert_eq!(
+            relay.db.put(role_event, unix_now()).await,
+            crate::db::PutOutcome::Stored
+        );
+        let (removed, state) = relay
+            .db
+            .apply_vanish_checked([0xaa; 32], unix_now())
+            .await
+            .expect("vanish");
+        assert_eq!(removed, 1);
+        assert!(state.role && !state.group);
+        assert!(
+            relay.db.state_stamp().await.expect("stamp") > stamp,
+            "the role removal must advance the shared stamp"
+        );
+        assert_eq!(
+            relay.db.state_seq_group().await.expect("seq"),
+            seq,
+            "the role removal must leave the group sequence unchanged"
+        );
+
+        restore_group_state(&relay, true, false)
+            .await
+            .expect("the role-only advance must not reject the group snapshot");
+        let groups = relay.groups.read().await;
+        assert!(!groups.is_unrestored());
+        assert!(
+            groups.group("dm-role-survives").is_some(),
+            "the DM group must survive a role-only removal"
+        );
+        drop(groups);
         relay.db.shutdown();
     }
 

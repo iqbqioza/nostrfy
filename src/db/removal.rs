@@ -7,10 +7,11 @@ use super::db_error;
 #[cfg(test)]
 use super::store::take_chunk_fault;
 use super::store::{
-    CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, StateRemoved, Store, TAG_INDEX_VALUE_MAX, created_key,
-    decode_pending_purge, decode_purged_group_marker, delegated_by, deleted_address_key,
-    dtag_key_safe, encode_pending_deletion, encode_pending_purge, encode_purged_group_marker,
-    pending_deletion_key, pubkey_key, purged_group_key, replaceable_key, tag_key,
+    CREATED_LEN, GIFT_WRAP_INDEX, ID_LEN, StateFamily, StateRemoved, Store, TAG_INDEX_VALUE_MAX,
+    created_key, decode_pending_purge, decode_purged_group_marker, delegated_by,
+    deleted_address_key, dtag_key_safe, encode_pending_deletion, encode_pending_purge,
+    encode_purged_group_marker, pending_deletion_key, pubkey_key, purged_group_key,
+    replaceable_key, tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -506,6 +507,12 @@ impl Store {
             }
             if !chunk_state_removed.is_empty() {
                 self.bump_state_stamp(&mut wtxn)?;
+                if chunk_state_removed.group {
+                    // The group snapshot is validated by the group sequence:
+                    // bumping it here makes a group-state removal invalidate
+                    // the snapshot, while a role-only removal does not.
+                    self.bump_state_seq(&mut wtxn, StateFamily::Group)?;
+                }
             }
             wtxn.commit()?;
             state_removed.merge(chunk_state_removed);
@@ -633,6 +640,12 @@ impl Store {
             }
             if !chunk_state_removed.is_empty() {
                 self.bump_state_stamp(&mut wtxn)?;
+                if chunk_state_removed.group {
+                    // The group snapshot is validated by the group sequence:
+                    // bumping it here makes a group-state removal invalidate
+                    // the snapshot, while a role-only removal does not.
+                    self.bump_state_seq(&mut wtxn, StateFamily::Group)?;
+                }
             }
             if wrote {
                 wtxn.commit()?;
@@ -739,6 +752,9 @@ impl Store {
                 self.remove_event(&mut wtxn, id)?;
                 if !state_removed.is_empty() {
                     self.bump_state_stamp(&mut wtxn)?;
+                    if state_removed.group {
+                        self.bump_state_seq(&mut wtxn, StateFamily::Group)?;
+                    }
                 }
                 true
             }
@@ -1165,6 +1181,7 @@ impl Store {
         )?;
         self.purge_pending.delete(&mut wtxn, &key)?;
         self.bump_state_stamp(&mut wtxn)?;
+        self.bump_state_seq(&mut wtxn, StateFamily::Group)?;
         wtxn.commit()?;
         Ok(removed)
     }
@@ -1497,6 +1514,9 @@ impl Store {
             if !chunk_state_removed.is_empty() {
                 // The stamp and the state-event removals commit atomically.
                 self.bump_state_stamp(&mut wtxn)?;
+                if chunk_state_removed.group {
+                    self.bump_state_seq(&mut wtxn, StateFamily::Group)?;
+                }
             }
             state_removed.merge(chunk_state_removed);
             wtxn.commit()?;
@@ -1647,6 +1667,9 @@ impl Store {
                 // (a separate bump transaction would let a crash lose the
                 // fact that the derived state changed).
                 self.bump_state_stamp(&mut wtxn)?;
+                if chunk_state_removed.group {
+                    self.bump_state_seq(&mut wtxn, StateFamily::Group)?;
+                }
             }
             wtxn.commit()?;
             state_removed.merge(chunk_state_removed);
