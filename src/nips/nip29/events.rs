@@ -469,7 +469,18 @@ pub(crate) fn build_admins_event(
             })
             .collect();
         admins.sort();
-        for (pk, roles) in admins {
+        let mut bytes = 0usize;
+        for (tags, (pk, roles)) in admins.into_iter().enumerate() {
+            let tag_bytes = pk
+                .len()
+                .saturating_add(roles.iter().map(String::len).sum::<usize>())
+                .saturating_add(roles.len().saturating_mul(8));
+            if tags >= super::MAX_ADMIN_ROLE_TAGS
+                || bytes.saturating_add(tag_bytes) > super::MAX_ADMIN_ROLE_BYTES
+            {
+                break;
+            }
+            bytes = bytes.saturating_add(tag_bytes);
             let mut tag = vec![P.to_string(), pk];
             tag.extend(roles);
             event.tags.push(tag);

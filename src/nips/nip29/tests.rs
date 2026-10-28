@@ -896,6 +896,36 @@ fn tombstone_churn_does_not_lock_out_creates() {
 }
 
 #[test]
+fn ghost_overflow_hides_unknown_ids_and_survives_a_snapshot() {
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("live"), vec![]),
+        "relay",
+        1_600_000_000,
+        false,
+        false,
+    );
+    for i in 0..MAX_GHOSTS {
+        store.mark_ghost(&format!("ghost-{i}"));
+    }
+    store.mark_ghost("ghost-over-cap");
+    assert!(store.ghost_overflowed());
+    assert_eq!(
+        store.ghost.len(),
+        MAX_GHOSTS,
+        "the exact marker set must stay bounded"
+    );
+    assert!(!store.visible_gid("ghost-over-cap", false, None));
+    assert!(store.visible_gid("live", false, None));
+
+    let mut restored = GroupStore::default();
+    restored.restore(store.snapshot());
+    assert!(restored.ghost_overflowed());
+    assert!(!restored.visible_gid("ghost-over-cap", false, None));
+    assert!(restored.visible_gid("live", false, None));
+}
+
+#[test]
 fn ghosts_do_not_consume_the_live_group_cap() {
     // H02: a backed ghost is a historical fail-closed marker, not a live
     // group. It must not block a new create (the old combined budget let a
@@ -1813,6 +1843,24 @@ fn rebuild_does_not_fail_when_the_ghost_set_exceeds_the_cap() {
         assert!(store.is_ghosted("g2"));
     });
     db.shutdown();
+}
+
+#[test]
+fn generated_admin_roster_has_a_total_tag_budget() {
+    let mut group = Group::default();
+    for i in 0..(MAX_ADMIN_ROLE_TAGS + 32) {
+        group.members.insert(
+            format!("{i:064x}"),
+            vec!["role".to_string()].into_iter().collect(),
+        );
+    }
+    let event =
+        super::events::build_admins_event("g1", Some(&group), "relay", 1_600_000_000, false);
+    let admin_tags = event.tags.iter().filter(|tag| tag[0] == P).count();
+    assert!(
+        admin_tags <= MAX_ADMIN_ROLE_TAGS,
+        "the generated 39001 must stay within its total tag budget"
+    );
 }
 
 #[test]
@@ -6996,6 +7044,7 @@ fn encoded_persisted_snapshot_matches_the_typed_format() {
             .collect(),
         deleted: std::collections::HashSet::new(),
         ghost: std::collections::HashSet::new(),
+        ghost_overflow: false,
         stamp: 42,
         seq: 7,
         group_seq: Some(7),

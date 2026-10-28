@@ -322,6 +322,16 @@ pub struct Relay {
     pub roles: Arc<RwLock<RoleStore>>,
     /// NIP-IA archived identities (relay-scoped visibility metadata).
     pub archive: Arc<RwLock<std::collections::BTreeSet<String>>>,
+    /// A large archive set deferred a 13535 snapshot publish (see the
+    /// stats tick); the delta is already stored, so a retry is safe.
+    archive_dirty: AtomicBool,
+    /// Last successful full 13535 publish (unix seconds).
+    archive_published_at: AtomicU64,
+    /// A large relay roster deferred a full 13534 publish (add/remove
+    /// deltas are still emitted). The stats tick retries it.
+    membership_dirty: AtomicBool,
+    /// Last successful full 13534 publish (unix seconds).
+    membership_published_at: AtomicU64,
     /// The coalesced NIP-43 role rebuild that follows a NIP-09 deletion,
     /// NIP-62 vanish or NIP-40 expiry of a role-state event: while stale,
     /// the live store is the fail-closed empty store and `persist_roles`
@@ -2763,6 +2773,10 @@ impl Relay {
             startup_group_recovery: std::sync::atomic::AtomicBool::new(false),
             roles: Arc::new(RwLock::new(RoleStore::default())),
             archive: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
+            archive_dirty: AtomicBool::new(false),
+            archive_published_at: AtomicU64::new(0),
+            membership_dirty: AtomicBool::new(false),
+            membership_published_at: AtomicU64::new(0),
             roles_rebuild: std::sync::Arc::new(RolesRebuild::default()),
             api_limit: ApiLimiter::new(api_max_concurrent),
             publish_rate: std::sync::Mutex::new(PublishRate::default()),
@@ -8216,6 +8230,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_relay_roster_coalesces_full_13534_publishes() {
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        relay.config.write().await.relay.enabled_nips = vec![43];
+        {
+            let mut roles = relay.roles.write().await;
+            for i in 0..1_001 {
+                assert!(roles.admit(&format!("{i:064x}")));
+            }
+        }
+        assert!(relay.publish_membership(None).await);
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13534]})).unwrap();
+        let (before, _) = relay
+            .db
+            .query(vec![filter.clone()], 1, crate::util::unix_now())
+            .await;
+        assert_eq!(before.len(), 1);
+
+        let new_member = "ff".repeat(32);
+        assert!(relay.roles.write().await.admit(&new_member));
+        assert!(
+            relay
+                .publish_membership(Some((true, new_member.clone())))
+                .await
+        );
+        let (deferred, _) = relay
+            .db
+            .query(vec![filter.clone()], 1, crate::util::unix_now())
+            .await;
+        assert!(
+            !deferred[0]
+                .tags
+                .iter()
+                .any(|tag| tag.len() >= 2 && tag[0] == "member" && tag[1] == new_member),
+            "a large roster must not re-sign the full 13534 on every admission"
+        );
+
+        // Once the coalescing interval is over, the stats-tick helper
+        // publishes the deferred full roster.
+        relay
+            .membership_published_at
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        relay.republish_membership_if_dirty().await;
+        let (refreshed, _) = relay
+            .db
+            .query(vec![filter], 1, crate::util::unix_now())
+            .await;
+        assert!(
+            refreshed[0]
+                .tags
+                .iter()
+                .any(|tag| tag.len() >= 2 && tag[0] == "member" && tag[1] == new_member),
+            "the deferred roster must eventually include the new member"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn role_admin_lifecycle() {
         let key = "01".repeat(32);
         let relay = build_role_relay(Some(&key)).await;
@@ -8955,6 +9027,66 @@ mod tests {
         assert!(
             !relay.archive.read().await.contains(&target),
             "the refused identity must not enter the set"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn large_archive_set_coalesces_full_13535_publishes() {
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        {
+            let mut archive = relay.archive.write().await;
+            for i in 0..1_001 {
+                archive.insert(format!("{i:064x}"));
+            }
+        }
+        assert!(relay.publish_archive_snapshot().await);
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [13535]})).unwrap();
+        let target = "ff".repeat(32);
+        let request = crate::event::Event {
+            id: "bd".repeat(32),
+            pubkey: target.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 9035,
+            tags: vec![
+                vec!["-".into()],
+                vec!["p".into(), target.clone()],
+                vec!["reason".into(), "coalesce".into()],
+            ],
+            content: "archive test".into(),
+            sig: String::new(),
+        };
+        relay
+            .apply_identity_archive(&request)
+            .await
+            .expect("self archive request must be accepted");
+        let (deferred, _) = relay
+            .db
+            .query(vec![filter.clone()], 1, crate::util::unix_now())
+            .await;
+        assert!(
+            !deferred[0]
+                .tags
+                .iter()
+                .any(|tag| tag.len() == 2 && tag[0] == "p" && tag[1] == target),
+            "a large archive set must not re-sign 13535 on every archive"
+        );
+
+        relay
+            .archive_published_at
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        relay.republish_archive_if_dirty().await;
+        let (refreshed, _) = relay
+            .db
+            .query(vec![filter], 1, crate::util::unix_now())
+            .await;
+        assert!(
+            refreshed[0]
+                .tags
+                .iter()
+                .any(|tag| tag.len() == 2 && tag[0] == "p" && tag[1] == target),
+            "the deferred archive snapshot must eventually include the identity"
         );
         relay.db.shutdown();
     }

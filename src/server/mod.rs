@@ -2997,6 +2997,10 @@ async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                 // A large group's 39002 is throttled; retry it once its
                 // interval elapsed so a dropped update is delayed, not lost.
                 relay.republish_due_group_members().await;
+                // Large NIP-43 rosters and NIP-IA snapshots are coalesced
+                // the same way.
+                relay.republish_membership_if_dirty().await;
+                relay.republish_archive_if_dirty().await;
                 let path = relay.config.read().await.daemon.stats_file.clone();
                 relay
                     .stats
