@@ -8922,6 +8922,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_archive_set_is_bounded() {
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        {
+            let mut archive = relay.archive.write().await;
+            for i in 0..crate::nips::nip_ia::MAX_ARCHIVED_IDENTITIES {
+                archive.insert(format!("{i:064x}"));
+            }
+        }
+        let target = "ff".repeat(32);
+        let request = crate::event::Event {
+            id: "bc".repeat(32),
+            pubkey: target.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 9035,
+            tags: vec![
+                vec!["-".into()],
+                vec!["p".into(), target.clone()],
+                vec!["reason".into(), "full".into()],
+            ],
+            content: "archive test".into(),
+            sig: String::new(),
+        };
+        let error = relay
+            .apply_identity_archive(&request)
+            .await
+            .expect_err("a new identity must be refused at the archive cap");
+        assert!(
+            error.to_string().contains("archive") && error.to_string().contains("full"),
+            "the refusal must explain the archive bound: {error}"
+        );
+        assert!(
+            !relay.archive.read().await.contains(&target),
+            "the refused identity must not enter the set"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn command_journal_replays_a_stored_archive_after_a_crash() {
         let relay = build_relay_with_key(false, &"01".repeat(32)).await;
         let target = "aa".repeat(32);

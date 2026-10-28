@@ -1572,6 +1572,62 @@ async fn restore_buzz_backup(relay: &Relay) -> Result<()> {
     Ok(())
 }
 
+/// Whether a group event is ordinary channel content that a TTL may purge.
+/// Group state, relay-signed metadata and membership notices are retained.
+fn is_ttl_content(event: &crate::event::Event) -> bool {
+    !crate::nips::nip29::is_group_action_kind(event.kind)
+        && !(crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS).contains(&event.kind)
+        && !crate::nips::nip29::is_membership_notice_kind(event.kind)
+        && event.kind != 30622
+}
+
+/// Re-reads one boundary second of an ascending TTL scan before the cursor
+/// advances past it. The page collector can cut a same-second tie, and a
+/// full page of state at that second hides later expired content if the
+/// cursor jumps to `newest + 1`. Returns `None` when the second is too
+/// large to verify (the caller defers cleanup instead of skipping rows).
+async fn purge_ttl_boundary_second(
+    relay: &Relay,
+    filter: crate::filter::Filter,
+    boundary: u64,
+    now: u64,
+    gid: &str,
+) -> Option<usize> {
+    const VERIFY_LIMIT: usize = 150_000;
+    let mut boundary_filter = filter;
+    boundary_filter.since = Some(boundary);
+    boundary_filter.until = Some(boundary);
+    boundary_filter.limit = Some(VERIFY_LIMIT);
+    let Some((events, more)) = relay
+        .db
+        .query_full_startup(vec![boundary_filter], VERIFY_LIMIT, now, true)
+        .await
+    else {
+        log::warn!("could not verify the TTL boundary for {gid}; deferring cleanup");
+        return None;
+    };
+    if more || events.len() >= VERIFY_LIMIT {
+        log::warn!("TTL boundary {boundary} for {gid} is too large to verify; deferring cleanup");
+        return None;
+    }
+    let ids: Vec<[u8; 32]> = events
+        .iter()
+        .filter(|event| is_ttl_content(event))
+        .filter_map(crate::event::Event::id_bytes)
+        .collect();
+    if ids.is_empty() {
+        return Some(0);
+    }
+    let Some(removed) = relay.db.remove_events_by_id(&ids).await else {
+        log::warn!("could not remove expired TTL messages for {gid}; deferring cleanup");
+        return None;
+    };
+    relay
+        .stats
+        .bump(&relay.stats.events_deleted, removed as u64);
+    Some(removed)
+}
+
 /// Startup reclamation for channel TTL. Runtime reads hide expired content
 /// immediately; this pass also removes old rows so a long-running relay does
 /// not retain them forever. It is bounded per query and best-effort after a
@@ -1620,7 +1676,7 @@ async fn purge_expired_group_messages_paged(relay: &Relay, page: usize) -> Resul
             filter.limit = Some(page);
             let Some((events, _)) = relay
                 .db
-                .query_full_startup(vec![filter], page, now, true)
+                .query_full_startup(vec![filter.clone()], page, now, true)
                 .await
             else {
                 log::warn!("could not scan expired TTL messages for {gid}; deferring cleanup");
@@ -1631,18 +1687,13 @@ async fn purge_expired_group_messages_paged(relay: &Relay, page: usize) -> Resul
             }
             let ids: Vec<[u8; 32]> = events
                 .iter()
-                .filter(|event| {
-                    !crate::nips::nip29::is_group_action_kind(event.kind)
-                        && !(crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
-                            .contains(&event.kind)
-                        && !crate::nips::nip29::is_membership_notice_kind(event.kind)
-                        && event.kind != 30622
-                })
-                .filter_map(|event| event.id_bytes())
+                .filter(|event| is_ttl_content(event))
+                .filter_map(crate::event::Event::id_bytes)
                 .collect();
             if ids.is_empty() {
-                // The page is all state/metadata. Advance past it when it is
-                // full; a short page is the end of the scan.
+                // The page is all state/metadata. A short page is the end of
+                // the scan; a full one may hide expired content at the same
+                // boundary second, so verify that second before advancing.
                 if events.len() < page {
                     break;
                 }
@@ -1650,6 +1701,12 @@ async fn purge_expired_group_messages_paged(relay: &Relay, page: usize) -> Resul
                     break;
                 };
                 if newest >= cutoff {
+                    break;
+                }
+                if purge_ttl_boundary_second(relay, filter.clone(), newest, now, &gid)
+                    .await
+                    .is_none()
+                {
                     break;
                 }
                 since = Some(newest.saturating_add(1));
@@ -1663,8 +1720,9 @@ async fn purge_expired_group_messages_paged(relay: &Relay, page: usize) -> Resul
                 .stats
                 .bump(&relay.stats.events_deleted, removed as u64);
             if removed == 0 {
-                // All ids on this full page were already gone. Move past
-                // the boundary instead of re-reading the same page.
+                // All ids on this full page were already gone. Verify the
+                // boundary second before moving past it, so content hidden
+                // behind already-purged rows is not skipped.
                 if events.len() < page {
                     break;
                 }
@@ -1672,6 +1730,12 @@ async fn purge_expired_group_messages_paged(relay: &Relay, page: usize) -> Resul
                     break;
                 };
                 if newest >= cutoff {
+                    break;
+                }
+                if purge_ttl_boundary_second(relay, filter.clone(), newest, now, &gid)
+                    .await
+                    .is_none()
+                {
                     break;
                 }
                 since = Some(newest.saturating_add(1));
@@ -1821,11 +1885,22 @@ async fn restore_archive_state(relay: &Relay) -> Result<()> {
             "cannot read the NIP-IA archive state; refusing to start with an unknown archive"
         ));
     };
-    let archived: std::collections::BTreeSet<String> = match data {
+    let mut archived: std::collections::BTreeSet<String> = match data {
         Some(bytes) => serde_json::from_slice(&bytes)
             .map_err(|error| anyhow::anyhow!("invalid NIP-IA archive state: {error}"))?,
         None => std::collections::BTreeSet::new(),
     };
+    if archived.len() > crate::nips::nip_ia::MAX_ARCHIVED_IDENTITIES {
+        warn!(
+            "trimming a persisted NIP-IA archive set from {} to the {} identity bound",
+            archived.len(),
+            crate::nips::nip_ia::MAX_ARCHIVED_IDENTITIES
+        );
+        archived = archived
+            .into_iter()
+            .take(crate::nips::nip_ia::MAX_ARCHIVED_IDENTITIES)
+            .collect();
+    }
     *relay.archive.write().await = archived;
     Ok(())
 }
@@ -5331,6 +5406,74 @@ mod tests {
         assert!(
             content_rows.is_empty(),
             "expired content behind a full state page must be removed"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ttl_purge_checks_the_boundary_second_before_advancing() {
+        // A full page of state rows at the oldest second used to advance
+        // the cursor to `created_at + 1`, skipping expired content at the
+        // same second that did not fit on the page. The boundary re-read
+        // must reclaim it before the cursor moves.
+        let relay = blossom_relay_with_key(&"01".repeat(32)).await;
+        let now = unix_now();
+        let relay_pk = relay.relay_pubkey().unwrap_or_default();
+        {
+            let mut groups = relay.groups.write().await;
+            groups.buzz_enabled = true;
+            let create = Event {
+                id: "61".repeat(32),
+                pubkey: relay_pk.clone(),
+                created_at: now - 100,
+                kind: crate::nips::nip29::CREATE_GROUP,
+                tags: vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["ttl".into(), "10".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            groups.apply(&create, &relay_pk, now - 100, false, false);
+        }
+        let state = |id: &str, created_at: u64| Event {
+            id: id.repeat(32),
+            pubkey: relay_pk.clone(),
+            created_at,
+            kind: crate::nips::nip29::PUT_USER,
+            tags: vec![
+                vec!["h".into(), "g1".into()],
+                vec!["p".into(), "aa".repeat(32)],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let state_one = state("01", now - 99);
+        let state_two = state("02", now - 99);
+        let content = Event {
+            id: "ff".repeat(32),
+            pubkey: relay_pk.clone(),
+            created_at: now - 99,
+            kind: 9,
+            tags: vec![vec!["h".into(), "g1".into()]],
+            content: "expired".into(),
+            sig: String::new(),
+        };
+        for event in [&state_one, &state_two, &content] {
+            assert_eq!(
+                relay.db.put(event.clone(), now).await,
+                crate::db::PutOutcome::Stored
+            );
+        }
+        purge_expired_group_messages_paged(&relay, 2)
+            .await
+            .expect("TTL purge must succeed");
+        let filter: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": [content.id]})).unwrap();
+        let (rows, _) = relay.db.query(vec![filter], 10, unix_now()).await;
+        assert!(
+            rows.is_empty(),
+            "expired content in the boundary second must be reclaimed"
         );
         relay.db.shutdown();
     }

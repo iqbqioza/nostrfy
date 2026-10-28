@@ -16,6 +16,11 @@ pub const ARCHIVED_IDENTITIES: u64 = 13535;
 pub const ARCHIVED_DELTA: u64 = 8002;
 pub const UNARCHIVED_DELTA: u64 = 8003;
 
+/// Bound on the relay-scoped archived-identities set. The snapshot is
+/// relay-signed and grows one `p` tag per identity, so accepting unbounded
+/// self-archive requests would make every 13535 publish arbitrarily large.
+pub(crate) const MAX_ARCHIVED_IDENTITIES: usize = 10_000;
+
 /// The relay's NIP-IA archived-identities snapshot. The NIP-70 `-` tag marks
 /// it as relay state; one bare `p` tag names each archived identity.
 pub fn snapshot(relay_pubkey: &str, now: u64, archived: &BTreeSet<String>) -> Event {
@@ -23,6 +28,7 @@ pub fn snapshot(relay_pubkey: &str, now: u64, archived: &BTreeSet<String>) -> Ev
     tags.extend(
         archived
             .iter()
+            .take(MAX_ARCHIVED_IDENTITIES)
             .map(|pubkey| vec!["p".to_string(), pubkey.clone()]),
     );
     base(ARCHIVED_IDENTITIES, relay_pubkey, now, tags, "")

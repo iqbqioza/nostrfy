@@ -36,6 +36,43 @@ pub const DELETED_TAG: &str = "deleted";
 /// per-group member cap; members already listed are unaffected.
 pub(crate) const MAX_RELAY_MEMBERS: usize = 10_000;
 
+/// Bound on roles attached to one member. The NIP-43 roster is relay-signed
+/// and rebuilt on every membership change, so an admin must not be able to
+/// attach an unbounded role list to one pubkey.
+pub(crate) const MAX_ROLES_PER_MEMBER: usize = 16;
+
+/// Bound on distinct role definitions. Role definitions and the derived
+/// 39003/39001 lists are relay-signed state; an unbounded registry makes a
+/// single roster rebuild arbitrarily large.
+pub(crate) const MAX_ROLES: usize = 256;
+
+/// A role id is a tag value in the relay-signed roster, so its bytes are
+/// bounded like any other generated metadata field.
+pub(crate) const MAX_ROLE_BYTES: usize = 64;
+pub(crate) const MAX_ROLES_BYTES_PER_MEMBER: usize = 4 * 1024;
+
+/// Bound on NIP-86 invite codes. They live only in the roles snapshot, so
+/// an uncapped admin-created set makes every snapshot write and list
+/// response arbitrarily large.
+pub(crate) const MAX_CLAIMS: usize = 10_000;
+
+fn bounded_roster_roles(mut roles: Vec<String>, max_roles: usize) -> Vec<String> {
+    roles.retain(|role| !role.is_empty() && role.len() <= MAX_ROLE_BYTES);
+    roles.sort();
+    roles.dedup();
+    let mut used = 0usize;
+    roles.retain(|role| {
+        let next = used.saturating_add(role.len());
+        if next > MAX_ROLES_BYTES_PER_MEMBER {
+            return false;
+        }
+        used = next;
+        true
+    });
+    roles.truncate(max_roles);
+    roles
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Role {
     pub label: String,
@@ -192,6 +229,13 @@ impl RoleStore {
         // entry is not an owner row and stays.
         strip_synthetic_owner_assignments(&mut self.assignments);
         self.claims = snap.claims;
+        if self.claims.len() > MAX_CLAIMS {
+            // A snapshot written before the cap (or by an older build) must
+            // not keep an unbounded claim list alive in memory. Keep the
+            // deterministic BTreeSet prefix; an admin can re-create any
+            // dropped code.
+            self.claims = self.claims.iter().take(MAX_CLAIMS).cloned().collect();
+        }
     }
 
     /// Whether a snapshot stamped `snapshot_stamp` still reflects the
@@ -234,6 +278,12 @@ impl RoleStore {
         color: &str,
         order: Option<i64>,
     ) {
+        if id.is_empty() || id.len() > MAX_ROLE_BYTES {
+            return;
+        }
+        if !self.roles.contains_key(id) && self.roles.len() >= MAX_ROLES {
+            return;
+        }
         self.roles.insert(
             id.to_string(),
             Role {
@@ -273,6 +323,9 @@ impl RoleStore {
             return false;
         }
         let roles = self.assignments.entry(pubkey.to_string()).or_default();
+        if roles.len() >= MAX_ROLES_PER_MEMBER {
+            return false;
+        }
         // Unlike `unassign` (which reports whether anything changed), the
         // old code always reported success: a duplicate assignment
         // needlessly scheduled snapshots and republished the membership
@@ -318,6 +371,18 @@ impl RoleStore {
     /// Stores an invite code. Returns false when it already existed
     /// (idempotent success at the RPC layer).
     pub fn add_claim(&mut self, claim: &str) -> bool {
+        // Replay and tests also call this directly, so repeat the intake
+        // shape checks instead of relying on the NIP-86 validator.
+        if claim.trim().is_empty()
+            || claim != claim.trim()
+            || claim.chars().count() > Self::MAX_CLAIM_LEN
+            || claim.chars().any(char::is_control)
+        {
+            return false;
+        }
+        if self.claims.len() >= MAX_CLAIMS && !self.claims.contains(claim) {
+            return false;
+        }
         self.claims.insert(claim.to_string())
     }
 
@@ -427,8 +492,10 @@ impl RoleStore {
             if had_owner && roles.is_empty() {
                 continue;
             }
-            roles.sort();
-            members.insert(pk.clone(), roles);
+            members.insert(
+                pk.clone(),
+                bounded_roster_roles(roles, MAX_ROLES_PER_MEMBER),
+            );
         }
         for pubkey in extra_members {
             members.entry(pubkey.clone()).or_default();
@@ -442,8 +509,7 @@ impl RoleStore {
             // in `assignments` and does not authorize relay commands.
             let mut roles = self.assignments.get(pubkey).cloned().unwrap_or_default();
             roles.retain(|role| !is_synthetic_owner_role(role));
-            roles.sort();
-            roles.dedup();
+            let mut roles = bounded_roster_roles(roles, MAX_ROLES_PER_MEMBER.saturating_sub(1));
             if !roles.iter().any(|role| role == "owner") {
                 roles.insert(0, "owner".to_string());
             }
@@ -1274,6 +1340,45 @@ mod tests {
             );
             drop(db);
         });
+    }
+
+    #[test]
+    fn invite_claims_are_bounded() {
+        let mut store = RoleStore::default();
+        for i in 0..MAX_CLAIMS {
+            assert!(
+                store.add_claim(&format!("claim-{i}")),
+                "claim {i} must fit before the cap"
+            );
+        }
+        assert!(
+            !store.add_claim("claim-over-cap"),
+            "a new claim must be refused at the cap"
+        );
+        assert!(
+            !store.add_claim("claim-0"),
+            "an existing claim remains an idempotent no-op success"
+        );
+    }
+
+    #[test]
+    fn role_assignment_and_registry_are_bounded() {
+        let mut store = RoleStore::default();
+        for i in 0..(MAX_ROLES + 4) {
+            store.create(&format!("r{i}"), "R", "", "", None);
+        }
+        assert_eq!(
+            store.roles.len(),
+            MAX_ROLES,
+            "the role registry must stop at its cap"
+        );
+        for i in 0..MAX_ROLES_PER_MEMBER {
+            assert!(store.assign("aa", &format!("r{i}")));
+        }
+        assert!(
+            !store.assign("aa", &format!("r{MAX_ROLES_PER_MEMBER}")),
+            "one member must not accumulate an unbounded role list"
+        );
     }
 
     #[test]

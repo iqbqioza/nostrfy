@@ -33,6 +33,8 @@ pub(crate) enum RoleChange {
 pub(crate) enum ClaimRejection {
     /// NIP-43 is disabled or the relay key is missing.
     Unavailable,
+    /// The invite-code set is at [`crate::nips::nip43::MAX_CLAIMS`].
+    Full,
     /// The change is live in memory, but the role snapshot could not be
     /// persisted (or a rebuild still owns it). The caller must not report
     /// success: a lost `deleteclaim` would re-open the invite code.
@@ -534,6 +536,11 @@ impl super::Relay {
         let changed = {
             let mut archive = self.archive.write().await;
             if archived {
+                if !archive.contains(&target)
+                    && archive.len() >= crate::nips::nip_ia::MAX_ARCHIVED_IDENTITIES
+                {
+                    return Err("restricted: the archived-identity set is full".into());
+                }
                 archive.insert(target.clone())
             } else {
                 archive.remove(&target)
@@ -717,6 +724,9 @@ impl super::Relay {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
             return false;
         }
+        if id.is_empty() || id.len() > crate::nips::nip43::MAX_ROLE_BYTES {
+            return false;
+        }
         let relay_pubkey = self.relay_pubkey().unwrap_or_default();
         // Stamped with the monotonic clock so concurrent role changes
         // cannot collide on a timestamp (see `StampClock`).
@@ -732,14 +742,26 @@ impl super::Relay {
                     order,
                 },
                 |roles| {
+                    // The store silently ignores a create at its registry
+                    // cap; report the refusal instead of publishing a
+                    // definition-less role event as a success.
+                    if !roles.roles.contains_key(id)
+                        && roles.roles.len() >= crate::nips::nip43::MAX_ROLES
+                    {
+                        return (None, false);
+                    }
                     roles.create(id, label, description, color, order);
                     (
-                        roles.role_event(id, &relay_pubkey, self.stamp_floor(unix_now())),
+                        Some(roles.role_event(id, &relay_pubkey, self.stamp_floor(unix_now()))),
                         true,
                     )
                 },
             )
             .await;
+        let Some(event) = event else {
+            drop(buffer);
+            return false;
+        };
         // Debounced persistence (also on publish failure: memory changed,
         // so the snapshot must follow or a restart would lose it). A
         // skipped save is detected at startup through the state sequence.
@@ -1284,8 +1306,18 @@ impl super::Relay {
             return Err(ClaimRejection::Unavailable);
         }
         // A duplicate code is a no-op success; the snapshot is still
-        // written through below to confirm that it is durably present.
+        // written through below to confirm that it is durably present. A
+        // new code at the set cap is refused instead of silently dropped
+        // by `add_claim`.
         let mut buffer = self.roles_rebuild.buffer.lock().await;
+        let claims_full = {
+            let roles = self.roles.read().await;
+            roles.claims.len() >= crate::nips::nip43::MAX_CLAIMS && !roles.claims.contains(claim)
+        };
+        if claims_full {
+            drop(buffer);
+            return Err(ClaimRejection::Full);
+        }
         let _ = self
             .mutate_roles(
                 &mut buffer,

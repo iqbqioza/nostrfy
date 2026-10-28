@@ -1816,6 +1816,101 @@ fn rebuild_does_not_fail_when_the_ghost_set_exceeds_the_cap() {
 }
 
 #[test]
+fn group_role_bytes_are_bounded_on_intake() {
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1_600_000_000,
+        false,
+        false,
+    );
+    let oversized = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![
+            "p".into(),
+            USER.into(),
+            "x".repeat(MAX_ROLE_BYTES + 1),
+        ]],
+    );
+    assert!(
+        store
+            .validate_write(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("too long"),
+        "an oversized role label must not enter the generated roster"
+    );
+}
+
+#[test]
+fn child_ids_use_the_group_id_index_bound() {
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1_600_000_000,
+        false,
+        false,
+    );
+    let long_child = "a".repeat(129);
+    let edit = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), long_child]],
+    );
+    assert!(
+        store.validate_write(&edit).is_ok(),
+        "a child id longer than the old 128-byte limit must remain valid"
+    );
+    let too_long = "a".repeat(crate::db::store::TAG_INDEX_VALUE_MAX + 1);
+    let edit = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), too_long]],
+    );
+    assert!(
+        store
+            .validate_write(&edit)
+            .unwrap_err()
+            .to_string()
+            .contains("too long"),
+        "a child id beyond the group tag-index bound must be rejected"
+    );
+}
+
+#[test]
+fn group_member_roles_are_bounded_on_replay() {
+    let mut store = GroupStore::default();
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1_600_000_000,
+        false,
+        false,
+    );
+    let mut grant_tags = vec![vec!["p".into(), USER.into()]];
+    for i in 0..(MAX_ROLES_PER_MEMBER + 8) {
+        grant_tags.push(vec!["p".into(), USER.into(), format!("role-{i}")]);
+    }
+    store.apply(
+        &event(9000, ADMIN, Some("g1"), grant_tags),
+        "relay",
+        1_600_000_001,
+        false,
+        false,
+    );
+    assert!(
+        store.group("g1").unwrap().members[USER].len() <= MAX_ROLES_PER_MEMBER,
+        "a replayed member role list must stay bounded"
+    );
+}
+
+#[test]
 fn group_generation_ignores_a_role_only_stamp_advance() {
     // A role-state removal advances the shared removal stamp but not the
     // group-family sequence. New snapshots carry group_seq and must still
