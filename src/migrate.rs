@@ -1250,11 +1250,13 @@ async fn replay_stored_moderation(
     // migration deletes a legitimate pre-create setting/admin grant that
     // the first restart would have buffered and applied.
     const PENDING_STATE_MAX: usize = 50_000;
+    const PENDING_STATE_BYTES: usize = 64 * 1024 * 1024;
     let mut pending_state: std::collections::HashMap<String, Vec<Event>> =
         std::collections::HashMap::new();
     let mut pending_arrivals: std::collections::HashMap<String, u64> =
         std::collections::HashMap::new();
     let mut pending_state_count = 0usize;
+    let mut pending_state_bytes = 0usize;
     let mut since: Option<u64> = None;
     let mut page_refused = Vec::new();
     loop {
@@ -1339,12 +1341,18 @@ async fn replay_stored_moderation(
                 if event.kind == crate::nips::nip29::DELETE_GROUP {
                     continue;
                 }
-                if pending_state_count < PENDING_STATE_MAX {
+                let event_bytes = serde_json::to_vec(&event)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0);
+                if pending_state_count < PENDING_STATE_MAX
+                    && pending_state_bytes.saturating_add(event_bytes) <= PENDING_STATE_BYTES
+                {
                     if let Some(seq) = page_arrivals.get(&event.id) {
                         pending_arrivals.insert(event.id.clone(), *seq);
                     }
                     pending_state.entry(gid.clone()).or_default().push(event);
                     pending_state_count += 1;
+                    pending_state_bytes = pending_state_bytes.saturating_add(event_bytes);
                     continue;
                 }
                 // Bounded history exceeded: fall back to the pre-buffer
@@ -1401,7 +1409,19 @@ async fn replay_stored_moderation(
                 && let Some(mut buffered) = pending_state.remove(gid)
             {
                 pending_state_count = pending_state_count.saturating_sub(buffered.len());
+                let buffered_bytes: usize = buffered
+                    .iter()
+                    .map(|event| {
+                        serde_json::to_vec(event)
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                pending_state_bytes = pending_state_bytes.saturating_sub(buffered_bytes);
                 buffered.sort_by(|a, b| crate::nips::nip29::replay_order(a, b, &pending_arrivals));
+                for buffered_event in &buffered {
+                    pending_arrivals.remove(&buffered_event.id);
+                }
                 for buffered_event in buffered {
                     let authorized = replay_moderation(groups, &buffered_event, relay_pubkey);
                     if authorized

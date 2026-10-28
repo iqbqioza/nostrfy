@@ -169,8 +169,28 @@ host, because Buzz signs the relay URL it uploads to.
   edit. Startup and the periodic database-maintenance tick perform a bounded
   physical purge for TTL groups; the ascending scan advances past full pages
   that contain only group state/metadata, so older expired content is still
-  reclaimed. Read-time enforcement remains authoritative if a maintenance
-  scan is interrupted. NIP-40 `expiration` remains independent.
+  reclaimed. Before advancing, the scan re-reads the boundary second so a
+  same-second tie cut by the page limit is reclaimed as well; an oversized
+  boundary is deferred instead of skipped. Read-time enforcement remains
+  authoritative if a maintenance scan is interrupted. NIP-40 `expiration`
+  remains independent.
+- Relay-generated rosters and the derived group/role state are bounded:
+  NIP-29 keeps at most 16 role labels per member, 256 bytes per label,
+  4 KiB of labels per member and 256 distinct labels in a 39003; NIP-43
+  keeps at most 256 role definitions, 16 assignments per member, a 64-byte
+  role id, 10,000 relay members and 10,000 invite claims. Oversized intake
+  is rejected, and replay truncates legacy state before rebuilding mirrored
+  events. The NIP-IA archive set is capped at 10,000 identities and a
+  persisted set above that is trimmed at startup with a warning. The
+  NIP-29 startup and migration pending-state buffers are capped by both
+  count (50,000) and bytes (64 MiB). Child/parent ids use the same
+  tag-index bound as group ids rather than the older 128-byte limit, and
+  NIP-CL channel tags are validated even while Buzz is disabled so a later
+  enable cannot revive unchecked labels.
+- The NIP-98 replay guard, monotonic but drift-capped relay stamp clock, and
+  the `8000`/`8001` role-family classification cover the corresponding
+  NIP-43/LiveKit hardening paths; see the source comments for the exact
+  bounds.
 - NIP-CL's system-channel exclusion is applied to the HTTP bridge and to
   WebSocket REQ, COUNT, live delivery and NEG: a global filter does not
   receive a system channel's relay-signed state unless it names the channel

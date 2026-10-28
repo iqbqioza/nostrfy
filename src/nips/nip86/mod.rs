@@ -1398,6 +1398,9 @@ pub async fn rpc_handler(
                 Err(crate::relay::roles::ClaimRejection::Unavailable) => {
                     rpc_err("restricted: NIP-43 is disabled or the relay key is missing")
                 }
+                Err(crate::relay::roles::ClaimRejection::Full) => {
+                    rpc_err("restricted: the invite-code set is full")
+                }
                 Err(crate::relay::roles::ClaimRejection::NotDurable) => {
                     // The code change is live in memory even though the
                     // snapshot write failed; audit it like the access
@@ -1425,6 +1428,9 @@ pub async fn rpc_handler(
                 }
                 Err(crate::relay::roles::ClaimRejection::Unavailable) => {
                     rpc_err("restricted: NIP-43 is disabled or the relay key is missing")
+                }
+                Err(crate::relay::roles::ClaimRejection::Full) => {
+                    rpc_err("restricted: the invite-code set is full")
                 }
                 Err(crate::relay::roles::ClaimRejection::NotDurable) => {
                     // The revocation is live in memory even though the

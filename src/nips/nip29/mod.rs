@@ -95,8 +95,47 @@ pub(crate) const MAX_INVITES: usize = 100;
 /// relay-signed 39000/39003 events. The count caps alone still allow very
 /// large generated events if each value is attacker-sized.
 const MAX_INVITE_CODE_BYTES: usize = 256;
-const MAX_CHILD_ID_BYTES: usize = 128;
+const MAX_CHILD_ID_BYTES: usize = crate::db::store::TAG_INDEX_VALUE_MAX;
 const MAX_CHILD_BYTES: usize = 64 * 1024;
+
+/// Role labels attached to one group member and distinct labels in one
+/// group. The labels are mirrored into relay-signed 39001/39003 events on
+/// every membership change, so the free-form NIP-29 role model still needs
+/// a bound.
+pub(crate) const MAX_ROLES_PER_MEMBER: usize = 16;
+pub(crate) const MAX_GROUP_ROLES: usize = 256;
+/// Per-label and aggregate byte bounds for the role labels mirrored into
+/// 39001/39003. A count cap alone still allows 16 labels of event-sized
+/// text per member, and a generated event is republished on every change.
+pub(crate) const MAX_ROLE_BYTES: usize = 256;
+pub(crate) const MAX_ROLES_BYTES_PER_MEMBER: usize = 4 * 1024;
+pub(crate) const MAX_GROUP_ROLE_BYTES: usize = 64 * 1024;
+
+/// Sorts, de-duplicates and bounds the free-form role labels attached to a
+/// member. The same helper is used by replay and the relay-generated
+/// rosters so a legacy snapshot cannot bypass the intake bounds.
+pub(crate) fn bounded_member_roles<I>(roles: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut roles: Vec<String> = roles
+        .into_iter()
+        .filter(|role| !role.is_empty() && role.len() <= MAX_ROLE_BYTES)
+        .collect();
+    roles.sort();
+    roles.dedup();
+    let mut used = 0usize;
+    roles.retain(|role| {
+        let next = used.saturating_add(role.len());
+        if next > MAX_ROLES_BYTES_PER_MEMBER {
+            return false;
+        }
+        used = next;
+        true
+    });
+    roles.truncate(MAX_ROLES_PER_MEMBER);
+    roles
+}
 
 /// Maximum members per group. Without a bound an admin could spam `9000`
 /// events with fresh pubkeys, growing the member map (and every mirrored
@@ -1622,6 +1661,26 @@ impl GroupStore {
                 if group.members.len().saturating_add(fresh) > MAX_MEMBERS {
                     bail!("restricted: too many group members");
                 }
+                for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
+                    let unique: HashSet<&str> = tag[2..]
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|role| !role.is_empty())
+                        .collect();
+                    if unique.len() > MAX_ROLES_PER_MEMBER {
+                        bail!("restricted: too many roles for one group member");
+                    }
+                    let mut used = 0usize;
+                    for role in unique {
+                        if role.len() > MAX_ROLE_BYTES {
+                            bail!("restricted: a group role label is too long");
+                        }
+                        used = used.saturating_add(role.len());
+                        if used > MAX_ROLES_BYTES_PER_MEMBER {
+                            bail!("restricted: too many role bytes for one group member");
+                        }
+                    }
+                }
                 // The per-group cap does not bound the total across groups:
                 // the global budget does.
                 if self.at_member_capacity(fresh) {
@@ -2204,6 +2263,10 @@ impl GroupStore {
                             group.guests.remove(&pk);
                             group.bots.remove(&pk);
                         }
+                        // Bounded like validation: a legacy/replayed event
+                        // must not grow one member's mirrored role list
+                        // without limit.
+                        roles = bounded_member_roles(roles).into_iter().collect();
                         group.members.insert(pk, RoleSet::from(roles));
                     }
                     if event.tags.iter().any(|tag| {
@@ -3683,10 +3746,12 @@ impl GroupStore {
         // setting or admin grant. Bound the buffer so malformed history
         // cannot exhaust memory.
         const PENDING_STATE_MAX: usize = 50_000;
+        const PENDING_STATE_BYTES: usize = 64 * 1024 * 1024;
         let mut pending_state: HashMap<String, Vec<Event>> = HashMap::new();
         let mut pending_epochs: HashMap<String, String> = HashMap::new();
         let mut pending_arrivals: HashMap<String, u64> = HashMap::new();
         let mut pending_state_count = 0usize;
+        let mut pending_state_bytes = 0usize;
         let mut since: Option<u64> = None;
         loop {
             let mut filter: Filter =
@@ -3831,7 +3896,12 @@ impl GroupStore {
                     if event.kind == DELETE_GROUP {
                         continue;
                     }
-                    if pending_state_count < PENDING_STATE_MAX {
+                    let event_bytes = serde_json::to_vec(&event)
+                        .map(|bytes| bytes.len())
+                        .unwrap_or(0);
+                    if pending_state_count < PENDING_STATE_MAX
+                        && pending_state_bytes.saturating_add(event_bytes) <= PENDING_STATE_BYTES
+                    {
                         if let (Some(key), Some(expected)) = (&event_epoch, expected_epoch) {
                             pending_epochs.insert(key.clone(), expected.to_string());
                         }
@@ -3840,6 +3910,7 @@ impl GroupStore {
                         }
                         pending_state.entry(gid).or_default().push(event);
                         pending_state_count += 1;
+                        pending_state_bytes = pending_state_bytes.saturating_add(event_bytes);
                         continue;
                     }
                     // Bounded history exceeded: fall back to the previous
@@ -3870,6 +3941,15 @@ impl GroupStore {
                 {
                     buffered.sort_by(|a, b| replay_order(a, b, &pending_arrivals));
                     pending_state_count = pending_state_count.saturating_sub(buffered.len());
+                    let buffered_bytes: usize = buffered
+                        .iter()
+                        .map(|event| {
+                            serde_json::to_vec(event)
+                                .map(|bytes| bytes.len())
+                                .unwrap_or(0)
+                        })
+                        .sum();
+                    pending_state_bytes = pending_state_bytes.saturating_sub(buffered_bytes);
                     for buffered_event in buffered {
                         let expected = buffered_event
                             .id_bytes()
@@ -3883,6 +3963,10 @@ impl GroupStore {
                             true,
                             expected.as_deref(),
                         );
+                        // The arrival map is separate from the pending bucket;
+                        // retaining drained ids would make it grow across
+                        // repeated buffer-overflow cycles.
+                        pending_arrivals.remove(&buffered_event.id);
                     }
                 }
             }

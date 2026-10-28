@@ -464,8 +464,7 @@ pub(crate) fn build_admins_event(
                 // Sorted so the relay-generated event is deterministic
                 // across restarts (a HashSet iteration order would change
                 // the event id).
-                let mut roles: Vec<String> = roles.iter().cloned().collect();
-                roles.sort();
+                let roles = super::bounded_member_roles(roles.iter().cloned());
                 (pk.clone(), roles)
             })
             .collect();
@@ -585,8 +584,19 @@ pub(crate) fn build_roles_event(
             roles.extend(group.guests.iter().map(|_| "guest"));
             roles.extend(group.bots.iter().map(|_| "bot"));
         }
+        roles.retain(|role| role.len() <= super::MAX_ROLE_BYTES);
         roles.sort_unstable();
         roles.dedup();
+        let mut used = 0usize;
+        roles.retain(|role| {
+            let next = used.saturating_add(role.len());
+            if next > super::MAX_GROUP_ROLE_BYTES {
+                return false;
+            }
+            used = next;
+            true
+        });
+        roles.truncate(super::MAX_GROUP_ROLES);
         for role in roles {
             event.tags.push(vec!["role".to_string(), role.to_string()]);
         }

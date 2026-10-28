@@ -434,7 +434,6 @@ impl super::Relay {
         // group store applies them. A malformed label, channel type or
         // visibility rejects the whole event, as the NIP requires.
         if cfg.nip_enabled(29)
-            && cfg.relay.enabled_buzz
             && matches!(event.kind, nip29::CREATE_GROUP | 9002)
             && let Err(reason) = nip29::validate_channel_tags(event)
         {
