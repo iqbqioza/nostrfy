@@ -2152,6 +2152,7 @@ pub async fn run_server(
     ));
 
     restore_archive_state(&relay).await?;
+    relay.recover_command_journal().await?;
 
     // NIP-IA: NIP-IA-aware clients (Buzz) treat a missing archived-identities
     // snapshot as an uncheckable archive state. Publish the current

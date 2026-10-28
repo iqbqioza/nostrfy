@@ -274,6 +274,25 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(None);
             false
         }
+        Msg::CommandPendingAll { reply } => {
+            let out = match store.command_pending_all() {
+                Ok(entries) => Some(entries),
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::SaveCommandPending { reply, .. } => {
+            let _ = reply.send(None);
+            false
+        }
+        Msg::ClearCommandPending { reply, .. } => {
+            let _ = reply.send(false);
+            false
+        }
         Msg::LoadDmCarry { reply } => {
             let out = match store.load_dm_carry() {
                 Ok(data) => Some(data),
@@ -1594,6 +1613,40 @@ pub(crate) fn spawn(
                                         }
                                     };
                                     let _ = reply.send(recovered);
+                                }
+                                Msg::SaveCommandPending {
+                                    event_id,
+                                    data,
+                                    reply,
+                                } => {
+                                    let fresh = match store.save_command_pending(&event_id, &data) {
+                                        Ok(fresh) => Some(fresh),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(fresh);
+                                }
+                                Msg::ClearCommandPending { event_id, reply } => {
+                                    let cleared = match store.clear_command_pending(&event_id) {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(cleared);
+                                }
+                                Msg::CommandPendingAll { reply } => {
+                                    let out = match store.command_pending_all() {
+                                        Ok(entries) => Some(entries),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(out);
                                 }
                                 Msg::SaveDmCarry { data, reply } => {
                                     let saved = match store.save_dm_carry(&data) {

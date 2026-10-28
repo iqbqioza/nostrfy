@@ -204,6 +204,14 @@ impl super::Relay {
         if let Err(e) = self.validate_base(cfg, event, now, authed, verified) {
             return Precheck::Reject(e.to_string());
         }
+        // NIP-IA archive/unarchive requests mutate relay state. Validate
+        // them before the put so a malformed/unauthorized request is never
+        // stored and broadcast as an inert command.
+        if matches!(event.kind, 9035 | 9036)
+            && let Err(reason) = self.validate_identity_archive(event).await
+        {
+            return Precheck::Reject(reason);
+        }
         // NIP-43: charge the configured publish rate for every verified join
         // attempt *before* the vanish lookup and the invite-code comparison.
         // The admit branch returns early (it never reaches the shared rate
@@ -2184,6 +2192,44 @@ mod tests {
         assert!(
             matches!(out, super::Precheck::Reject(ref message) if message.contains("relay-signed")),
             "client-signed 13535 must be rejected: {out:?}"
+        );
+        drop(cfg);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn malformed_archive_request_is_rejected_before_storage() {
+        let relay = build_validate_relay("nostrfy-nip-ia-intake-test").await;
+        let cfg = relay.config.read().await;
+        let access = AccessControl::default();
+        let now = unix_now();
+        let target = "aa".repeat(32);
+        // Missing the NIP-70 `-` tag.
+        let missing_protection = signed_with_seed(7, 9035, vec![vec!["p".into(), target.clone()]]);
+        let out = relay
+            .precheck(&cfg, &access, &missing_protection, now, &[], None, None)
+            .await;
+        assert!(
+            matches!(out, super::Precheck::Reject(ref message) if message.contains("NIP-70")),
+            "a malformed archive request must be rejected at intake: {out:?}"
+        );
+        // Wrong target arity.
+        let wrong_target = signed_with_seed(
+            7,
+            9036,
+            vec![
+                vec!["-".into()],
+                vec!["p".into(), target.clone()],
+                vec!["p".into(), "bb".repeat(32)],
+            ],
+        );
+        let authed = [wrong_target.pubkey.clone()];
+        let out = relay
+            .precheck(&cfg, &access, &wrong_target, now, &authed, None, None)
+            .await;
+        assert!(
+            matches!(out, super::Precheck::Reject(ref message) if message.contains("one hex pubkey")),
+            "a multi-target archive request must be rejected at intake: {out:?}"
         );
         drop(cfg);
         relay.db.shutdown();

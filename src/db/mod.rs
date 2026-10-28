@@ -542,6 +542,18 @@ enum Msg {
     RecoverGroupApplyPending {
         reply: oneshot::Sender<Option<usize>>,
     },
+    SaveCommandPending {
+        event_id: Vec<u8>,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Option<bool>>,
+    },
+    ClearCommandPending {
+        event_id: Vec<u8>,
+        reply: oneshot::Sender<bool>,
+    },
+    CommandPendingAll {
+        reply: oneshot::Sender<Option<Vec<Vec<u8>>>>,
+    },
     /// Persist the NIP-IA archived-identities set.
     SaveIdentityArchive {
         data: Vec<u8>,
@@ -1159,6 +1171,9 @@ fn msg_bytes(msg: &Msg) -> usize {
         | Msg::MarkGroupApplyPending { event_id, .. }
         | Msg::ClearGroupApplyPending { event_id, .. } => event_id.len(),
         Msg::GroupApplyPending { event_ids, .. } => event_ids.iter().map(Vec::len).sum(),
+        Msg::SaveCommandPending { event_id, data, .. } => event_id.len() + data.len(),
+        Msg::ClearCommandPending { event_id, .. } => event_id.len(),
+        Msg::CommandPendingAll { .. } => 0,
         Msg::SaveRoleRebuildPending { data, .. }
         | Msg::SaveIdentityArchive { data, .. }
         | Msg::SaveDmCarry { data, .. } => data.len(),
@@ -2267,6 +2282,33 @@ impl DbClient {
     /// startup rebuild. `None` is a failed write and must abort startup.
     pub async fn recover_group_apply_pending(&self) -> Option<usize> {
         self.request_write_checked(|reply| Msg::RecoverGroupApplyPending { reply })
+            .await
+            .flatten()
+    }
+
+    /// Persists a command event's side effect as pending. The startup replay
+    /// applies it only when the event itself is still stored.
+    pub async fn save_command_pending(&self, event_id: [u8; 32], data: Vec<u8>) -> Option<bool> {
+        self.request_write_checked(|reply| Msg::SaveCommandPending {
+            event_id: event_id.to_vec(),
+            data,
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
+    pub async fn clear_command_pending(&self, event_id: [u8; 32]) -> bool {
+        self.request_write_checked(|reply| Msg::ClearCommandPending {
+            event_id: event_id.to_vec(),
+            reply,
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    pub async fn command_pending_all(&self) -> Option<Vec<Vec<u8>>> {
+        self.request_read_startup(|reply| Msg::CommandPendingAll { reply })
             .await
             .flatten()
     }

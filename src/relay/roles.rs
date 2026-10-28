@@ -297,7 +297,11 @@ impl super::Relay {
     /// Applies a NIP-IA archive/unarchive request. The request event is
     /// stored by the caller after this succeeds. Supported policy paths are
     /// self and relay-admin; the NIP-OA owner-of-agent path is not enabled.
-    pub(crate) async fn apply_identity_archive(
+    /// Pure pre-store validation for a NIP-IA archive/unarchive request.
+    /// The apply path repeats it after the put (the authorization profile
+    /// can change in between); this copy lets the accept path reject a
+    /// malformed request before it is stored/broadcast.
+    pub(crate) async fn validate_identity_archive(
         &self,
         event: &crate::event::Event,
     ) -> Result<(), String> {
@@ -305,6 +309,120 @@ impl super::Relay {
             return Err("invalid: not a NIP-IA request".into());
         }
         if event.created_at.abs_diff(unix_now()) > 120 {
+            return Err("restricted: archive request is outside the freshness window".into());
+        }
+        if event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() == 1 && tag[0] == "-")
+            .count()
+            != 1
+        {
+            return Err("invalid: archive request requires exactly one NIP-70 - tag".into());
+        }
+        let mut targets = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "p")
+            .map(|tag| tag[1].to_ascii_lowercase());
+        let Some(target) = targets.next() else {
+            return Err("invalid: archive request requires one p tag".into());
+        };
+        if targets.next().is_some()
+            || target.len() != 64
+            || !target.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid: archive request target must be one hex pubkey".into());
+        }
+        if let Some(replaced_by) = event
+            .tags
+            .iter()
+            .filter(|tag| tag.len() >= 2 && tag[0] == "replaced-by")
+            .map(|tag| tag[1].to_ascii_lowercase())
+            .next()
+            && (replaced_by.len() != 64
+                || !replaced_by.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || replaced_by == target)
+        {
+            return Err("invalid: replaced-by must be a different hex pubkey".into());
+        }
+        let self_request = event.pubkey.eq_ignore_ascii_case(&target);
+        let admin = self.is_relay_owner_or_admin(&event.pubkey).await;
+        let mut owner = if !self_request && !admin {
+            crate::nips::nip_ia::verify_owner_agent_request(event, &target)
+        } else {
+            None
+        };
+        if !self_request && !admin && owner.is_none() {
+            let filter = crate::filter::Filter {
+                kinds: Some(vec![0]),
+                authors: Some(vec![target.clone()]),
+                limit: Some(1),
+                ..crate::filter::Filter::default()
+            };
+            let Some((profiles, _)) = self
+                .db
+                .query_full_startup(vec![filter], 1, unix_now(), false)
+                .await
+            else {
+                return Err("error: database unavailable".into());
+            };
+            if let Some(profile) = profiles
+                .iter()
+                .find(|profile| profile.pubkey.eq_ignore_ascii_case(&target))
+                && let Some(owner_pubkey) =
+                    crate::nips::nip_ia::verify_owner_agent_profile(profile, &target, &event.pubkey)
+            {
+                owner = Some(owner_pubkey);
+            }
+        }
+        if !self_request && !admin && owner.is_none() {
+            return Err(
+                "restricted: only the target, a relay admin or a proven agent owner may archive \
+                 this identity"
+                    .into(),
+            );
+        }
+        if event.kind == 9036
+            && self
+                .access
+                .read()
+                .await
+                .blocked_pubkeys
+                .iter()
+                .any(|(blocked, _)| blocked.eq_ignore_ascii_case(&target))
+        {
+            return Err("restricted: an access-control ban cannot be self-unarchived".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn apply_identity_archive(
+        &self,
+        event: &crate::event::Event,
+    ) -> Result<(), String> {
+        self.apply_identity_archive_inner(event, true).await
+    }
+
+    /// Replays a journaled archive command after a crash. The request was
+    /// accepted when it was stored, so the fresh-request window no longer
+    /// applies; all authorization and tag checks still run.
+    pub(crate) async fn apply_identity_archive_replayed(
+        &self,
+        event: &crate::event::Event,
+    ) -> Result<(), String> {
+        self.apply_identity_archive_inner(event, false).await
+    }
+
+    async fn apply_identity_archive_inner(
+        &self,
+        event: &crate::event::Event,
+        require_freshness: bool,
+    ) -> Result<(), String> {
+        if !matches!(event.kind, 9035 | 9036) {
+            return Err("invalid: not a NIP-IA request".into());
+        }
+        if require_freshness && event.created_at.abs_diff(unix_now()) > 120 {
             return Err("restricted: archive request is outside the freshness window".into());
         }
         if event
