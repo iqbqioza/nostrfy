@@ -661,6 +661,11 @@ const GROUPS_REBUILD_BUFFER_MAX: usize = 4096;
 /// scan through the dirty flag.
 const ROLES_REBUILD_MIN_INTERVAL_SECS: u64 = 2;
 
+/// Retry delay after a failed role rebuild scan. The live store stays
+/// fail-closed; without a retry it would remain empty until an unrelated
+/// removal or a restart.
+const ROLES_REBUILD_RETRY_SECS: u64 = 5;
+
 /// A group event accepted while a rebuild scan was in flight, replayed onto
 /// the fresh store once the scan completes.
 struct BufferedGroupEvent {
@@ -736,6 +741,11 @@ impl Drop for DerivedMutationGuard<'_> {
     fn drop(&mut self) {
         self.epoch.finished.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+/// Stored commands whose side effect has a startup-replayable journal.
+fn is_durable_command(kind: u64) -> bool {
+    matches!(kind, 9030..=9033 | 9035 | 9036)
 }
 
 /// Result of the post-commit side effects (see [`Relay::after_put`]).
@@ -988,6 +998,20 @@ async fn read_role_generation(db: &DbClient) -> Option<(u64, u64)> {
 /// the rebuild is dirty). Mirrors [`GROUPS_REBUILD_BUFFER_MAX`].
 const ROLES_REBUILD_BUFFER_MAX: usize = 4096;
 
+/// The durable shutdown journal. `seq` is the role-family generation at
+/// capture; a journal older than the restored/current role sequence must not
+/// overwrite later state. Legacy journals were a bare mutation array and
+/// deserialize without a generation (then retain the old apply behavior).
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct RoleRebuildJournal {
+    #[serde(default)]
+    stamp: Option<u64>,
+    #[serde(default)]
+    seq: Option<u64>,
+    #[serde(default)]
+    mutations: Vec<BufferedRoleMutation>,
+}
+
 /// A role mutation accepted while a rebuild is pending or in flight,
 /// replayed onto the fresh store once the scan completes. The high-level
 /// action (not the published event) is buffered, so a mutation is replayed
@@ -1096,6 +1120,23 @@ struct RolesRebuildBuffer {
     /// The buffer is full: the worker must discard the fresh store and
     /// rebuild later instead of applying a partial set.
     overflow: bool,
+}
+
+/// Encodes the bounded role journal together with the role-family
+/// generation it was captured at. A failed generation read stores `None`
+/// (legacy behavior) rather than inventing a generation.
+async fn encode_role_rebuild_journal(
+    db: &DbClient,
+    mutations: &[BufferedRoleMutation],
+) -> Option<Vec<u8>> {
+    let stamp = db.state_stamp().await;
+    let seq = db.state_seq_role().await;
+    serde_json::to_vec(&RoleRebuildJournal {
+        stamp,
+        seq,
+        mutations: mutations.to_vec(),
+    })
+    .ok()
 }
 
 /// Records a fire-and-forget pubkey removal (NIP-43 leave, vanish, failed
@@ -1284,31 +1325,28 @@ impl RolesRebuild {
         // replay it after the event rebuild; an empty journal is left
         // untouched (a previous crash may still own it).
         if !buffer.mutations.is_empty() {
-            match serde_json::to_vec(&buffer.mutations) {
-                Ok(data) => {
-                    // A transient writer backlog must not drop the captured
-                    // leaves on shutdown. Retry a few times before falling
-                    // back to the (already warned) in-memory-only state.
-                    let mut saved = false;
-                    for attempt in 0..3 {
-                        if db.save_role_rebuild_pending(data.clone()).await {
-                            saved = true;
-                            break;
-                        }
-                        if attempt < 2 {
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        }
+            if let Some(data) = encode_role_rebuild_journal(db, &buffer.mutations).await {
+                // A transient writer backlog must not drop the captured
+                // leaves on shutdown. Retry a few times before falling
+                // back to the (already warned) in-memory-only state.
+                let mut saved = false;
+                for attempt in 0..3 {
+                    if db.save_role_rebuild_pending(data.clone()).await {
+                        saved = true;
+                        break;
                     }
-                    if !saved {
-                        log::warn!(
-                            "could not persist the role rebuild mutation journal after retries; \
-                             captured mutations may be lost on shutdown"
-                        );
+                    if attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                 }
-                Err(error) => {
-                    log::warn!("could not serialize the role rebuild mutation journal: {error}")
+                if !saved {
+                    log::warn!(
+                        "could not persist the role rebuild mutation journal after retries; \
+                         captured mutations may be lost on shutdown"
+                    );
                 }
+            } else {
+                log::warn!("could not serialize the role rebuild mutation journal")
             }
         }
         // A dropped leave (buffered while the live store was revoked, never
@@ -1637,9 +1675,40 @@ async fn roles_rebuild_worker(
             state.retain_buffering().await;
             log::error!(
                 "role state rebuild failed; keeping the live role store empty (fail-closed) \
-                 and retaining captured mutations for the next role-state removal"
+                 and retrying with backoff"
             );
             state.running.store(false, Ordering::SeqCst);
+            // A failed scan would otherwise leave the fail-closed empty
+            // store forever: only another role-state removal or a restart
+            // would schedule another attempt. Retry on a timer; the dirty
+            // flag makes a concurrent mark coalesce with this attempt.
+            let retry_db = db.clone();
+            let retry_roles = Arc::clone(&roles);
+            let retry_key = relay_pubkey.clone();
+            let retry_persist = Arc::clone(&persist_lock);
+            let retry_state = Arc::clone(&state);
+            let retry_publisher = publisher.clone();
+            let mut retry_drain = drain.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(
+                        ROLES_REBUILD_RETRY_SECS,
+                    )) => {}
+                    _ = retry_drain.changed() => return,
+                }
+                if *retry_drain.borrow() {
+                    return;
+                }
+                schedule_roles_rebuild(
+                    retry_db,
+                    retry_roles,
+                    retry_key,
+                    retry_persist,
+                    retry_state,
+                    retry_publisher,
+                    retry_drain,
+                );
+            });
             return;
         }
         if state.dirty.load(Ordering::SeqCst) {
@@ -3800,6 +3869,36 @@ impl Relay {
         } else {
             None
         };
+        // Durable command intent: written before the put so a crash after
+        // the command becomes visible can replay it on startup. The startup
+        // replay checks that the command event is still stored, so a crash
+        // between this marker and the put cannot execute an unaccepted
+        // command.
+        let command_pending = if is_durable_command(event.kind) {
+            if let Some(id) = event.id_bytes() {
+                let Ok(data) = serde_json::to_vec(&*event) else {
+                    self.publish_rate_rollback(&event.pubkey, now);
+                    return PutOutcome::Invalid(
+                        "error: command could not be journaled; retry".into(),
+                    );
+                };
+                match self.db.save_command_pending(id, data).await {
+                    Some(fresh) => Some(fresh),
+                    None => {
+                        self.publish_rate_rollback(&event.pubkey, now);
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        return PutOutcome::Invalid(
+                            "error: database unavailable: command journal was not written; retry"
+                                .into(),
+                        );
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let outcome = self
             .db
             .put_with_first_seen(Arc::clone(&event), now, first_seen)
@@ -3817,6 +3916,11 @@ impl Relay {
                 && let Some(id) = event.id_bytes()
             {
                 let _ = self.db.clear_group_apply_pending(id).await;
+            }
+            if command_pending == Some(true)
+                && let Some(id) = event.id_bytes()
+            {
+                let _ = self.db.clear_command_pending(id).await;
             }
         } else if nip29::is_group_action(&event)
             && let Some(event_id) = event.id_bytes()
@@ -4484,6 +4588,41 @@ impl Relay {
         false
     }
 
+    /// Clears the durable command journal entry after its side effect was
+    /// applied. A failed clear is harmless: the command is idempotent and a
+    /// startup replay will confirm it or remove an already-rejected event.
+    async fn clear_command_pending(&self, event: &Event) -> bool {
+        let Some(id) = event.id_bytes() else {
+            return true;
+        };
+        for attempt in 0..3 {
+            if self.db.clear_command_pending(id).await {
+                return true;
+            }
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        false
+    }
+
+    /// Handles a stored command whose side effect failed. Remove the command
+    /// event (so a client retry is actionable) and its journal entry; if the
+    /// removal itself fails, keep both for startup replay and report a
+    /// retryable failure.
+    async fn reject_stored_command(&self, event: &Event, reason: &str) -> RemovalAck {
+        let Some(id) = event.id_bytes() else {
+            return RemovalAck::Rejected(format!("error: command failed: {reason}; retry"));
+        };
+        match self.db.remove_events_by_id(&[id]).await {
+            Some(_) => {
+                let _ = self.db.clear_command_pending(id).await;
+                RemovalAck::Rejected(format!("error: command failed: {reason}; retry"))
+            }
+            None => RemovalAck::NotApplied,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn after_put(
         &self,
@@ -4644,36 +4783,49 @@ impl Relay {
             // Apply the role mutation only after the command event stored
             // (or was accepted as an ephemeral event). Applying before the
             // put let a captured, already-stored command be replayed after a
-            // later demotion/removal and mutate the roster again. The command
-            // is idempotent; a failed publish/persist is logged rather than
-            // pretending the stored command never happened.
+            // later demotion/removal and mutate the roster again. A failure
+            // removes the event and returns a retryable rejection; otherwise
+            // a re-send would be a duplicate with no way to re-run it.
             if let Err(reason) = self.apply_relay_member_command(&event).await {
                 log::warn!(
-                    "stored relay member command {} but could not apply it: {reason}",
+                    "stored relay member command {} could not be applied: {reason}",
                     event.id
                 );
+                return self.reject_stored_command(&event, &reason).await;
             }
+            let _ = self.clear_command_pending(&event).await;
         }
-        if event.kind == 9033
-            && let Some(icon) = event
+        if event.kind == 9033 {
+            let applied = if let Some(icon) = event
                 .tags
                 .iter()
                 .find(|tag| tag.len() >= 2 && tag[0] == "icon")
                 .map(|tag| tag[1].as_str())
-            && !self.apply_workspace_icon(icon).await
-        {
-            log::warn!(
-                "stored workspace icon command {} but could not persist the icon",
-                event.id
-            );
+            {
+                self.apply_workspace_icon(icon).await
+            } else {
+                false
+            };
+            if !applied {
+                log::warn!(
+                    "stored workspace icon command {} could not persist the icon",
+                    event.id
+                );
+                return self
+                    .reject_stored_command(&event, "workspace icon was not persisted")
+                    .await;
+            }
+            let _ = self.clear_command_pending(&event).await;
         }
-        if matches!(event.kind, 9035 | 9036)
-            && let Err(reason) = self.apply_identity_archive(&event).await
-        {
-            log::warn!(
-                "stored identity archive command {} but could not apply it: {reason}",
-                event.id
-            );
+        if matches!(event.kind, 9035 | 9036) {
+            if let Err(reason) = self.apply_identity_archive(&event).await {
+                log::warn!(
+                    "stored identity archive command {} could not be applied: {reason}",
+                    event.id
+                );
+                return self.reject_stored_command(&event, &reason).await;
+            }
+            let _ = self.clear_command_pending(&event).await;
         }
         if nip29_enabled && nip29::is_group_action(&event) {
             let (removed, group_unapplied, group_rejection) = self
@@ -5132,6 +5284,84 @@ impl Relay {
         all_stored
     }
 
+    /// Replays durable command side effects left by a crash. The journal is
+    /// written before the command put and cleared after the side effect; an
+    /// entry whose command event is no longer stored is discarded (the put
+    /// may never have happened, or the event was rejected/removed).
+    pub(crate) async fn recover_command_journal(&self) -> anyhow::Result<()> {
+        let Some(entries) = self.db.command_pending_all().await else {
+            return Err(anyhow::anyhow!(
+                "cannot read the durable command journal; refusing to start"
+            ));
+        };
+        let mut events = Vec::with_capacity(entries.len());
+        for data in entries {
+            match serde_json::from_slice::<crate::event::Event>(&data) {
+                Ok(event) => events.push(event),
+                Err(error) => log::warn!("ignoring an invalid durable command entry: {error}"),
+            }
+        }
+        events.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        for event in events {
+            let Some(id) = event.id_bytes() else {
+                log::warn!("durable command journal entry has an invalid event id");
+                continue;
+            };
+            let filter = crate::filter::Filter {
+                ids: Some(vec![event.id.clone()]),
+                limit: Some(1),
+                ..crate::filter::Filter::default()
+            };
+            let exists = match self
+                .db
+                .query_full_startup(vec![filter], 1, unix_now(), false)
+                .await
+            {
+                Some((stored, _)) => !stored.is_empty(),
+                None => {
+                    log::warn!(
+                        "cannot verify durable command {}; keeping it for the next startup",
+                        event.id
+                    );
+                    continue;
+                }
+            };
+            if !exists {
+                let _ = self.db.clear_command_pending(id).await;
+                continue;
+            }
+            let applied = match event.kind {
+                9030..=9032 => self.apply_relay_member_command(&event).await.is_ok(),
+                9033 => {
+                    let icon = event
+                        .tags
+                        .iter()
+                        .find(|tag| tag.len() >= 2 && tag[0] == "icon")
+                        .map(|tag| tag[1].as_str());
+                    match icon {
+                        Some(icon) => self.apply_workspace_icon(icon).await,
+                        None => false,
+                    }
+                }
+                9035 | 9036 => self.apply_identity_archive_replayed(&event).await.is_ok(),
+                _ => true,
+            };
+            if applied {
+                let _ = self.db.clear_command_pending(id).await;
+            } else {
+                log::warn!(
+                    "durable command {} could not be replayed; keeping its journal entry",
+                    event.id
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Replays the bounded role-rebuild journal persisted at shutdown.
     /// Returns whether a journal existed; the caller persists the store and
     /// clears the journal only after that succeeds.
@@ -5145,8 +5375,38 @@ impl Relay {
         let Some(data) = data else {
             return Ok(false);
         };
-        let mutations: Vec<BufferedRoleMutation> = serde_json::from_slice(&data)
-            .map_err(|error| anyhow::anyhow!("invalid role rebuild mutation journal: {error}"))?;
+        // New journals carry the role-family sequence at capture. A journal
+        // older than the restored/current role sequence is stale (a later
+        // role-state event or snapshot superseded it) and must not replay
+        // old leaves/removals. Legacy bare-vector journals have no
+        // generation and keep their previous behavior.
+        let (journal_stamp, journal_seq, mutations) =
+            match serde_json::from_slice::<RoleRebuildJournal>(&data) {
+                Ok(journal) => (journal.stamp, journal.seq, journal.mutations),
+                Err(_) => {
+                    let mutations: Vec<BufferedRoleMutation> = serde_json::from_slice(&data)
+                        .map_err(|error| {
+                            anyhow::anyhow!("invalid role rebuild mutation journal: {error}")
+                        })?;
+                    (None, None, mutations)
+                }
+            };
+        let current_stamp = self.db.state_stamp().await;
+        let current_seq = self.db.state_seq_role().await;
+        if journal_stamp.is_some_and(|stamp| current_stamp.is_some_and(|current| current > stamp))
+            || journal_seq.is_some_and(|seq| current_seq.is_some_and(|current| current > seq))
+        {
+            log::warn!(
+                "discarding a stale role rebuild journal (captured at stamp {:?}/seq {:?}, \
+                 current {:?}/{:?})",
+                journal_stamp,
+                journal_seq,
+                current_stamp,
+                current_seq
+            );
+            self.clear_role_rebuild_journal().await;
+            return Ok(false);
+        }
         let mut roles = self.roles.write().await;
         for mutation in &mutations {
             if !replay_role_mutation(&mut roles, mutation) {
@@ -6105,7 +6365,7 @@ impl Relay {
         if buffer.mutations.is_empty() {
             return;
         }
-        let Ok(data) = serde_json::to_vec(&buffer.mutations) else {
+        let Some(data) = encode_role_rebuild_journal(&self.db, &buffer.mutations).await else {
             log::warn!("could not serialize the role rebuild mutation journal at shutdown");
             return;
         };
@@ -7477,6 +7737,7 @@ mod tests {
     use super::ROLES_REBUILD_BUFFER_MAX;
     use super::Relay;
     use super::RemovalAck;
+    use super::RoleRebuildJournal;
     use super::StampClock;
     use super::enqueue_live_batch;
     use super::roles::RoleChange;
@@ -8343,6 +8604,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_role_rebuild_journal_is_not_replayed() {
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        let member = "aa".repeat(32);
+        assert!(relay.create_role("king", "King", "", "", None).await);
+        assert_eq!(
+            relay.assign_role(&member, "king").await,
+            RoleChange::Applied
+        );
+        let journal = RoleRebuildJournal {
+            stamp: Some(0),
+            seq: Some(0),
+            mutations: vec![BufferedRoleMutation::RemovePubkey {
+                pubkey: member.clone(),
+            }],
+        };
+        assert!(
+            relay
+                .db
+                .save_role_rebuild_pending(serde_json::to_vec(&journal).unwrap())
+                .await
+        );
+        assert!(
+            !relay.apply_role_rebuild_journal().await.unwrap(),
+            "a journal older than the role sequence must be discarded"
+        );
+        assert!(
+            relay.roles.read().await.is_member_of(&member),
+            "the stale journal must not undo a later assignment"
+        );
+        assert_eq!(
+            relay.db.load_role_rebuild_pending().await,
+            Some(None),
+            "the stale journal must be cleared"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn shutdown_flushes_buffered_role_mutations() {
         let relay = build_role_relay(Some(&"01".repeat(32))).await;
         let member = "aa".repeat(32);
@@ -8359,8 +8658,12 @@ mod tests {
             .await
             .expect("journal read")
             .expect("journal must be persisted");
-        let journal: Vec<BufferedRoleMutation> = serde_json::from_slice(&data).unwrap();
-        assert!(journal.iter().any(|mutation| matches!(
+        let journal: RoleRebuildJournal = serde_json::from_slice(&data).unwrap();
+        assert!(
+            journal.seq.is_some() && journal.stamp.is_some(),
+            "the shutdown journal must carry its role generation"
+        );
+        assert!(journal.mutations.iter().any(|mutation| matches!(
             mutation,
             BufferedRoleMutation::RemovePubkey { pubkey } if pubkey == &member
         )));
@@ -8576,6 +8879,99 @@ mod tests {
                 .tags
                 .iter()
                 .any(|tag| { tag.len() == 2 && tag[0] == "p" && tag[1] == target })
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn command_journal_replays_a_stored_archive_after_a_crash() {
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let target = "aa".repeat(32);
+        let mut request = crate::event::Event {
+            id: String::new(),
+            pubkey: target.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 9035,
+            tags: vec![vec!["-".into()], vec!["p".into(), target.clone()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        request.id = crate::nips::nip01::compute_id(&request);
+        let id = request.id_bytes().expect("id");
+        assert_eq!(
+            relay.db.put(request.clone(), crate::util::unix_now()).await,
+            crate::db::PutOutcome::Stored
+        );
+        assert_eq!(
+            relay
+                .db
+                .save_command_pending(id, serde_json::to_vec(&request).unwrap())
+                .await,
+            Some(true)
+        );
+        relay
+            .recover_command_journal()
+            .await
+            .expect("journal replay must run");
+        assert!(
+            relay.archive.read().await.contains(&target),
+            "the stored archive command must be replayed"
+        );
+        assert!(
+            relay
+                .db
+                .command_pending_all()
+                .await
+                .expect("journal read")
+                .is_empty(),
+            "a successfully replayed command must clear its journal"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn command_journal_does_not_execute_an_unstored_command() {
+        // The intent marker is written before the put. A crash in that gap
+        // must not archive anything: replay requires the command event to
+        // still be stored.
+        let relay = build_relay_with_key(false, &"01".repeat(32)).await;
+        let target = "bb".repeat(32);
+        let mut request = crate::event::Event {
+            id: String::new(),
+            pubkey: target.clone(),
+            created_at: crate::util::unix_now(),
+            kind: 9035,
+            tags: vec![vec!["-".into()], vec!["p".into(), target.clone()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        request.id = crate::nips::nip01::compute_id(&request);
+        assert_eq!(
+            relay
+                .db
+                .save_command_pending(
+                    request.id_bytes().unwrap(),
+                    serde_json::to_vec(&request).unwrap()
+                )
+                .await,
+            Some(true)
+        );
+        relay
+            .recover_command_journal()
+            .await
+            .expect("journal recovery must run");
+        assert!(
+            !relay.archive.read().await.contains(&target),
+            "an unstored command must never execute"
+        );
+        assert!(
+            relay
+                .db
+                .command_pending_all()
+                .await
+                .expect("journal read")
+                .is_empty(),
+            "the orphan marker must be cleared"
         );
         relay.db.shutdown();
     }

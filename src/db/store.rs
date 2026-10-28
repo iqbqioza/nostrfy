@@ -244,6 +244,10 @@ pub(crate) const STATE_SEQ_ROLE_KEY: &[u8] = b"state_seq_role";
 /// removes any marked event, so a crash between the put and the apply cannot
 /// make a rejected grant/join reappear on the next rebuild.
 const GROUP_APPLY_PENDING_PREFIX: &[u8] = b"group_apply_pending:";
+/// [`INDEX_META`] prefix for a stored command event whose side effect has
+/// not been confirmed. Startup replays these only when the command event is
+/// still stored; a crash before the put therefore cannot execute it.
+const COMMAND_PENDING_PREFIX: &[u8] = b"command_pending:";
 
 /// Which derived store a state-relevant `kind` feeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2370,6 +2374,13 @@ fn group_apply_pending_key(event_id: &[u8]) -> Vec<u8> {
     key
 }
 
+fn command_pending_key(event_id: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(COMMAND_PENDING_PREFIX.len() + event_id.len());
+    key.extend_from_slice(COMMAND_PENDING_PREFIX);
+    key.extend_from_slice(event_id);
+    key
+}
+
 pub(crate) fn created_key(created: u64, id: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(CREATED_LEN + ID_LEN);
     key.extend_from_slice(&created.to_be_bytes());
@@ -3221,6 +3232,44 @@ impl Store {
         }
         wtxn.commit()?;
         Ok(ids.len())
+    }
+
+    /// Stores the command event JSON as a durable pending side effect.
+    /// Returns whether the entry was newly created.
+    pub(crate) fn save_command_pending(&self, event_id: &[u8], data: &[u8]) -> Result<bool> {
+        if event_id.len() != ID_LEN {
+            return Err(anyhow::anyhow!("invalid command journal event id"));
+        }
+        self.disk_full_error()?;
+        let mut wtxn = self.env.write_txn()?;
+        let key = command_pending_key(event_id);
+        let fresh = self.index_meta.get(&wtxn, &key)?.is_none();
+        self.index_meta.put(&mut wtxn, &key, data)?;
+        wtxn.commit()?;
+        Ok(fresh)
+    }
+
+    pub(crate) fn clear_command_pending(&self, event_id: &[u8]) -> Result<()> {
+        if event_id.len() != ID_LEN {
+            return Err(anyhow::anyhow!("invalid command journal event id"));
+        }
+        let mut wtxn = self.env.write_txn()?;
+        let key = command_pending_key(event_id);
+        self.index_meta.delete(&mut wtxn, &key)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Loads every pending command entry. The startup replay checks that the
+    /// event itself is still stored before applying it.
+    pub(crate) fn command_pending_all(&self) -> Result<Vec<Vec<u8>>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for item in self.index_meta.prefix_iter(&rtxn, COMMAND_PENDING_PREFIX)? {
+            let (_, value) = item?;
+            out.push(value.to_vec());
+        }
+        Ok(out)
     }
 
     pub(crate) fn event_arrivals(

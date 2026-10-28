@@ -3972,6 +3972,40 @@ fn group_apply_pending_marker_recovers_the_unconfirmed_event() {
 }
 
 #[test]
+fn command_pending_journal_round_trips() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .expect("database must open");
+        let id = [9u8; 32];
+        assert_eq!(
+            db.save_command_pending(id, b"{\"kind\":9035}".to_vec())
+                .await,
+            Some(true)
+        );
+        assert_eq!(
+            db.save_command_pending(id, b"updated".to_vec()).await,
+            Some(false)
+        );
+        assert_eq!(
+            db.command_pending_all().await,
+            Some(vec![b"updated".to_vec()])
+        );
+        assert!(db.clear_command_pending(id).await);
+        assert_eq!(db.command_pending_all().await, Some(Vec::new()));
+        db.shutdown();
+    });
+}
+
+#[test]
 fn group_epoch_index_round_trips_additively() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
