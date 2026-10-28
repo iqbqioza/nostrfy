@@ -8675,6 +8675,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vanished_pubkeys_cannot_gain_a_role() {
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        let owner = "aa".repeat(32);
+        let target = "bb".repeat(32);
+        relay.config.write().await.relay.pubkey = owner.clone();
+        assert!(
+            relay
+                .db
+                .apply_vanish_checked([0xbb; 32], crate::util::unix_now())
+                .await
+                .is_some()
+        );
+        let command = crate::event::Event {
+            id: String::new(),
+            pubkey: owner,
+            created_at: crate::util::unix_now(),
+            kind: 9030,
+            tags: vec![
+                vec!["p".into(), target.clone()],
+                vec!["role".into(), "admin".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        let err = relay
+            .validate_relay_member_command(&command)
+            .await
+            .expect_err("a vanished target must be refused");
+        assert!(err.contains("vanished"), "unexpected error: {err}");
+        assert_eq!(
+            relay.assign_role(&target, "admin").await,
+            RoleChange::Failed,
+            "the NIP-86 assignment path must fail closed too"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn relay_member_commands_update_the_roster() {
         let key = "01".repeat(32);
         let relay = build_role_relay(Some(&key)).await;

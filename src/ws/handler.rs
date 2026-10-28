@@ -634,7 +634,7 @@ impl super::Conn {
             // result actually contains group events (COUNT and the live
             // path skip it the same way): holding it across every stored
             // event of a REQ would block group writes for no reason.
-            let groups = if events.iter().any(nip29::is_group_event) {
+            let groups = if events.iter().any(nip29::needs_group_store) {
                 Some(self.relay.groups.read().await)
             } else {
                 None
@@ -1210,7 +1210,7 @@ impl super::Conn {
         // an unauthenticated peer cannot learn the size of a private group,
         // the existence of gift wraps or the count of protected events.
         let events: Vec<Event> = {
-            let has_group_events = events.iter().any(nip29::is_group_event);
+            let has_group_events = events.iter().any(nip29::needs_group_store);
             let groups = if has_group_events {
                 Some(self.relay.groups.read().await)
             } else {
