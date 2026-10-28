@@ -946,6 +946,9 @@ impl super::Relay {
             .map(|tag| tag[1].to_ascii_lowercase())
             .find(|target| target.len() == 64 && target.bytes().all(|b| b.is_ascii_hexdigit()))
             .ok_or_else(|| "invalid: member command needs one hex p tag".to_string())?;
+        if self.db.is_vanished(&target).await != Some(false) {
+            return Err("restricted: the target pubkey has vanished".into());
+        }
         let role = event
             .tags
             .iter()
@@ -1090,6 +1093,9 @@ impl super::Relay {
         // (and would reintroduce the removed-owner authority bug).
         if role.eq_ignore_ascii_case("owner") {
             return RoleChange::Unknown;
+        }
+        if self.db.is_vanished(pubkey).await != Some(false) {
+            return RoleChange::Failed;
         }
         // A rebuild marked before (or during) this call revokes the live
         // store: publishing its membership list would store a partial 13534

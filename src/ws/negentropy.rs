@@ -441,7 +441,10 @@ impl super::Conn {
             // non-group NEG filter must not stall group writes/live delivery
             // behind the whole visibility pass (REQ/COUNT already take this
             // lock conditionally).
-            let groups = if items.iter().any(|item| item.gid.is_some()) {
+            let groups = if items
+                .iter()
+                .any(|item| item.gid.is_some() || item.notice_gid.is_some())
+            {
                 Some(self.relay.groups.read().await)
             } else {
                 None
@@ -473,6 +476,17 @@ impl super::Conn {
                         })
                     }) {
                         return false;
+                    }
+                    // Membership notices carry an `h` for the NIP-CL system
+                    // gate but are not channel-scoped for membership access.
+                    if let Some(gid) = &item.notice_gid {
+                        let Some(groups) = groups.as_deref() else {
+                            return false;
+                        };
+                        if !crate::server::bridge::nip_cl_group_visible(&system_filter, groups, gid)
+                        {
+                            return false;
+                        }
                     }
                     // NIP-78: application-specific events are only synced
                     // to the authenticated owner.

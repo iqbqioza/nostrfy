@@ -418,6 +418,8 @@ impl super::Relay {
                     | nip29::WINDOW_BOUNDS
                     | nip29::THREAD_WINDOW_BOUNDS
                     | nip_ia::ARCHIVED_IDENTITIES
+                    | nip_ia::ARCHIVED_DELTA
+                    | nip_ia::UNARCHIVED_DELTA
                     | 30622
             ))
             && Some(event.pubkey.as_str()) != self.relay_pubkey_ref()
@@ -2193,6 +2195,19 @@ mod tests {
             matches!(out, super::Precheck::Reject(ref message) if message.contains("relay-signed")),
             "client-signed 13535 must be rejected: {out:?}"
         );
+        for kind in [
+            crate::nips::nip_ia::ARCHIVED_DELTA,
+            crate::nips::nip_ia::UNARCHIVED_DELTA,
+        ] {
+            let fake_delta = signed_with_seed(7, kind, vec![]);
+            let out = relay
+                .precheck(&cfg, &access, &fake_delta, now, &[], None, None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(ref message) if message.contains("relay-signed")),
+                "client-signed NIP-IA delta {kind} must be rejected: {out:?}"
+            );
+        }
         drop(cfg);
         relay.db.shutdown();
     }

@@ -205,6 +205,13 @@ pub fn is_group_event(event: &Event) -> bool {
             || ((GROUP_META..=GROUP_PINS).contains(&event.kind) && group_id_d(event).is_some()))
 }
 
+/// Whether serving this event needs the group store to decide visibility.
+/// Membership notices are stored globally (not as channel-scoped events),
+/// but NIP-CL's system-channel gate still needs their `h` group id.
+pub(crate) fn needs_group_store(event: &Event) -> bool {
+    is_group_event(event) || (is_membership_notice_kind(event.kind) && group_id(event).is_some())
+}
+
 /// Group id of a relay-generated metadata event (from the `d` tag).
 pub fn group_id_d(event: &Event) -> Option<&str> {
     tag_value(event, D)

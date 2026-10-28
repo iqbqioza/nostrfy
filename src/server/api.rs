@@ -485,9 +485,9 @@ fn api_visible_filtered(
         {
             return true;
         }
-        filters
-            .iter()
-            .any(|filter| crate::server::bridge::nip_cl_visible(filter, event, groups))
+        filters.iter().any(|filter| {
+            filter.matches(event) && crate::server::bridge::nip_cl_visible(filter, event, groups)
+        })
     });
 
     system_channel_visible
@@ -1849,7 +1849,10 @@ fn aggregate_visible(
         let Some(groups) = groups else {
             return false;
         };
-        if !groups.visible_kind(gid, item.kind, None)
+        // The relay-wide aggregates are a global filter: system-channel
+        // state must not leak its kind/author metadata there.
+        if !crate::server::bridge::nip_cl_group_visible(&Filter::default(), groups, gid)
+            || !groups.visible_kind(gid, item.kind, None)
             || groups.channel_ttl_expired_gid(gid, item.kind, item.created, unix_now())
         {
             return false;
@@ -2946,6 +2949,7 @@ mod tests {
                 protected: false,
                 app_specific: false,
                 gid: None,
+                notice_gid: None,
                 invite_code: None,
                 wrap_recipients: None,
                 state_recipients: None,

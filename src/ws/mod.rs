@@ -1684,14 +1684,13 @@ where
     F: futures_util::Sink<Message, Error = axum::Error> + Unpin,
 {
     for (event, json) in batch {
-        if nip29::is_group_event(event) {
+        if nip29::needs_group_store(event) {
             if let Some(store) = group_store.as_ref() {
                 let guard = store.read().await;
                 conn.deliver_live_at(event, json, Some(&guard), now);
             } else {
-                // The caller only omits the store when the batch has no
-                // group events; a mismatch fails closed (the event is not
-                // visible without the group state).
+                // A group-scoped event (or a notice whose system-channel
+                // gate needs its h id) without the store fails closed.
                 conn.deliver_live_at(event, json, None, now);
             }
         } else {
@@ -3277,6 +3276,76 @@ mod tests {
             assert!(
                 named_ids.contains(&event.id),
                 "the same event must reach a filter that names its channel"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn membership_notices_apply_the_system_channel_gate() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn_with(&"03".repeat(32)).await;
+            let now = unix_now();
+            let channel = "sys-notice";
+            let target = "04".repeat(32);
+            conn.authed_pubkeys.push(target.clone());
+            let relay_pk = conn.relay.relay_pubkey.clone().expect("keyed relay");
+            let mut create = crate::event::Event {
+                id: String::new(),
+                pubkey: relay_pk.clone(),
+                created_at: now,
+                kind: crate::nips::nip29::CREATE_GROUP,
+                tags: vec![
+                    vec!["h".into(), channel.into()],
+                    vec!["visibility".into(), "open".into()],
+                    vec!["channel_type".into(), "system".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            create.id = crate::nips::nip01::compute_id(&create);
+            {
+                let mut groups = conn.relay.groups.write().await;
+                groups.apply(&create, &relay_pk, now, false, false);
+                if let Some(group) = groups.groups.get_mut(channel) {
+                    group.channel_type = "system".into();
+                }
+            }
+            let mut notice = crate::event::Event {
+                id: String::new(),
+                pubkey: relay_pk,
+                created_at: now + 1,
+                kind: crate::nips::nip29::MEMBER_ADDED,
+                tags: vec![
+                    vec!["p".into(), target.clone()],
+                    vec!["h".into(), channel.into()],
+                    vec!["t".into(), "system".into()],
+                ],
+                content: "{}".into(),
+                sig: String::new(),
+            };
+            notice.id = crate::nips::nip01::compute_id(&notice);
+            conn.relay.db.put(notice.clone(), now).await;
+
+            conn.handle_req(&[json!("global"), json!({"kinds": [44100]})])
+                .await;
+            conn.pump_pending_reqs();
+            assert!(
+                !outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["id"] == notice.id),
+                "a global filter must not receive a system-channel notice"
+            );
+
+            conn.handle_req(&[json!("named"), json!({"kinds": [44100], "#h": [channel]})])
+                .await;
+            conn.pump_pending_reqs();
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["id"] == notice.id),
+                "a filter naming the system channel must receive its notice"
             );
             conn.relay.db.shutdown();
         });

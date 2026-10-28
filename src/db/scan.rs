@@ -41,6 +41,10 @@ pub(crate) struct NegItem {
     /// gate is on.
     pub app_specific: bool,
     pub gid: Option<String>,
+    /// Group id of a NIP-29/Buzz membership notice (`44100`/`44101`).
+    /// Notices are stored globally and remain p-gated; this field is used
+    /// only for the NIP-CL system-channel gate.
+    pub notice_gid: Option<String>,
     /// Bearer invite code on a NIP-29 JOIN. NEG has no event body to apply
     /// the member-only visibility rule later, so carry the code here.
     pub invite_code: Option<String>,
@@ -531,6 +535,11 @@ impl ScanCollector for ItemCollector {
         }
         let protected = crate::nips::nip70::is_protected(&event);
         let gid = crate::nips::nip29::group_id_any(&event).map(str::to_string);
+        let notice_gid = if crate::nips::nip29::is_membership_notice_kind(event.kind) {
+            crate::nips::nip29::group_id(&event).map(str::to_string)
+        } else {
+            None
+        };
         let wrap_recipients = if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
             Some(
                 event
@@ -572,6 +581,7 @@ impl ScanCollector for ItemCollector {
             protected,
             app_specific: crate::nips::nip78::is_app_specific(&event),
             gid,
+            notice_gid,
             invite_code,
             wrap_recipients,
             state_recipients,
@@ -591,6 +601,15 @@ impl ScanCollector for ItemCollector {
         }
         let protected = crate::nips::nip70::tags_protected(event.tags());
         let gid = crate::nips::nip29::group_id_any_light(event).map(str::to_string);
+        let notice_gid = if crate::nips::nip29::is_membership_notice_kind(event.kind()) {
+            event
+                .tags()
+                .iter()
+                .find(|tag| tag.len() >= 2 && tag[0] == "h")
+                .map(|tag| tag[1].clone())
+        } else {
+            None
+        };
         let wrap_recipients = if event.kind() == crate::nips::nip62::GIFT_WRAP_KIND {
             Some(
                 event
@@ -632,6 +651,7 @@ impl ScanCollector for ItemCollector {
             protected,
             app_specific: crate::nips::nip78::is_app_specific_kind(event.kind()),
             gid,
+            notice_gid,
             invite_code,
             wrap_recipients,
             state_recipients,
