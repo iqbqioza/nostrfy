@@ -60,7 +60,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tower = { version = "0.5", features = ["util"] }
 # On-the-fly Brotli for Blossom media/JSON responses. Only the Brotli
 # feature is enabled: the layer negotiates `Accept-Encoding` itself.
-tower-http = { version = "0.6", default-features = false, features = ["compression-br"] }
+tower-http = { version = "0.7", default-features = false, features = ["compression-br"] }
 toml = "1.1"
 # `nostrfy upgrade`: fetches the latest release binary (and the latest
 # version tag) over HTTPS with rustls; no other network use. The raw binary
