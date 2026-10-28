@@ -702,6 +702,13 @@ pub(crate) struct GroupsSnapshot {
     /// older snapshots deserialize as 0.
     #[serde(default)]
     pub seq: u64,
+    /// The group-family sequence at capture. New snapshots set this even
+    /// when it is zero, so a missing value identifies a legacy snapshot that
+    /// still has to fall back to the shared removal stamp. The group
+    /// sequence now advances on group-state removals too; role-only removals
+    /// leave it unchanged and therefore no longer invalidate group/DM state.
+    #[serde(default)]
+    pub group_seq: Option<u64>,
     /// Buzz compatibility mode at snapshot capture. If it differs on the
     /// next restore, startup republishes the 39000/39001/39002 rosters so a
     /// mode switch is reflected without waiting for the next mutation.
@@ -721,6 +728,10 @@ pub(crate) struct BuzzBackup {
     pub stamp: u64,
     #[serde(default)]
     pub seq: u64,
+    /// Group-family generation at capture (see
+    /// [`GroupsSnapshot::group_seq`]).
+    #[serde(default)]
+    pub group_seq: Option<u64>,
     #[serde(default)]
     pub groups: HashMap<String, BuzzGroupBackup>,
 }
@@ -753,6 +764,7 @@ struct DmBackupRef<'a> {
     ghost: &'a HashSet<String>,
     stamp: u64,
     seq: u64,
+    group_seq: Option<u64>,
     buzz_enabled: Option<bool>,
 }
 
@@ -776,6 +788,7 @@ pub(crate) fn dm_backup_json(
         ghost: &empty,
         stamp,
         seq,
+        group_seq: Some(seq),
         buzz_enabled,
     };
     serde_json::to_vec(&view)
@@ -787,6 +800,7 @@ pub(crate) fn dm_backup_json(
 struct BuzzBackupRef<'a> {
     stamp: u64,
     seq: u64,
+    group_seq: Option<u64>,
     groups: HashMap<&'a str, BuzzGroupBackupRef<'a>>,
 }
 
@@ -827,7 +841,12 @@ pub(crate) fn buzz_backup_json(
             )
         })
         .collect();
-    serde_json::to_vec(&BuzzBackupRef { stamp, seq, groups })
+    serde_json::to_vec(&BuzzBackupRef {
+        stamp,
+        seq,
+        group_seq: Some(seq),
+        groups,
+    })
 }
 
 /// Verifies that a rebuild page delivered every event of its boundary
@@ -882,6 +901,7 @@ impl GroupStore {
             // `DbClient::state_seq`).
             stamp: 0,
             seq: 0,
+            group_seq: None,
             buzz_enabled: Some(self.buzz_enabled),
         }
     }
@@ -906,6 +926,7 @@ impl GroupStore {
             ghost: &'a HashSet<String>,
             stamp: u64,
             seq: u64,
+            group_seq: Option<u64>,
             buzz_enabled: Option<bool>,
         }
         let snapshot = SnapshotRef {
@@ -914,6 +935,7 @@ impl GroupStore {
             ghost: &self.ghost,
             stamp,
             seq,
+            group_seq: Some(seq),
             buzz_enabled: Some(self.buzz_enabled),
         };
         let data = serde_json::to_vec(&snapshot)?;
@@ -1098,9 +1120,19 @@ impl GroupStore {
         current_stamp: u64,
         current_seq: u64,
     ) -> bool {
-        if !Self::snapshot_is_current(snap.stamp, current_stamp)
-            || !Self::snapshot_is_current(snap.seq, current_seq)
-        {
+        // New snapshots carry the group-family sequence separately and use
+        // it as the authoritative group generation. A role-only removal
+        // advances the shared stamp but not this sequence, so it must not
+        // invalidate group/DM state. Legacy snapshots have no group_seq and
+        // keep the old stamp+sequence check.
+        let current = match snap.group_seq {
+            Some(group_seq) => Self::snapshot_is_current(group_seq, current_seq),
+            None => {
+                Self::snapshot_is_current(snap.stamp, current_stamp)
+                    && Self::snapshot_is_current(snap.seq, current_seq)
+            }
+        };
+        if !current {
             return false;
         }
         self.restore(snap);

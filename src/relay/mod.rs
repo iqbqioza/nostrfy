@@ -800,6 +800,11 @@ struct GroupsRebuild {
     /// staleness the in-flight scan has not yet confirmed (see
     /// [`RebuildBuffer`]).
     buffer: tokio::sync::Mutex<RebuildBuffer>,
+    /// Keep the corrupt/stale main snapshot and DM/Buzz backups when the
+    /// startup recovery fails closed. Clearing them would make the next
+    /// start treat the database as a fresh/pre-snapshot database and could
+    /// publish DM history that the failed recovery could not reconstruct.
+    preserve_unrestored: AtomicBool,
     /// Derived-state mutations committed but not yet applied in memory
     /// (see [`DerivedMutationEpoch`]).
     derived: DerivedMutationEpoch,
@@ -818,6 +823,7 @@ impl Default for GroupsRebuild {
             lock: tokio::sync::Mutex::new(()),
             persist_lock: tokio::sync::Mutex::new(()),
             buffer: tokio::sync::Mutex::new(RebuildBuffer::default()),
+            preserve_unrestored: AtomicBool::new(false),
             derived: DerivedMutationEpoch::default(),
         }
     }
@@ -855,9 +861,14 @@ impl GroupsRebuild {
         }
         // An unrestored store is not authoritative: saving its empty state
         // (for example from the pending-purge resume) would make the next
-        // start treat every lost group id as public. Drop the snapshot and
-        // let the next enabled start rebuild.
+        // start treat every lost group id as public. A failed startup
+        // recovery must preserve the corrupt snapshot and its DM/Buzz
+        // backups for a later attempt; a normal fail-closed empty store
+        // (e.g. NIP-29 disabled with no snapshot) still drops them.
         if groups.read().await.is_unrestored() {
+            if self.preserve_unrestored.load(Ordering::SeqCst) {
+                return PersistOutcome::Committed;
+            }
             return if db.clear_groups_snapshot().await {
                 PersistOutcome::Committed
             } else {
@@ -4862,6 +4873,24 @@ impl Relay {
     /// durable.
     pub(crate) async fn persist_groups(&self) -> bool {
         self.persist_groups_outcome().await == PersistOutcome::Committed
+    }
+
+    /// Keeps the on-disk group snapshot and DM/Buzz backups when the store
+    /// is marked unrestored. Used by failed startup recovery so a later
+    /// restart can retry instead of turning a DM-bearing database into a
+    /// fresh-looking empty store.
+    pub(crate) fn preserve_unrestored_group_snapshots(&self) {
+        self.groups_rebuild
+            .preserve_unrestored
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Releases the recovery preserve flag once a snapshot restore or full
+    /// event rebuild has produced an authoritative store.
+    pub(crate) fn release_unrestored_group_snapshots(&self) {
+        self.groups_rebuild
+            .preserve_unrestored
+            .store(false, Ordering::SeqCst);
     }
 
     /// Persists group state only when a successful return means the current
@@ -14450,6 +14479,35 @@ mod tests {
     }
 
     /// Waits until no role rebuild worker is running (successful or failed).
+    #[tokio::test]
+    async fn failed_recovery_preserves_the_snapshot_and_backups() {
+        // The normal fail-closed clear drops the snapshot/backups. A recovery
+        // failure that could not prove DM state must instead preserve them
+        // for the next startup; otherwise a corrupt main snapshot becomes a
+        // fresh-looking database and unknown DM ids become public.
+        let relay = build_relay_with_key(false, "").await;
+        let mut snapshot = crate::nips::nip29::GroupsSnapshot::default();
+        snapshot.groups.insert(
+            "dm-preserve".into(),
+            crate::nips::nip29::Group {
+                channel_type: "dm".into(),
+                ..crate::nips::nip29::Group::default()
+            },
+        );
+        assert!(relay.db.save_groups(snapshot).await);
+        relay.preserve_unrestored_group_snapshots();
+        relay.groups.write().await.mark_unrestored();
+        assert!(relay.persist_groups().await);
+        assert!(
+            matches!(
+                relay.db.load_groups().await,
+                crate::db::LoadGroupsOutcome::Loaded(_)
+            ),
+            "a recovery-failed store must keep the snapshot for the next attempt"
+        );
+        relay.db.shutdown();
+    }
+
     #[tokio::test]
     async fn an_unrestored_group_store_is_never_persisted() {
         // AUD-04: the pending-purge resume must not save the empty

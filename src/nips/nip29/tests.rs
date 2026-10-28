@@ -129,6 +129,7 @@ fn buzz_backup_restores_metadata_without_adding_members() {
     let backup = BuzzBackup {
         stamp: 0,
         seq: 0,
+        group_seq: None,
         groups: std::collections::HashMap::from([
             (
                 "g1".into(),
@@ -1812,6 +1813,40 @@ fn rebuild_does_not_fail_when_the_ghost_set_exceeds_the_cap() {
         assert!(store.is_ghosted("g2"));
     });
     db.shutdown();
+}
+
+#[test]
+fn group_generation_ignores_a_role_only_stamp_advance() {
+    // A role-state removal advances the shared removal stamp but not the
+    // group-family sequence. New snapshots carry group_seq and must still
+    // restore; a legacy snapshot without it keeps the old fail-closed
+    // stamp+sequence check.
+    let mut store = GroupStore::default();
+    let current = GroupsSnapshot {
+        groups: HashMap::from([("g1".into(), Group::default())]),
+        stamp: 42,
+        seq: 7,
+        group_seq: Some(7),
+        ..GroupsSnapshot::default()
+    };
+    assert!(
+        store.restore_checked(current, 43, 7),
+        "a role-only shared-stamp advance must not invalidate a group snapshot"
+    );
+    assert!(store.group("g1").is_some());
+
+    let mut legacy = GroupStore::default();
+    let legacy_snapshot = GroupsSnapshot {
+        groups: HashMap::from([("g2".into(), Group::default())]),
+        stamp: 42,
+        seq: 7,
+        group_seq: None,
+        ..GroupsSnapshot::default()
+    };
+    assert!(
+        !legacy.restore_checked(legacy_snapshot, 43, 7),
+        "a legacy snapshot must keep the shared-stamp rejection"
+    );
 }
 
 #[test]
@@ -6850,6 +6885,7 @@ fn encoded_persisted_snapshot_matches_the_typed_format() {
     let mut expected = store.snapshot();
     expected.stamp = 42;
     expected.seq = 7;
+    expected.group_seq = Some(7);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&data).unwrap(),
         serde_json::to_value(&expected).unwrap(),
@@ -6867,6 +6903,7 @@ fn encoded_persisted_snapshot_matches_the_typed_format() {
         ghost: std::collections::HashSet::new(),
         stamp: 42,
         seq: 7,
+        group_seq: Some(7),
         buzz_enabled: Some(store.buzz_enabled),
     };
     assert_eq!(
@@ -6878,6 +6915,7 @@ fn encoded_persisted_snapshot_matches_the_typed_format() {
     let mut buzz_expected = BuzzBackup {
         stamp: 42,
         seq: 7,
+        group_seq: Some(7),
         groups: std::collections::HashMap::new(),
     };
     for (gid, group) in &expected.groups {

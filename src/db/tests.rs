@@ -8237,6 +8237,85 @@ fn state_stamp_advances_with_group_state_removals() {
 }
 
 #[test]
+fn group_sequence_advances_on_group_removals_but_not_role_removals() {
+    // Group snapshots now use group_seq as their authoritative removal
+    // generation. A group-state removal must advance it; a role-only removal
+    // must not, so a role rebuild no longer discards DM/Buzz backups.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let now = unix_now();
+    let authored = |kind: u64, pk: &str, created: u64| {
+        let mut e = event(kind, "x", created, vec![]);
+        e.pubkey = pk.to_string();
+        e.id = nip01::compute_id(&e);
+        e
+    };
+    rt.block_on(async {
+        assert_eq!(db.state_seq_group().await, Some(0));
+        assert_eq!(
+            db.put(authored(9000, &"aa".repeat(32), now), now).await,
+            PutOutcome::Stored
+        );
+        let before_group_removal = db.state_seq_group().await.expect("group seq");
+        assert_eq!(
+            db.apply_vanish_checked([0xaa; 32], now).await,
+            Some((
+                1,
+                StateRemoved {
+                    group: true,
+                    role: false,
+                    group_ids: None
+                }
+            ))
+        );
+        assert!(
+            db.state_seq_group().await.expect("group seq") > before_group_removal,
+            "a group-state removal must advance the group sequence"
+        );
+
+        assert_eq!(
+            db.put(
+                authored(
+                    crate::nips::nip43::MEMBERSHIP_LIST,
+                    &"bb".repeat(32),
+                    now + 1
+                ),
+                now + 1
+            )
+            .await,
+            PutOutcome::Stored
+        );
+        let role_removal_seq = db.state_seq_group().await;
+        assert_eq!(
+            db.apply_vanish_checked([0xbb; 32], now + 1).await,
+            Some((
+                1,
+                StateRemoved {
+                    group: false,
+                    role: true,
+                    group_ids: Some(Vec::new())
+                }
+            ))
+        );
+        assert_eq!(
+            db.state_seq_group().await,
+            role_removal_seq,
+            "a role-only removal must not invalidate group/DM state"
+        );
+        db.shutdown();
+    });
+}
+
+#[test]
 fn state_seq_advances_with_group_and_role_puts_but_not_ordinary_events() {
     // The derived-state sequence (consumed by the snapshot currency check)
     // advances in the same commit as every NIP-29/NIP-43 state-relevant

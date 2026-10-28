@@ -221,7 +221,12 @@ host, because Buzz signs the relay URL it uploads to.
   skipping deleted/ghosted ids and vanished participants. A truly new
   database, or a migration with no snapshot, backup, or metadata events,
   still has no DM state; the migration carry handles its own transition.
-  Runtime state-removal rebuilds carry live DM groups across the swap.
+  Runtime state-removal rebuilds carry live DM groups across the swap. If
+  a corrupt/stale main snapshot cannot be paired with a usable DM backup or
+  metadata scan, startup marks the group store unrestored and preserves all
+  snapshot/backup bytes for a later retry instead of publishing a DM-less
+  state. Group snapshots carry the group-family sequence (`group_seq`), so
+  a role-only removal no longer invalidates DM/Buzz state.
   Creation and hide persist the snapshot synchronously before the ACK (a
   failed save is retryable), so a crash cannot leave a current pre-DM
   snapshot that makes the unknown channel public. Hidden-DM sets are
@@ -380,10 +385,15 @@ host, because Buzz signs the relay URL it uploads to.
   visible sample itself is saturated, so hidden rows cannot set it; their
   counts still come from the newest 20,000 raw events, may undercount older
   visible events, and are marked `sampled: true`.
-- NIP-29 and NIP-43 snapshots share one removal stamp. A group-state
-  removal or purge can invalidate the role snapshot, forcing a role rebuild
-  (stale-snapshot invite codes are carried across); role removals likewise
-  invalidate the group snapshot. The events remain the source of truth.
+- NIP-29 and NIP-43 snapshots share the legacy removal stamp, but group
+  snapshots also carry the group-family sequence (`group_seq`). A
+  group-state removal or purge invalidates group/DM state and may force a
+  role rebuild (stale-snapshot invite codes are carried across); a
+  role-only removal no longer invalidates the group/DM snapshot. The events
+  remain the source of truth. A corrupt role snapshot still refuses
+  startup (an empty auto-rebuild would silently revoke every grant and
+  destroy snapshot-only invite codes); restore the database backup or
+  remove `roles:snapshot` manually only after accepting that claim loss.
 - A role rebuild is deferred while NIP-43 is disabled; the snapshot's claims
   are carried over when it is re-enabled. Synthetic owner/allowlist roster
   entries are not treated as role-bearing assignments, and a vanished
