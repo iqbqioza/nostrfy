@@ -126,4 +126,4 @@ opt-level = 1
 brotli = "9"
 # Match axum's tokio-tungstenite version so the test client does not pull a
 # second copy; the tests only use ws://, so no TLS feature is needed.
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
